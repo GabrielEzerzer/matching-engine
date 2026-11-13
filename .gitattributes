@@ -1,2 +1,4 @@
 # Shell scripts run under Linux/WSL; keep them LF even with core.autocrlf=true.
 *.sh text eol=lf
+# The golden files are compared line by line; keep them LF everywhere.
+harness/golden/* text eol=lf
