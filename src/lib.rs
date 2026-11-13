@@ -8,16 +8,22 @@
 //!
 //! All prices and quantities are integers. Commands go in through [`OrderBook::apply`] and the
 //! resulting events are appended to a caller-supplied `Vec<Event>`, in a fully deterministic order.
+//!
+//! [`itch`] parses Nasdaq TotalView-ITCH 5.0 and [`replay`] drives one book per instrument from
+//! an ITCH stream.
 
 #![forbid(unsafe_code)]
 
 mod book;
+pub mod itch;
 mod level;
 mod orders;
+pub mod replay;
 mod side;
 mod types;
 
 pub use book::OrderBook;
 pub use types::{
-    Command, Event, LevelDepth, LevelSnapshot, OrderId, Price, Qty, RejectReason, Side, Snapshot,
+    Command, Event, LevelDepth, LevelSnapshot, OrderId, OrderInfo, Price, Qty, RejectReason, Side,
+    Snapshot,
 };

@@ -9,3 +9,13 @@ publish = false
 
 [dev-dependencies]
 proptest = "1"
+sha2 = "0.10"
+hdrhistogram = { version = "7", default-features = false }
+
+# Release builds are what the replay, the golden check and the benchmark run. One codegen unit
+# and fat LTO give the optimiser the whole program; debug info adds nothing at run time and lets
+# `perf` attribute samples to source lines.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+debug = true

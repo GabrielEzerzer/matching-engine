@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use crate::orders::{OrderMap, RestingOrder};
 use crate::side::BookSide;
 use crate::types::{
-    Command, Event, LevelDepth, LevelSnapshot, OrderId, Price, Qty, RejectReason, Side, Snapshot,
+    Command, Event, LevelDepth, LevelSnapshot, OrderId, OrderInfo, Price, Qty, RejectReason, Side,
+    Snapshot,
 };
 
 #[derive(Debug)]
@@ -142,6 +143,23 @@ impl OrderBook {
 
     pub fn best_ask(&self) -> Option<Price> {
         self.asks.best_price()
+    }
+
+    /// The side, price and remaining quantity of a resting order, or `None` if `id` is not resting.
+    pub fn order(&self, id: OrderId) -> Option<OrderInfo> {
+        self.orders.get(&id).map(|o| OrderInfo {
+            side: o.side,
+            price: o.price,
+            qty: o.qty,
+        })
+    }
+
+    /// The order with time priority at the best price of `side`: the one an incoming order on
+    /// the opposite side would trade with first. `None` if the side is empty.
+    pub fn front_order(&self, side: Side) -> Option<OrderId> {
+        let side = self.side(side);
+        let price = side.best_price()?;
+        side.level(price)?.front()
     }
 
     /// Levels of one side, best price first.

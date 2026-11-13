@@ -5,3 +5,9 @@
 
 # cargo build output
 /target
+
+# ITCH data files stay out of git (scripts/fetch-itch.sh downloads them)
+*.NASDAQ_ITCH50
+*.NASDAQ_ITCH50.gz
+*.NASDAQ_ITCH50.tmp
+/data

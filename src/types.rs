@@ -107,6 +107,15 @@ pub enum RejectReason {
     ReduceTooLarge,
 }
 
+/// A resting order as [`crate::OrderBook::order`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderInfo {
+    pub side: Side,
+    pub price: Price,
+    /// Remaining quantity.
+    pub qty: Qty,
+}
+
 /// Aggregate view of one price level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LevelDepth {
