@@ -10,7 +10,7 @@ pub type Price = u32;
 /// Totals over many orders (a level's depth) are `u64` so they cannot overflow.
 pub type Qty = u32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     Buy,
     Sell,
@@ -55,7 +55,7 @@ pub enum Command {
 /// - Reduce: `Rejected` or `Reduced` (with `remaining == 0` when the order was removed).
 /// - Replace: `Rejected`, or `Replaced` followed by the new order's events as for Limit,
 ///   without its `Accepted`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     Accepted {
         id: OrderId,
@@ -96,7 +96,7 @@ pub enum Event {
 /// Checks run in this order: Limit and Market check `ZeroQuantity` then `DuplicateOrderId`;
 /// Reduce checks `UnknownOrder`, `ZeroQuantity`, then `ReduceTooLarge`; Replace checks
 /// `UnknownOrder`, `ZeroQuantity`, then `DuplicateOrderId` (a `new_id` equal to the old id is fine).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
     ZeroQuantity,
     /// The id belongs to an order that is resting in the book.

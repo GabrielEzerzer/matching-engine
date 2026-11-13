@@ -32,20 +32,24 @@ fn config() -> Config {
 }
 
 /// A small id pool so that cancels, modifies and new orders keep hitting ids that are live,
-/// filled, cancelled or duplicated, plus a rare id from a wide range that is almost never known.
+/// filled, cancelled or duplicated, plus a rare id from a wide range that is almost never known
+/// and a rare id at either end of the integer range.
 fn id() -> impl Strategy<Value = OrderId> {
     prop_oneof![
-        12 => 1..=16u64,
-        1 => 1_000..=1_000_000u64,
+        24 => 1..=16u64,
+        2 => 1_000..=1_000_000u64,
+        1 => prop_oneof![Just(0u64), Just(u64::MAX)],
     ]
 }
 
-/// Mostly small sizes, some zeros, and some large sizes that sweep several levels.
+/// Mostly small sizes, some zeros, some large sizes that sweep several levels, and a rare size
+/// at the top of the integer range.
 fn qty() -> impl Strategy<Value = u32> {
     prop_oneof![
-        1 => Just(0u32),
-        12 => 1..=10u32,
-        3 => 11..=60u32,
+        2 => Just(0u32),
+        24 => 1..=10u32,
+        6 => 11..=60u32,
+        1 => prop_oneof![Just(u32::MAX - 1), Just(u32::MAX)],
     ]
 }
 
@@ -59,9 +63,13 @@ fn reduce_by() -> impl Strategy<Value = u32> {
     ]
 }
 
-/// A narrow band, so buy and sell prices overlap and orders cross often.
+/// A narrow band, so buy and sell prices overlap and orders cross often, plus a rare price at
+/// either end of the integer range, so a round that does arithmetic on prices cannot pass unseen.
 fn price() -> impl Strategy<Value = u32> {
-    96..=104u32
+    prop_oneof![
+        30 => 96..=104u32,
+        1 => prop_oneof![Just(0u32), Just(1), Just(u32::MAX - 1), Just(u32::MAX)],
+    ]
 }
 
 fn side() -> impl Strategy<Value = Side> {
@@ -154,6 +162,9 @@ fn generators_hit_the_interesting_cases() {
         replace_trades: u32,
         sweep_two_levels: u32,
         partial_fill_then_rest: u32,
+        extreme_price: u32,
+        extreme_qty: u32,
+        extreme_id: u32,
     }
 
     let mut runner = TestRunner::deterministic();
@@ -243,7 +254,13 @@ fn generators_hit_the_interesting_cases() {
                     c.replace_same_id += u32::from(id == new_id);
                     c.replace_trades += u32::from(!trades.is_empty());
                 }
-                Command::Limit { id, .. } => {
+                Command::Limit { id, price, qty, .. } => {
+                    // Accepted limits at the ends of the integer ranges.
+                    if matches!(events[0], Event::Accepted { .. }) {
+                        c.extreme_price += u32::from(price <= 1 || price >= u32::MAX - 1);
+                        c.extreme_qty += u32::from(qty >= u32::MAX - 1);
+                        c.extreme_id += u32::from(id == 0 || id == u64::MAX);
+                    }
                     let mut prices = trades.clone();
                     prices.dedup();
                     c.sweep_two_levels += u32::from(prices.len() >= 2);
@@ -269,6 +286,9 @@ fn generators_hit_the_interesting_cases() {
         c.reduce_to_zero,
         c.replace_same_id,
         c.replace_trades,
+        c.extreme_price,
+        c.extreme_qty,
+        c.extreme_id,
         c.sweep_two_levels,
         c.partial_fill_then_rest,
     ];
