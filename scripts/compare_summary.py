@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Summarises the runs of a scripts/compare.sh comparison and gives its verdict. compare.sh calls
-# it, and compare.sh's header and the README describe the rule. It recomputes everything from the
+# it, and compare.sh's header and BENCHMARKING.md describe the rule. It recomputes everything from the
 # run lines, so -r and -f work on any saved comparison, and scripts/test_compare_summary.py checks
 # the arithmetic without a benchmark.
 #

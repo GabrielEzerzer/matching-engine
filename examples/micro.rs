@@ -189,7 +189,7 @@ fn main() -> ExitCode {
     };
     if !cfg!(target_os = "linux") && !args.allow_non_linux {
         eprintln!(
-            "refusing to benchmark on {}: results of record come from Linux (WSL2). \
+            "refusing to benchmark on {}: results of record come from Linux. \
              Pass --allow-non-linux to run anyway; the output is then labelled.",
             std::env::consts::OS
         );

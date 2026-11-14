@@ -29,8 +29,8 @@
 //! day's state when the window opens, and stops at the first message past it. `--limit` then
 //! counts timed messages, and `messages` and `book_messages` count only the window.
 //!
-//! Under WSL2 the hypervisor does not report steal time, so a run slowed by other work on the
-//! host cannot be seen from inside. Each run therefore times a fixed CPU-bound loop before and
+//! A virtual machine does not always report steal time, so a run slowed by other work on the
+//! host may not be visible from inside. Each run therefore times a fixed CPU-bound loop before and
 //! after its passes (`control_ms_start`, `control_ms_end`); a run whose control time is out of
 //! line with the others ran on a contended or slower CPU.
 
@@ -179,7 +179,7 @@ fn main() -> ExitCode {
     let linux = cfg!(target_os = "linux");
     if !linux && !args.allow_non_linux {
         eprintln!(
-            "refusing to benchmark on {}: results of record come from Linux (WSL2). \
+            "refusing to benchmark on {}: results of record come from Linux. \
              Pass --allow-non-linux to run anyway; the output is then labelled.",
             std::env::consts::OS
         );

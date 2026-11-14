@@ -5,7 +5,7 @@
 #   scripts/bench-build.sh [LABEL]
 #
 # The copies go to $BENCH_BINS/LABEL/bench and LABEL/micro (built with --features internals), with
-# BENCH_BINS defaulting to /root/bench-bins and LABEL to the short commit (with "-dirty" when
+# BENCH_BINS defaulting to $HOME/bench-bins and LABEL to the short commit (with "-dirty" when
 # tracked files have uncommitted changes). Beside them,
 # commit.txt holds the full commit label (see scripts/commit-label.sh), build.txt the toolchain,
 # build time and SHA-256, and settings.txt every build setting apart from the source: RUSTFLAGS,
@@ -15,7 +15,7 @@
 # differ. An existing LABEL is never overwritten; remove its directory first. The last line of
 # stdout is the bench binary's path.
 #
-# Linux only, like scripts/bench.sh: the binaries are for benchmarks of record under WSL2.
+# Linux only, like scripts/bench.sh: the binaries are for benchmarks of record on Linux.
 set -euo pipefail
 
 if [ "$#" -gt 1 ] || [ "${1:-}" = "-h" ]; then
@@ -23,7 +23,7 @@ if [ "$#" -gt 1 ] || [ "${1:-}" = "-h" ]; then
     exit 2
 fi
 if [ "$(uname -s)" != "Linux" ]; then
-    echo "bench-build.sh: refusing to run on $(uname -s); benchmarks of record run on Linux (WSL2)." >&2
+    echo "bench-build.sh: refusing to run on $(uname -s); benchmarks of record run on Linux." >&2
     exit 2
 fi
 
@@ -40,7 +40,7 @@ label="${1:-$short}"
 case "$label" in
     "" | */* | .*) echo "bench-build.sh: bad label \"$label\"" >&2; exit 2 ;;
 esac
-dir="${BENCH_BINS:-/root/bench-bins}/$label"
+dir="${BENCH_BINS:-$HOME/bench-bins}/$label"
 if [ -e "$dir" ]; then
     echo "bench-build.sh: $dir already exists; remove it to rebuild that label" >&2
     exit 2
