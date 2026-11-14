@@ -565,7 +565,7 @@ fn read_folds_catch_skipped_and_wrong_reads() {
 
     // Remove still removes but folds a constant in place of the order it took out. The same loop
     // folding the real result gives the stored value, so the copy differs in that arm only.
-    let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::new()).collect();
+    let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::default()).collect();
     let (mut right, mut constant) = (0, 0);
     for &op in &w.map_ops {
         match op {

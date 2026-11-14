@@ -607,7 +607,7 @@ pub mod parts {
 
     /// Folds the order a get found and the order a removal took out ([`fold_order`]).
     pub fn run_maps(w: &Workload) -> (Vec<OrderMap>, u64) {
-        let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::new()).collect();
+        let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::default()).collect();
         let mut reads = 0;
         for &op in &w.map_ops {
             match op {
