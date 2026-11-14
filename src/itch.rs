@@ -206,6 +206,10 @@ pub fn message_length(kind: u8) -> Option<usize> {
 }
 
 /// Decodes one message body (the bytes after the 2-byte length prefix).
+///
+/// Errors are checked in this order: an empty body is `Empty`; an unknown type byte is
+/// `UnknownType` whatever the length; a length that does not match the type is `BadLength`; only
+/// a message of the right length can be `BadField`.
 pub fn decode(msg: &[u8]) -> Result<Message, ItchError> {
     let Some(&kind) = msg.first() else {
         return Err(ItchError::Empty);
