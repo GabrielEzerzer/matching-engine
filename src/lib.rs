@@ -26,7 +26,7 @@ mod types;
 /// time each one on its own. Not part of the stable API: these types change between rounds.
 #[cfg(feature = "internals")]
 pub mod internals {
-    pub use crate::level::Level;
+    pub use crate::level::{Level, Nodes};
     pub use crate::orders::{OrderMap, RestingOrder};
     pub use crate::side::BookSide;
 }
