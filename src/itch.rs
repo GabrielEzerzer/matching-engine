@@ -218,6 +218,10 @@ const fn len(kind: u8) -> usize {
 /// Each decoded type checks its length by converting the body to an array of that length, so
 /// every field read is at a constant offset into an array of known size and needs no run-time
 /// bounds check.
+///
+/// Errors are checked in this order: an empty body is `Empty`; an unknown type byte is
+/// `UnknownType` whatever the length; a length that does not match the type is `BadLength`; only
+/// a message of the right length can be `BadField`.
 pub fn decode(msg: &[u8]) -> Result<Message, ItchError> {
     let Some(&kind) = msg.first() else {
         return Err(ItchError::Empty);
