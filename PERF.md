@@ -170,6 +170,20 @@ Guardrail: `book_mean_ns` +0.44%, interval −4.73% to +5.90%. The upper end is 
 
 **Not kept, and dropped: the array decoder.** It improved and was confirmed on its own part in both rounds (a parsed message went from 22.3 ns to 19.0 ns in this session), but it did not pass the guardrail in the one round where the guardrail was of record, and a candidate gets no third round. The decoder is a few nanoseconds of a book message that takes about 520 ns in the window, which is less than this comparison can resolve in ten pairs: the result does not show that the change slows the book, only that a slowdown of 5% was not ruled out. The code stays on the unmerged branch `parse-arrays`.
 
+### Allocation and pooling
+
+No candidate was measured for this part, because the two kept structural changes already pool what the baseline allocated. Allocation counts come from the microbenchmark's counting allocator and are exact, so they need no comparison. They are from the sessions above, each change alone against `209e9e2`:
+
+| Workload | Build | Allocations per pass | Per operation | Bytes per operation |
+|---|---|---|---|---|
+| `book`, 2,922,290 commands | baseline | 380,227 | 0.130 | 12.0 |
+| `book` | linked ring (`4a2bce7`) | 27,920 | 0.0096 | 5.9 |
+| `side`, 5,004,039 operations | baseline | 27,760 | 0.0055 | 2.8 |
+| `side` | sorted index into a slab (`5d2380b`) | 303 | 0.0001 | 0.2 |
+| `orders`, 4,978,788 operations | baseline and hasher | 82 | 0.0000 | 1.7 |
+
+The baseline allocated when a level's `VecDeque` was first filled or grew and when the `BTreeMap` of levels added a node. The ring keeps every queue node in one slab per book with a free list, and the index keeps every level in a slab and reuses the slot of a removed level. The two changes have not been counted together; the session `stage3-total` records the count for the merged code. What should be left is the growth of the slabs, the index vectors and the id map up to their peak sizes. Sizing them in advance was not tried.
+
 ### Instruction counts
 
 Instruction counts from `cachegrind` on the laptop are deterministic and are given as supporting numbers only; they are not timings and decide nothing. One pass of the part, candidate against `209e9e2`: on `orders`, the hasher −21.9% and the flat table −25.1%; on `book`, lazy removal +4.2%, the linked ring −4.2% and the map-entry change −0.8%. The flat table executes fewer instructions than the hasher and was still the slower of the two in time.
