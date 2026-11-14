@@ -1,11 +1,11 @@
 //! Latency and throughput benchmark: the full ITCH day through one book per instrument.
 //!
 //! ```text
-//! bench [--limit N] [--commit LABEL] [--allow-non-linux] FILE
+//! bench [--limit N] [--commit LABEL] [--no-throughput] [--allow-non-linux] FILE
 //! ```
 //!
 //! Prints one JSON line. Run it through `scripts/bench.sh`, which pins it to one CPU, repeats it
-//! and summarises the runs.
+//! and summarises the runs, or through `scripts/compare.sh`, which compares two builds in pairs.
 //!
 //! What is timed, per ITCH message: splitting its frame off the buffer, decoding it, and applying
 //! it to the replay (the driver's command choice, the book's work, the driver's counters). The
@@ -14,7 +14,8 @@
 //! hashed. The events the book emits go into a `Vec` the driver reuses, so the sink allocates
 //! only while it first grows. The book's own allocations are part of what is measured.
 //!
-//! Two passes, each over the whole file with a fresh replay:
+//! Two passes, each over the whole file with a fresh replay (`--no-throughput` skips the first,
+//! and the output then has no `throughput_*` fields):
 //! - Throughput: no per-message timer. Each chunk's parse-and-apply loop is timed as a whole with
 //!   `Instant`, and throughput is messages over the summed time.
 //! - Latency: each message is timed with the TSC (`lfence; rdtsc; lfence` before,
@@ -99,6 +100,7 @@ mod tsc {
 struct Args {
     limit: Option<u64>,
     commit: String,
+    throughput: bool,
     allow_non_linux: bool,
     file: PathBuf,
 }
@@ -106,6 +108,7 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut limit = None;
     let mut commit = "unknown".to_string();
+    let mut throughput = true;
     let mut allow_non_linux = false;
     let mut file = None;
     let mut args = std::env::args().skip(1);
@@ -116,6 +119,7 @@ fn parse_args() -> Result<Args, String> {
                 limit = Some(v.parse().map_err(|_| format!("bad --limit {v}"))?);
             }
             "--commit" => commit = args.next().ok_or("--commit needs a label")?,
+            "--no-throughput" => throughput = false,
             "--allow-non-linux" => allow_non_linux = true,
             _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
             _ => file = Some(PathBuf::from(arg)),
@@ -124,9 +128,11 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         limit,
         commit,
+        throughput,
         allow_non_linux,
         file: file.ok_or(
-            "usage: bench [--limit N] [--commit LABEL] [--allow-non-linux] FILE".to_string(),
+            "usage: bench [--limit N] [--commit LABEL] [--no-throughput] [--allow-non-linux] FILE"
+                .to_string(),
         )?,
     })
 }
@@ -245,23 +251,33 @@ fn run(args: &Args) -> Result<String, String> {
     out.float("instant_overhead_ns_p50", timer.instant_p50, 2);
     out.float("instant_resolution_ns", timer.instant_resolution, 2);
 
-    let throughput = throughput_pass(args)?;
-    out.num("messages", throughput.messages);
-    out.num("book_messages", throughput.book_messages);
-    out.float(
-        "throughput_msgs_per_s",
-        throughput.messages as f64 / throughput.busy.as_secs_f64(),
-        0,
-    );
-    out.float("throughput_busy_s", throughput.busy.as_secs_f64(), 3);
-    out.float("throughput_wall_s", throughput.wall.as_secs_f64(), 3);
-
+    let throughput = if args.throughput {
+        Some(throughput_pass(args)?)
+    } else {
+        None
+    };
     let latency = latency_pass(args)?;
-    if latency.messages != throughput.messages {
-        return Err(format!(
-            "passes disagree on the message count: {} vs {}",
-            throughput.messages, latency.messages
-        ));
+    out.num("messages", latency.messages);
+    out.num("book_messages", latency.book_messages);
+    if let Some(throughput) = throughput {
+        if (throughput.messages, throughput.book_messages)
+            != (latency.messages, latency.book_messages)
+        {
+            return Err(format!(
+                "passes disagree on the message counts: {} and {} vs {} and {}",
+                throughput.messages,
+                throughput.book_messages,
+                latency.messages,
+                latency.book_messages
+            ));
+        }
+        out.float(
+            "throughput_msgs_per_s",
+            throughput.messages as f64 / throughput.busy.as_secs_f64(),
+            0,
+        );
+        out.float("throughput_busy_s", throughput.busy.as_secs_f64(), 3);
+        out.float("throughput_wall_s", throughput.wall.as_secs_f64(), 3);
     }
     for (name, hist, sum) in [
         ("all", &latency.all, latency.all_ticks),
@@ -413,6 +429,7 @@ fn throughput_pass(args: &Args) -> Result<Throughput, String> {
 
 struct Latency {
     messages: u64,
+    book_messages: u64,
     all: Histogram<u64>,
     book: Histogram<u64>,
     all_ticks: u64,
@@ -493,6 +510,7 @@ fn latency_pass(args: &Args) -> Result<Latency, String> {
     }
     Ok(Latency {
         messages,
+        book_messages: replay.stats().book_messages,
         all,
         book,
         all_ticks,

@@ -45,18 +45,7 @@ command -v taskset >/dev/null || { echo "bench.sh: taskset not found (util-linux
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
-# A worktree checked out from Windows has a .git file with a Windows path that Linux git cannot
-# follow; WSL can still run the Windows git.
-commit="unknown"
-for g in git git.exe; do
-    if command -v "$g" >/dev/null && sha="$("$g" rev-parse HEAD 2>/dev/null)"; then
-        commit="$sha"
-        if [ -n "$("$g" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-            commit="$commit-dirty"
-        fi
-        break
-    fi
-done
+commit="$(scripts/commit-label.sh)"
 if [ "$commit" = "unknown" ]; then
     echo "bench.sh: WARNING: could not read the git commit; results are labelled \"unknown\"" >&2
 fi
