@@ -266,8 +266,8 @@ def golden_argvs(L, label):
 def checkout_argvs(bundle, br, dest):
     """Branch br from the bundle as a checkout at dest, on a local branch of the same name."""
     return [["git", "init", "-q", str(dest)],
-            ["git", "-C", str(dest), "fetch", "-q", str(bundle), f"{BUNDLE_REF}{br}:refs/heads/{br}"],
-            ["git", "-C", str(dest), "checkout", "-q", br]]
+            ["git", "-C", str(dest), "fetch", "-q", str(bundle), f"{BUNDLE_REF}{br}"],
+            ["git", "-C", str(dest), "checkout", "-q", "-B", br, "FETCH_HEAD"]]
 
 
 def bench_argv(plan, L, s):
@@ -626,13 +626,15 @@ class Kernel:
             return rec.update(state="failed", note=f"no build of {lab}")
         out = self.L.results / s["id"]
         rec["label"] = lab
-        code = self.sh(bench_argv(self.plan, self.L, s), f"{out}.jsonl", f"{out}.err",
-                       cwd=self.L.src / lab, env=env_for(self.L, lab))
-        ids = self.status["labels"][lab]
-        for f in (Path(f"{out}.jsonl"), Path(f"{out}.err")):  # bench.sh labels its runs with the bundle commit
-            if ids.get("bundle_commit") and ids.get("commit") and f.is_file():
-                write_text(f, f.read_text(encoding="utf-8", errors="replace")
-                           .replace(ids["bundle_commit"], ids["commit"]))
+        try:
+            code = self.sh(bench_argv(self.plan, self.L, s), f"{out}.jsonl", f"{out}.err",
+                           cwd=self.L.src / lab, env=env_for(self.L, lab))
+        finally:
+            ids = self.status["labels"][lab]
+            for f in (Path(f"{out}.jsonl"), Path(f"{out}.err")):  # bench.sh labels its runs with the bundle commit
+                if ids.get("bundle_commit") and ids.get("commit") and f.is_file():
+                    write_text(f, f.read_text(encoding="utf-8", errors="replace")
+                               .replace(ids["bundle_commit"], ids["commit"]))
         summary = read_summary(f"{out}.jsonl")
         if summary is None or code:
             return rec.update(state="failed", note=f"exit {code}{'' if summary else ', no summary line'}; "
@@ -727,17 +729,17 @@ def git(repo, *args, env=None):
     return r.stdout.strip()
 
 
-def make_bundle(repo, branches, bundle):
-    """Writes a bundle of one history-free commit per branch (the branch's tree, the neutral
+def make_bundle(repo, commits, bundle):
+    """Writes a bundle of one history-free commit per branch in commits (that commit's tree, the neutral
     BUNDLE_ENV identity and dates, BUNDLE_MESSAGE) under refs/kaggle-bundle/<branch>, so no name or
     address from the real history leaves the machine. Returns {branch: bundle commit}. The temporary
     refs are deleted afterwards, also when bundling fails."""
     env = {**os.environ, **BUNDLE_ENV}
     made = {}
     try:
-        for br in branches:
+        for br, commit in commits.items():
             sha = git(repo, "commit-tree", "--no-gpg-sign", "-m", BUNDLE_MESSAGE,
-                      f"refs/heads/{br}^{{tree}}", env=env)
+                      f"{commit}^{{tree}}", env=env)
             git(repo, "update-ref", f"{BUNDLE_REF}{br}", sha)
             made[br] = sha
         git(repo, "bundle", "create", str(Path(bundle).resolve()), *[f"{BUNDLE_REF}{b}" for b in made])
@@ -767,7 +769,7 @@ def write_kernel(plan_path, out_dir, owner):
         d.mkdir(parents=True, exist_ok=True)
     name = slug(plan)
     bundle = src / "matching-engine.bundle"
-    bundle_commits = make_bundle(repo, branches, bundle)
+    bundle_commits = make_bundle(repo, commits, bundle)
     write_json(src / "dataset-metadata.json",
                {"id": f"{owner}/{name}-src", "title": f"{name}-src", "licenses": [{"name": "other"}]})
     code = embed(here.read_text(encoding="utf-8"),
@@ -969,15 +971,16 @@ class SelfTest(unittest.TestCase):
                                       check=True, capture_output=True, text=True).stdout.strip()
             repo.mkdir()
             g("init", "-q")
-            g("checkout", "-q", "-b", "b0")
+            g("symbolic-ref", "HEAD", "refs/heads/master")  # git's usual initial branch names: the
             (repo / "f.txt").write_text("one\n")
             g("add", "f.txt")
             g("commit", "-q", "-m", f"first, by {name}")
-            g("branch", "bx")
+            g("checkout", "-q", "-b", "main")  # kernel's checkout must not collide with either
             (repo / "f.txt").write_text("two\n")
             g("commit", "-q", "-am", f"second <{mail}>")
-            made = make_bundle(repo, ["b0", "bx"], bundle)
-            self.assertEqual(made, make_bundle(repo, ["b0", "bx"], bundle))  # reproducible
+            commits = {br: g("rev-parse", br) for br in ("master", "main")}
+            made = make_bundle(repo, commits, bundle)
+            self.assertEqual(made, make_bundle(repo, commits, bundle))  # reproducible
             self.assertEqual(g("for-each-ref", BUNDLE_REF), "")  # temporary refs gone
             data = bundle.read_bytes()
             for x in (name, mail):
