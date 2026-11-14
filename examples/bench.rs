@@ -430,8 +430,11 @@ fn latency_pass(args: &Args) -> Result<Latency, String> {
     let mut all = new_hist();
     let mut book = new_hist();
     let (mut all_ticks, mut book_ticks, mut saturated) = (0u64, 0u64, 0u64);
-    // One slot per possible frame in a chunk, written once now so it is resident.
+    // One slot per possible frame in a chunk. vec! of zeros is mapped lazily, so write every
+    // slot now to fault the pages in before the timed loop; black_box keeps the write.
     let mut timings: Vec<u32> = vec![0; DEFAULT_CHUNK / MIN_FRAME + 1];
+    timings.fill(1);
+    std::hint::black_box(&mut timings);
     let limit = args.limit.unwrap_or(u64::MAX);
     let mut messages = 0u64;
     loop {

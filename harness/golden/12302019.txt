@@ -1,4 +1,4 @@
-format matching-engine-golden-v1
+format matching-engine-golden-v2
 input_file 12302019.NASDAQ_ITCH50
 input_bytes 8251407909
 input_sha256 5d81c2e14a0f748b29c674b6a342796932702034b4dd341e39e9a9ec5bac610f
@@ -31,6 +31,7 @@ executions_fallback_not_best_price 308
 executions_fallback_behind_at_best 92959
 executions_fallback_unknown_order 816
 executions_fallback_too_large 48
+executions_fallback_zero_shares 0
 executions_aggressor_percent 98.3834
 c_price_differs 97146
 rejections 1881
@@ -50,4 +51,4 @@ diverged_books 15
 final_books_with_orders 4
 final_resting_orders 4
 replay_hash_algorithm sha256
-replay_hash d3fd748385bc35aeb4c3df28b4cd74d2409dde27810770ef05b37a545a9ecf2d
+replay_hash 58ff016326b19a3cf3ab850f1373206139ed954794bd2500ca009bf9e715f647

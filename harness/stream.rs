@@ -1,9 +1,10 @@
 //! Reads an ITCH file in large chunks so that the bytes a caller parses are already resident in
 //! memory: no file I/O and no page faults happen while a chunk is being parsed.
 //!
-//! The buffer is allocated and touched once. Each [`ChunkReader::fill`] moves the unparsed tail of
-//! the previous chunk (a frame cut by the chunk boundary) to the front and reads until the buffer
-//! is full or the file ends.
+//! The buffer is allocated once. Each [`ChunkReader::fill`] moves the unparsed tail of the
+//! previous chunk (a frame cut by the chunk boundary) to the front and reads until the buffer is
+//! full or the file ends; the read writes every byte it returns, so those pages are resident
+//! before the caller parses them.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -25,7 +26,7 @@ impl ChunkReader {
         assert!(chunk > 1 << 17, "chunk too small for a frame");
         Ok(Self {
             file: File::open(path)?,
-            // vec! of zeros writes every page, so the buffer is resident before any timing.
+            // A zeroed allocation, mapped lazily: the first fill's reads fault its pages in.
             buf: vec![0u8; chunk],
             len: 0,
             eof: false,

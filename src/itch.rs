@@ -350,11 +350,6 @@ impl<'a> Frames<'a> {
     pub fn offset(&self) -> usize {
         self.offset
     }
-
-    /// The bytes after the frames returned so far.
-    pub fn rest(&self) -> &'a [u8] {
-        &self.buf[self.offset..]
-    }
 }
 
 impl Iterator for Frames<'_> {
@@ -750,7 +745,6 @@ mod tests {
             );
             assert_eq!(items.len(), if cut > boundary { 2 } else { 1 });
             assert_eq!(frames.offset(), if cut > boundary { boundary } else { 0 });
-            assert_eq!(frames.rest(), &stream[frames.offset()..cut]);
         }
     }
 

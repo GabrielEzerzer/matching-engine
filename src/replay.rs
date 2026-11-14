@@ -16,9 +16,10 @@
 //! synthetic id at or above [`TAKER_ID_BASE`]. The book's matching then has to pick exactly the
 //! named order, and the driver checks that it did (a mismatch is a [`ReplayError`]). If the named
 //! order is not at the front of the best level (around the crosses and in other special cases),
-//! or the execution is larger than what the book has left, the driver falls back to `Reduce`, so
-//! the book stays as Nasdaq's is. The `C` execution price is ignored: the aggressor trades at the
-//! resting order's price, and [`Stats::c_price_differs`] counts how often the two differ.
+//! or the execution is for zero shares or more than the book has left, the driver falls back to
+//! `Reduce`, so the book stays as Nasdaq's is. The `C` execution price is ignored: the aggressor
+//! trades at the resting order's price, and [`Stats::c_price_differs`] counts how often the two
+//! differ.
 //!
 //! Every other message type changes no book. `R` (stock directory) records the symbol of a
 //! locate and `H` (stock trading action) its trading state.
@@ -64,33 +65,6 @@ impl CommandKind {
         CommandKind::ExecutionAggressor,
         CommandKind::ExecutionFallback,
     ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            CommandKind::Add => "add",
-            CommandKind::Delete => "delete",
-            CommandKind::PartialCancel => "partial_cancel",
-            CommandKind::Replace => "replace",
-            CommandKind::ExecutionAggressor => "execution_aggressor",
-            CommandKind::ExecutionFallback => "execution_fallback",
-        }
-    }
-}
-
-pub const REJECT_REASONS: [RejectReason; 4] = [
-    RejectReason::ZeroQuantity,
-    RejectReason::DuplicateOrderId,
-    RejectReason::UnknownOrder,
-    RejectReason::ReduceTooLarge,
-];
-
-pub fn reject_reason_name(reason: RejectReason) -> &'static str {
-    match reason {
-        RejectReason::ZeroQuantity => "zero_quantity",
-        RejectReason::DuplicateOrderId => "duplicate_order_id",
-        RejectReason::UnknownOrder => "unknown_order",
-        RejectReason::ReduceTooLarge => "reduce_too_large",
-    }
 }
 
 fn reason_index(reason: RejectReason) -> usize {
@@ -127,16 +101,19 @@ pub struct Stats {
     pub exec_fallback_unknown: u64,
     /// Executions replayed as `Reduce` because they are larger than the order's remaining shares.
     pub exec_fallback_too_large: u64,
+    /// Executions replayed as `Reduce` because they are for zero shares, which the book rejects.
+    pub exec_fallback_zero_shares: u64,
     /// `C` messages whose execution price differs from the named order's resting price.
     pub c_price_differs: u64,
-    /// Rejections by command kind (index in [`CommandKind::ALL`]) and reason (index in
-    /// [`REJECT_REASONS`]).
+    /// Rejections by command kind (index in [`CommandKind::ALL`]) and reason (zero quantity,
+    /// duplicate order id, unknown order, reduce too large). Read with [`Stats::rejections_for`].
     pub rejections: [[u64; 4]; 6],
     /// Add or replace commands that traded in our book. Nasdaq rests these only while the
     /// security is not trading (see the module docs).
     pub unexpected_trade_messages: u64,
-    /// Those of `unexpected_trade_messages` that arrived while the security's last trading
-    /// state was `T` (trading).
+    /// Those of `unexpected_trade_messages` that arrived while the security was trading: its
+    /// last trading state was `T`, or no `H` message had arrived for it yet. Only an explicit
+    /// halted, paused or quotation-only state counts as not trading.
     pub unexpected_trade_messages_while_trading: u64,
     /// Those that arrived while the security was trading and its book had not diverged yet.
     /// A consistent feed and a correct book make this zero.
@@ -160,6 +137,7 @@ impl Default for Stats {
             exec_fallback_behind_at_best: 0,
             exec_fallback_unknown: 0,
             exec_fallback_too_large: 0,
+            exec_fallback_zero_shares: 0,
             c_price_differs: 0,
             rejections: [[0; 4]; 6],
             unexpected_trade_messages: 0,
@@ -177,6 +155,7 @@ impl Stats {
             + self.exec_fallback_behind_at_best
             + self.exec_fallback_unknown
             + self.exec_fallback_too_large
+            + self.exec_fallback_zero_shares
     }
 
     pub fn total_rejections(&self) -> u64 {
@@ -423,7 +402,7 @@ impl Replay {
             CommandKind::Add | CommandKind::Replace if trades > 0 => {
                 self.stats.unexpected_trade_messages += 1;
                 self.stats.unexpected_trades += trades;
-                if self.trading_state(locate) == Some(b'T') {
+                if !matches!(self.trading_state(locate), Some(b'H' | b'P' | b'Q')) {
                     self.stats.unexpected_trade_messages_while_trading += 1;
                     if !self.diverged(locate) {
                         self.stats.unexpected_trade_messages_on_clean_trading_books += 1;
@@ -469,6 +448,11 @@ impl Replay {
         };
         if c_price.is_some_and(|p| p != order.price) {
             self.stats.c_price_differs += 1;
+        }
+        if shares == 0 {
+            // An aggressor for zero shares would be rejected and fail the aggressor check.
+            self.stats.exec_fallback_zero_shares += 1;
+            return (fallback, CommandKind::ExecutionFallback);
         }
         if shares > order.qty {
             self.stats.exec_fallback_too_large += 1;

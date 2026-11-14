@@ -301,6 +301,31 @@ fn execution_of_an_unknown_or_too_small_order_is_a_counted_rejection() {
 }
 
 #[test]
+fn execution_of_zero_shares_on_the_front_order_falls_back_to_reduce() {
+    let mut r = Replay::new();
+    run(&mut r, add(1, false, 5, 1000));
+    let (cmd, events) = run(&mut r, exec(1, 0));
+    assert_eq!(cmd, Some(Command::Reduce { id: 1, by: 0 }));
+    assert_eq!(
+        events,
+        [Event::Rejected {
+            id: 1,
+            reason: RejectReason::ZeroQuantity
+        }]
+    );
+    let s = r.stats();
+    assert_eq!(s.exec_fallback_zero_shares, 1);
+    assert_eq!(s.exec_aggressor, 0);
+    assert_eq!(
+        s.rejections_for(CommandKind::ExecutionFallback, RejectReason::ZeroQuantity),
+        1
+    );
+    // The order is untouched and a later execution still replays as an aggressor.
+    run(&mut r, exec(1, 5));
+    assert_eq!(r.stats().exec_aggressor, 1);
+}
+
+#[test]
 fn crossing_adds_are_counted_by_trading_state_and_mark_the_book_diverged() {
     let mut r = Replay::new();
     run(&mut r, trading_action(b'H'));
@@ -349,6 +374,34 @@ fn crossing_add_on_a_clean_trading_book_is_counted_separately() {
         r.stats().unexpected_trade_messages_on_clean_trading_books,
         1
     );
+}
+
+#[test]
+fn crossing_add_before_any_trading_action_counts_as_trading() {
+    let mut r = Replay::new();
+    assert_eq!(r.trading_state(L), None);
+    run(&mut r, add(1, false, 50, 1000));
+    run(&mut r, add(2, true, 50, 1000));
+    let s = r.stats();
+    assert_eq!(s.unexpected_trade_messages_while_trading, 1);
+    assert_eq!(s.unexpected_trade_messages_on_clean_trading_books, 1);
+}
+
+#[test]
+fn crossing_adds_while_paused_or_quoting_do_not_count_as_trading() {
+    for state in *b"PQ" {
+        let mut r = Replay::new();
+        run(&mut r, trading_action(state));
+        run(&mut r, add(1, false, 50, 1000));
+        run(&mut r, add(2, true, 50, 1000));
+        let s = r.stats();
+        assert_eq!(s.unexpected_trade_messages, 1);
+        assert_eq!(
+            s.unexpected_trade_messages_while_trading, 0,
+            "{}",
+            state as char
+        );
+    }
 }
 
 #[test]

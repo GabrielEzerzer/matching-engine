@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use matching_engine::itch::{Frames, ItchError, Message};
-use matching_engine::replay::{CommandKind, REJECT_REASONS, Replay, reject_reason_name};
+use matching_engine::RejectReason;
+use matching_engine::itch::{Frames, ItchError};
+use matching_engine::replay::{CommandKind, Replay};
 use sha2::{Digest, Sha256};
 
 use golden::{ReplayHasher, hex};
@@ -187,9 +188,7 @@ fn run(file: &Path, limit: Option<u64>, diagnose: bool) -> Result<Vec<(String, S
             let before = diagnose.then(|| Before::capture(&replay, &msg));
             let applied = replay.apply(&msg).map_err(|e| e.to_string())?;
             hasher.events(applied.locate, applied.events);
-            if let Message::SystemEvent { event, .. } = msg {
-                hasher.checkpoint(event, &replay);
-            }
+            hasher.after_message(&msg, &replay);
             if let Some(before) = before {
                 diag.record(&before, &msg, &replay);
             }
@@ -235,7 +234,7 @@ fn summary(
     let s = replay.stats();
     let mut out: Vec<(String, String)> = Vec::new();
     let mut put = |k: &str, v: String| out.push((k.to_string(), v));
-    put("format", "matching-engine-golden-v1".into());
+    put("format", "matching-engine-golden-v2".into());
     put(
         "input_file",
         file.file_name()
@@ -281,6 +280,10 @@ fn summary(
         "executions_fallback_too_large",
         s.exec_fallback_too_large.to_string(),
     );
+    put(
+        "executions_fallback_zero_shares",
+        s.exec_fallback_zero_shares.to_string(),
+    );
     let pct = if executions == 0 {
         0.0
     } else {
@@ -302,7 +305,11 @@ fn summary(
             let n = s.rejections_for(kind, reason);
             if n > 0 {
                 put(
-                    &format!("rejections_{}_{}", kind.name(), reject_reason_name(reason)),
+                    &format!(
+                        "rejections_{}_{}",
+                        command_kind_name(kind),
+                        reject_reason_name(reason)
+                    ),
                     n.to_string(),
                 );
             }
@@ -342,6 +349,33 @@ fn summary(
     put("replay_hash_algorithm", "sha256".into());
     put("replay_hash", hex(&hash));
     out
+}
+
+const REJECT_REASONS: [RejectReason; 4] = [
+    RejectReason::ZeroQuantity,
+    RejectReason::DuplicateOrderId,
+    RejectReason::UnknownOrder,
+    RejectReason::ReduceTooLarge,
+];
+
+fn reject_reason_name(reason: RejectReason) -> &'static str {
+    match reason {
+        RejectReason::ZeroQuantity => "zero_quantity",
+        RejectReason::DuplicateOrderId => "duplicate_order_id",
+        RejectReason::UnknownOrder => "unknown_order",
+        RejectReason::ReduceTooLarge => "reduce_too_large",
+    }
+}
+
+fn command_kind_name(kind: CommandKind) -> &'static str {
+    match kind {
+        CommandKind::Add => "add",
+        CommandKind::Delete => "delete",
+        CommandKind::PartialCancel => "partial_cancel",
+        CommandKind::Replace => "replace",
+        CommandKind::ExecutionAggressor => "execution_aggressor",
+        CommandKind::ExecutionFallback => "execution_fallback",
+    }
 }
 
 /// State captured before a message, for `--diagnose`.
@@ -396,6 +430,8 @@ impl Diagnostics {
                 "behind_at_best"
             } else if after.exec_fallback_unknown > b.exec_fallback_unknown {
                 "unknown"
+            } else if after.exec_fallback_zero_shares > b.exec_fallback_zero_shares {
+                "zero_shares"
             } else {
                 "too_large"
             };

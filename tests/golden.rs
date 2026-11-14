@@ -86,8 +86,9 @@ fn every_event_has_its_documented_bytes() {
     for (event, body) in cases {
         let mut out = Vec::new();
         encode_event(&mut out, 0xABCD, &event);
-        let mut want = vec![0xCD, 0xAB];
-        want.extend_from_slice(&body);
+        // The tag byte comes first, then the locate, then the fields.
+        let mut want = vec![body[0], 0xCD, 0xAB];
+        want.extend_from_slice(&body[1..]);
         assert_eq!(out, want, "{event:?}");
     }
     for (reason, byte) in [
@@ -108,12 +109,14 @@ fn empty_replay_digest_is_pinned() {
     let digest = ReplayHasher::new().finish(&replay);
     assert_eq!(
         hex(&digest),
-        "6415c4da8f9145c5a15161f9d7fb0b97ee3b8568e4e471ddf3c62e190e7b702b"
+        "3add35e0dbe18fe685957a34a23250fd17bfdd88fee7e5daf1517e5f5acbddab"
     );
 }
 
-#[test]
-fn small_replay_digest_is_pinned() {
+/// Replays three messages at locate 7: a buy of 100 at 500, a crossing sell of 40 that trades
+/// against it (an unexpected trade, which is fine here), and a system event, through a hasher
+/// with checkpoints every `period` messages.
+fn small_replay_digest(period: u64) -> String {
     let h = |locate| Header {
         locate,
         tracking: 0,
@@ -130,7 +133,6 @@ fn small_replay_digest_is_pinned() {
     };
     let messages = [
         add(1, true, 100),
-        // Crosses and trades 40 against order 1 (an unexpected trade, which is fine here).
         add(2, false, 40),
         Message::SystemEvent {
             header: h(0),
@@ -138,16 +140,39 @@ fn small_replay_digest_is_pinned() {
         },
     ];
     let mut replay = Replay::new();
-    let mut hasher = ReplayHasher::new();
+    let mut hasher = ReplayHasher::with_period(period);
     for msg in &messages {
         let applied = replay.apply(msg).unwrap();
         hasher.events(applied.locate, applied.events);
-        if let Message::SystemEvent { event, .. } = *msg {
-            hasher.checkpoint(event, &replay);
-        }
+        hasher.after_message(msg, &replay);
     }
+    hex(&hasher.finish(&replay))
+}
+
+#[test]
+fn small_replay_digest_is_pinned() {
+    // The default period is far beyond three messages: only the system event's checkpoint.
     assert_eq!(
-        hex(&hasher.finish(&replay)),
-        "c0f830a610f46a0a1c61802f5704477ae0f2323ad2f46ad265ab3da2c8c6cb78"
+        small_replay_digest(golden::PERIOD),
+        "7c8f8d0426a642d12848ca057385a5b7066f418a30ffb58888a8ddd418fb7f65"
     );
+}
+
+#[test]
+fn periodic_checkpoints_are_pinned() {
+    // One periodic checkpoint, after the second message.
+    assert_eq!(
+        small_replay_digest(2),
+        "0a9b77eabda6461092eab67d36902c6bcfda52f7d5a99b509b53e6893653a6d6"
+    );
+    // One after every message; on the system event it follows the system event's checkpoint.
+    assert_eq!(
+        small_replay_digest(1),
+        "49e2089db6dbf6ec43147808dc0c7b266e21c55df32b8be121236b1e92665404"
+    );
+}
+
+#[test]
+fn the_checkpoint_period_is_two_to_the_twenty() {
+    assert_eq!(golden::PERIOD, 1 << 20);
 }
