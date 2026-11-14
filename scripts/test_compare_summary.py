@@ -141,7 +141,7 @@ class Arithmetic(unittest.TestCase):
         meta, runs, pairs = cs.load(write(lines))
         e = cs.estimate(*cs.diffs(runs, pairs, "all_mean_ns"), False)
         self.assertAlmostEqual(e["effect"], 0.0, places=9)
-        self.assertAlmostEqual(cs.pct(e["order"]), 100 * (1 / 0.9 - 1), places=6)  # 11.1%: first run vs second
+        self.assertAlmostEqual(cs.report(e, None, False)["order_effect_pct"], 10.0, places=9)
 
 
 class EndToEnd(unittest.TestCase):
@@ -174,6 +174,21 @@ class EndToEnd(unittest.TestCase):
         self.assertIsNone(s["all_mean_ns"]["order_effect_pct"])
         self.assertIn("not measured", err)
 
+    def test_order_effect_is_how_much_faster_the_second_run_was(self):
+        # Every second run takes 0.9 of the time and gives 0.9 of the throughput: 10% faster in
+        # latency, 10% slower in throughput.
+        lines = comparison([0, 0, 0], [0, 0, 0], sha_c=SHA_A, tput=True, second=0.9)
+        _, s, _ = summarise(write(lines))
+        self.assertEqual(s["all_mean_ns"]["order_effect_pct"], 10.0)
+        self.assertEqual(s["throughput_msgs_per_s"]["order_effect_pct"], -10.0)
+
+    def test_non_positive_statistic_refused(self):
+        lines = comparison([-6, -4, -5], [-1, -3, -2])
+        lines[1]["all_p50_ns"] = 0
+        code, err = refused(write(lines))
+        self.assertEqual(code, 2)
+        self.assertIn("pair 1 baseline has all_p50_ns = 0", err)
+
     def test_aa_is_labelled_a_method_check(self):
         lines = comparison([-9.2, -8.8, -9.0], [9.1, 8.9, 9.0], sha_c=SHA_A)
         _, s, err = summarise("-s", "all_mean_ns", write(lines))
@@ -186,6 +201,11 @@ class EndToEnd(unittest.TestCase):
         aa = write(comparison([-1, 1, 0], [1, -1, 0], sha_c=SHA_A, flat=0.5))
         _, s, _ = summarise("-s", "all_mean_ns", "-f", aa, write(comparison([-6, -4, -5], [-1, -3, -2])))
         self.assertEqual(s["all_mean_ns"]["floor_ln_x100"], 1.53)
+        # For latency, improved needs the high end below pct(-floor), regressed the low end above
+        # pct(+floor).
+        f = 3.747 * math.sqrt(2 / 3) / 2 / 100
+        self.assertEqual(s["all_mean_ns"]["floor_pct"], round(100 * math.expm1(-f), 3))  # -1.518
+        self.assertEqual(s["all_mean_ns"]["floor_regressed_pct"], round(100 * math.expm1(f), 3))
         self.assertEqual(s["verdict"], "improved")  # 3.5 - 1.53 = 1.97 > 1.53
 
     def test_floor_must_match_throughput_setting(self):
