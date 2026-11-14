@@ -107,6 +107,40 @@ On the Kaggle machine a book command went from 177.3 ns to 159.7 ns (median over
 
 The code that merged differs from the measured commit in two places that the `book` measurement does not touch: `Level::check`, which only the tests and the invariant checker call, now also fails for a ring shorter than the level's count, and the `level` microbenchmark's adapter was rewritten for the merged setup's read checks.
 
+### Price-level lookup, round 1
+
+Session `stage3-levels`, started 14 November 2026 at 04:51 UTC. Baseline `209e9e2`. Measured part: `side`, 5,004,039 price-level operations per pass (find, insert, remove and best-price reads on six busy symbols up to 10:30).
+
+| Step | Change | Effect on best pass | Interval | Effect on median pass | Verdict |
+|---|---|---|---|---|---|
+| Same binary twice | none | −0.29% | −0.84% to +0.27% | +0.05% | inconclusive, as it should be |
+| First comparison | sorted `Vec` of levels in place of the `BTreeMap` (`54236c4`) | −6.42% | −6.78% to −6.07% | −6.04% | improved |
+| First comparison | `BTreeMap` with the best price cached (`5c22fc1`) | −8.63% | −9.07% to −8.18% | −8.14% | improved |
+| First comparison | sorted index of (price, slot) into a slab of levels (`5d2380b`) | −44.16% | −44.44% to −43.87% | −44.27% | improved (1 flagged run, on the baseline) |
+| Same binary twice | none | −0.08% | −0.48% to +0.32% | −0.02% | inconclusive, as it should be |
+| Confirming comparison | sorted index into a slab | −43.94% | −44.15% to −43.73% | −43.83% | improved |
+
+The golden replay hash was unchanged and the tests passed in the session. The session's window comparison ran with the statistic an earlier draft of the plan declared (`all_p50_ns`, 6 pairs: −9.96%, interval −18.73% to −0.25%; `book_mean_ns` in the same runs −9.80%, interval −17.80% to −1.03%). That is not the declared guardrail, so nothing was kept in this round. The two alternatives that improved less were not confirmed, because only the best of a group goes to the confirming comparison.
+
+### Price-level lookup, round 2
+
+Session `stage3-levels-r2`, started 14 November 2026 at 05:51 UTC. Baseline `209e9e2`, candidate `5d2380b` (the sorted index alone), part `side`, the same statistic and pair count as round 1. This is the one second round the procedure allows. Its reason was written down before it started: round 1's guardrail ran the wrong statistic and too few pairs.
+
+| Step | Change | Effect on best pass | Interval | Effect on median pass | Verdict |
+|---|---|---|---|---|---|
+| Same binary twice | none | +0.23% | −0.10% to +0.57% | +0.51% | inconclusive, as it should be |
+| First comparison | sorted index into a slab | −44.08% | −44.35% to −43.81% | −43.95% | improved |
+| Same binary twice | none | +0.12% | −0.08% to +0.31% | −0.07% | inconclusive, as it should be |
+| Confirming comparison | sorted index into a slab | −43.88% | −44.05% to −43.70% | −43.98% | improved |
+
+Guardrail: `book_mean_ns` −7.63%, interval −14.78% to +0.11%. The upper end is below +5%, so it passes. The interval reaches just above zero, so this test does not by itself show an end-to-end gain. One candidate run was flagged (pair 2, the only positive pair, at +8.94%); the other nine pairs lay between −2.5% and −16.8%. The window's median book message, reported for information, changed by −8.78% (interval −13.36% to −3.95%). The golden replay hash was unchanged and the tests passed in the session.
+
+**Kept on its second round: the sorted index into a slab of levels.** Both rounds side by side: round 1's first comparison −44.16% and confirmation −43.94%, with no guardrail of record; round 2's first comparison −44.08%, confirmation −43.88% and the guardrail above. Two rounds are two chances to pass, so the guardrail result is less certain than its interval says on its own. The effect on the part itself was the same in all four comparisons.
+
+On the Kaggle machine a price-level operation went from 44.4 ns to 24.9 ns (median over the runs of each run's best pass). In the guardrail window the mean time of a book message was 597.9 ns for the baseline and 562.5 ns for the candidate, and its median 465.1 ns and 431.5 ns (medians over the ten runs of each build). These window numbers are from a different session than the order queue's and are not comparable with them.
+
+The code that merged differs from the measured commit: removing a level checks in release builds too that the level is empty (one comparison per removed level), and it sits on top of the hasher and the linked ring, while the measurement was of the sorted index alone against `209e9e2`. The combination has not been timed.
+
 ### Instruction counts
 
 Instruction counts from `cachegrind` on the laptop are deterministic and are given as supporting numbers only; they are not timings and decide nothing. One pass of the part, candidate against `209e9e2`: on `orders`, the hasher −21.9% and the flat table −25.1%; on `book`, lazy removal +4.2%, the linked ring −4.2% and the map-entry change −0.8%. The flat table executes fewer instructions than the hasher and was still the slower of the two in time.
