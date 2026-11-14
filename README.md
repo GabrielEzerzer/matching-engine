@@ -140,7 +140,11 @@ The pairs within one comparison share the machine's state, such as its temperatu
 
 `inconclusive` is final for that round. Running the same comparisons again is a new round, and it is logged as one with its own result. A comparison with flagged runs counts as run, and repeating it is also a new round.
 
-When there are several alternatives for one part, each is compared once against the baseline with the same declared statistic and pair count, and only the one with the best effect goes on to the confirming comparison.
+When there are several alternatives for one part, each is compared once against the baseline with the same declared statistic and pair count, and only the one with the best effect goes on to the confirming comparison. The alternatives are compared on the same microbenchmark part, because effects measured on different parts have different denominators and cannot be ranked against each other. The confirming comparison shows that the chosen alternative beats the baseline again. It does not show that it beats the other alternatives.
+
+A kept change must also pass the guardrail (see "Guardrail window"), reproduce the golden hash and pass the tests.
+
+Every round is logged in `PERF.md`, kept or not, with the part that was changed, the microbenchmark part it was measured on, what that part's adapter includes, the effect and interval of each comparison, and the guardrail result.
 
 Over many rounds some kept changes will still be chance, and the effects reported for kept rounds are biased upward, because only the comparisons that came out well were kept. The unbiased figure for the whole exercise is one comparison of the starting commit against the final commit at the end.
 
@@ -175,12 +179,26 @@ scripts/compare.sh -m side -n 10 -s ns_per_op_min /root/bench-bins/BASE/micro /r
 
 The statistics are `ns_per_op_median` and `ns_per_op_min`, all runs must report the same `workload_checksum`, `passes` and `ops`, and the comparison rule is the one described above. Before the pairs, `compare.sh` runs the baseline once with one timed pass and discards its output, so that a workload derived on first use is derived there and every recorded run loads it from the cache. `-m` cannot be combined with `-l`, `-w` or `-t`.
 
+### What a microbenchmark result means
+
+The microbenchmarks screen changes. They do not measure how much of the real replay's cost a part accounts for, and a percentage measured on one part does not carry over to the replay.
+
+- **The statistics summarise whole passes.** `ns_per_op_min` is the fastest timed pass divided by its operations: the best observed cost of a warmed pass. It is the least disturbed by other work on the host, which is why rounds declare it, but a change that is faster in its best pass and slower in most would also win on it. Each comparison therefore reports the effect on `ns_per_op_median` beside the declared one, and a round whose two effects disagree in sign is logged as such. Neither statistic says anything about the latency of single operations or their tail.
+- **Memory is laid out differently from the real book.** `level` keeps every level in one vector created before the pass, where the book keeps levels inside its price map. `side` runs on levels that hold no orders. `orders` runs the map alone. A queue that stores more inline can win on `level` and lose once it sits inside the price map, and a change that improves locality between the order map and the levels cannot show its gain on either part alone.
+- **The stream is narrower and more regular than the replay.** It holds six symbols, and the work of all other symbols and of the other parts between two operations is removed. Every pass starts from empty state, reuses the memory the previous pass freed, and repeats the same operations, so caches and the branch predictor are warmer than they are during a day's replay, and the state never grows to what the book holds later in the day.
+
+A change whose gain depends on memory layout or on how two parts work together is therefore compared on `book`, not on its own part. This applies to any change that needs the order map inside the `level` adapter. Its log entry says that the result is the cost of pre-decoded book commands, not the cost of queue operations.
+
 ## Guardrail window
 
 A change that wins on its part still has to hold up end to end. `bench --window HH:MM:SS-HH:MM:SS` times only the messages in that part of the day: it first replays everything before the window untimed, so the books are in their real state when timing starts, and stops at the first message at or after the end. `compare.sh -w WINDOW` passes the option through.
 
 ```sh
-scripts/compare.sh -w 09:30:00-10:00:00 -s all_p50_ns /root/bench-bins/BASE/bench /root/bench-bins/CAND/bench > guard.jsonl
+scripts/compare.sh -w 09:30:00-10:00:00 -n 10 -s book_mean_ns /root/bench-bins/BASE/bench /root/bench-bins/CAND/bench > guard.jsonl
 ```
+
+The guardrail asks a different question from a round's comparisons: not whether the change is faster, but whether it could be meaningfully slower. Its statistic and its margin are declared before it runs. The statistic is `book_mean_ns`, the mean time of the messages that reach a book, because a mean moves when rare operations get slower and a median does not. The margin is 5%. The guardrail passes when the upper end of the comparison's interval is below +5%, which rules out a regression of that size at the interval's confidence. A verdict of `inconclusive` is not a pass: an interval from −2% to +8% is inconclusive and still allows an 8% regression. When the upper end is at or above the margin, the guardrail is unresolved and the change is not kept; it can be measured again as a new comparison with more pairs or on a quieter machine. Ten pairs decide clear cases and leave noisy ones unresolved.
+
+A pass covers this statistic in this window. It does not cover tail latency, or the state the books reach later in the day.
 
 The guardrail window is 09:30:00 to 10:00:00, the first half hour of regular trading. It is the densest part of the day, with 32,817,244 messages (about an eighth of the day) and the largest bursts, so it exercises the book under the heaviest load. The warm-up before it is only the 6,696,719 pre-market messages, and the input up to 10:00 is 1.24 GB, which stays in the page cache between runs. A run takes about 30 seconds on a quiet machine, so a 10-pair comparison takes about ten minutes.
