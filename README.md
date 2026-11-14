@@ -1,10 +1,40 @@
 # Matching engine
 
-A price-time priority order-matching engine in Rust, built for correctness first and then optimised down to the nanosecond. A slow reference book checks it through property tests, and a full Nasdaq ITCH 5.0 day replayed through it measures latency per message. Built out of interest.
+A price-time priority order-matching engine in Rust. A deliberately slow reference book checks it event by event, a full Nasdaq ITCH 5.0 trading day is replayed through it, and every message of that day is timed. The library has no runtime dependencies.
+
+## Current state
+
+The work ran in three stages, all finished. Stage 1 built a correct, unoptimised order book and the reference book that checks it. Stage 2 built the rig that makes measurements trustworthy: an ITCH 5.0 parser, a replay driver, a golden hash of the whole day's output, differential checks and a latency benchmark. Stage 3 tried optimisations one part at a time under a rule fixed before any numbers were seen, and kept three of them. `PERF.md` records every round, kept or not.
+
+### How correctness is checked
+
+- **Differential testing against a reference model.** `harness/reference.rs` keeps every order in one flat list and scans it for each match. Property tests send random command streams to both books and require identical events, and identical snapshots of every resting order, after every command. A deterministic deep-book test does the same over 8,684 commands on 300 price levels per side, and `examples/diff_slice` replays 5,000,000 commands of six busy symbols from the real day through both books and compares every event.
+- **Aggressor replay against Nasdaq's own executions.** When an ITCH execution names the order at the front of the best level, the replay sends it as the incoming order it really was, and the book's own matching has to trade against exactly that order or the replay stops. On the sample day 98.4% of executions replay this way, and 99.8% of plain E executions name the order this book has at the front, which checks the book's price-time priority against Nasdaq's.
+- **A golden hash of the whole day.** SHA-256 over every event of every book and periodic snapshots of every book's full state, for all 268,744,780 messages of 30 December 2019. Every kept optimisation reproduced it.
+
+### Results
+
+Median of three whole-day runs of the final build (`2c792ab`) on one pinned vCPU of a shared Kaggle cloud VM: 4 vCPUs, Intel Xeon at 2.20 GHz (Broadwell), Linux, `rustc 1.100.0`, fat LTO.
+
+| Measure | Result |
+|---|---|
+| Latency per message, p50 | 414 ns |
+| Latency per message, p99 | 2.0 µs |
+| Latency per message, p99.9 | 7.9 µs |
+| Throughput, one vCPU | 1.78 million messages per second |
+| Book command, final build against the unoptimised stage 2 build | 38.4% less time (98% interval 38.1% to 38.8%) |
+
+What is timed: each message on its own, from splitting its frame off an in-memory buffer through decoding it and applying it to its book, matching included. Messages run back to back; the file is read in 64 MiB chunks outside the timed regions. The timer's own cost, about 20 ns on that machine, is included in every latency. Throughput comes from a separate pass with no per-message timer. The last row compares the final build with the unoptimised stage 2 code (`f84e022`) on 2,922,290 pre-decoded commands of six busy symbols, in 10 alternating pairs; a second comparison in the same session confirmed it at 34.8%. `PERF.md` has the ranges of the runs, the other statistics and each round.
+
+These numbers are not directly comparable with the messages-per-second figures that ITCH book-building replays publish. Those replays rebuild the book from Nasdaq's executions without matching and divide wall time by the message count. Here matching runs throughout, the latency rows time each message separately, and the throughput pass times only parsing and applying from memory, leaving file reads out. Several published engines report higher throughput than this one.
+
+### How this was built
+
+Built with AI coding agents under the author's direction. Every pull request that changed code was reviewed before it merged by a separate review agent with a fresh context, and most also by a second model (GPT); each pull request's description records its reviews. Documentation-only changes were merged without review.
 
 ## What exists
 
-Stage 1 is a correct, unoptimised baseline: a library crate with a single-instrument `OrderBook`.
+The library crate has a single-instrument `OrderBook`.
 
 - Commands: limit and market orders, cancel, reduce (keeps time priority) and replace (new id, price and quantity; loses time priority and may trade). Invalid commands are rejected with a reason and leave the book unchanged.
 - Each command appends its events (accepted, trades, fills, cancels, reductions, replacements, rejections) to a `Vec<Event>` the caller owns, in a deterministic order documented on `Event`. A trade always prints at the resting order's price.
@@ -12,17 +42,17 @@ Stage 1 is a correct, unoptimised baseline: a library crate with a single-instru
 - Prices are `u32` ticks of $0.0001 and quantities are `u32` shares, matching ITCH 5.0. Level totals are `u64`.
 - There is no self-trade prevention: orders carry no owner.
 
-The book is split into modules that later stages measure and replace one at a time: `side` (price-level lookup, a sorted index into a slab of levels), `level` (the FIFO queue at one price, a doubly linked list in a slab of nodes per book), `orders` (the id map, a `HashMap` with a keyed integer hasher) and `book` (matching).
+The book is split into modules that can be measured and replaced one at a time: `side` (price-level lookup, a sorted index into a slab of levels), `level` (the FIFO queue at one price, a doubly linked list in a slab of nodes per book), `orders` (the id map, a `HashMap` with a keyed integer hasher) and `book` (matching). Stage 3 replaced the first three, which started as a `BTreeMap` of levels, a `VecDeque` per level and a `HashMap` with SipHash. An ITCH decoder that reads fields from fixed-size arrays was faster on its own part but did not pass the end-to-end check, so it was not merged; it stays on the branch `parse-arrays`.
 
-`harness/reference.rs` is a deliberately slow reference book that keeps every order in one flat list and scans it for each match. Only the tests and the differential replay compile it.
+`harness/reference.rs` is the slow reference book. Only the tests and the differential replay compile it.
 
-Stage 2 is the rig that makes optimisation rounds trustworthy: an ITCH 5.0 parser, a replay driver, a golden hash of the full day's output, differential checks against the reference book at depth, and a latency benchmark.
+The replay and measurement rig:
 
 - `src/itch.rs` parses ITCH 5.0 without allocating. It fully decodes the order messages (A, F, E, C, X, D, U) and the system event (S), stock directory (R) and stock trading action (H) messages. Every other 5.0 message type is recognised and length-checked. An unknown type, a wrong length or a cut-off frame is an error.
 - `src/replay.rs` drives one `OrderBook` per stock locate from the messages (see "How ITCH maps to book commands").
 - `examples/replay.rs` replays a whole day, prints the summary counts and the golden hash, and records or checks them against `harness/golden/12302019.txt`. The hash encoding is documented in `harness/golden.rs`.
 - `examples/diff_slice.rs` replays busy symbols through the real book and the reference book and compares every event.
-- `examples/bench.rs` and `scripts/bench.sh` measure latency per message and throughput.
+- `examples/bench.rs` and `scripts/bench.sh` measure latency per message and throughput; `examples/micro.rs` times one part of the book at a time (see [BENCHMARKING.md](BENCHMARKING.md)).
 
 ## Running the tests
 
@@ -34,7 +64,7 @@ cargo test --all-targets
 - `tests/prop.rs` sends random command streams to both books and requires identical events and identical snapshots after every command, along with the book's internal invariants. It runs 2,000 streams by default; set `PROPTEST_CASES` to run more, for example `PROPTEST_CASES=50000 cargo test --release --test prop`. It also checks that the generators reach the cases they are meant to cover.
 - `tests/deep.rs` is a deterministic deep-book differential test. It builds 300 price levels per side with queues of up to 252 orders, then cancels, reduces, replaces, sweeps, drains and repopulates, comparing events, snapshots and invariants with the reference after each of its 8,684 commands.
 - `tests/replay.rs` covers the ITCH-to-command mapping and the counters; `tests/golden.rs` pins the hash encoding with digests computed independently from the documented byte layout; the parser's tests are in `src/itch.rs`.
-- `tests/workload.rs` checks the microbenchmark workloads (see "Microbenchmarks") on a hand-made command stream: the derived operations rebuild each book's orders, levels and resting shares, each order-map operation matches a lookup the book makes, and the encoding round-trips. It also checks that the `level` operations contain exactly the looks at the front of a queue that the book makes. Its tests of the adapters that drive the real parts, of the share totals that catch an adapter skipping quantity changes, and of the read check that catches an adapter skipping a lookup or returning the wrong result, need the `internals` feature, so run the suite a second time with it:
+- `tests/workload.rs` checks the microbenchmark workloads (see "Microbenchmarks" in [BENCHMARKING.md](BENCHMARKING.md)) on a hand-made command stream: the derived operations rebuild each book's orders, levels and resting shares, each order-map operation matches a lookup the book makes, and the encoding round-trips. It also checks that the `level` operations contain exactly the looks at the front of a queue that the book makes. Its tests of the adapters that drive the real parts, of the share totals that catch an adapter skipping quantity changes, and of the read check that catches an adapter skipping a lookup or returning the wrong result, need the `internals` feature, so run the suite a second time with it:
 
 ```sh
 cargo test --all-targets --features internals
@@ -44,15 +74,16 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `ca
 
 ## The ITCH data
 
-The replay uses the public Nasdaq TotalView-ITCH 5.0 sample for 30 December 2019 (3,524,013,057 bytes compressed, 8,251,407,909 bytes and 268,744,780 messages decompressed). Under Linux or WSL2:
+The replay uses the public Nasdaq TotalView-ITCH 5.0 sample for 30 December 2019 (3,524,013,057 bytes compressed, 8,251,407,909 bytes and 268,744,780 messages decompressed). On Linux:
 
 ```sh
-scripts/fetch-itch.sh            # into $ITCH_DIR, default /data/itch
+export ITCH_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/itch"   # the default; any folder works
+scripts/fetch-itch.sh
 ```
 
 It downloads with resume, checks the pinned size and SHA-256 of the `.gz`, decompresses it and skips work already done. `VERIFY=1` also hashes an existing decompressed file. The data never goes into git.
 
-All replay, golden, differential and benchmark runs below are Linux runs (WSL2 on Windows), from the repository root, in release mode. On WSL2 with the checkout on a Windows drive, keep the build output on the Linux filesystem, for example `export CARGO_TARGET_DIR=/root/cargo-target/matching-engine`.
+All replay, golden, differential and benchmark runs below are Linux runs, from the repository root, in release mode, with `ITCH_DIR` set as above. If the checkout is on a slow filesystem (a Windows drive under WSL2, for example), keep the build output elsewhere: `export CARGO_TARGET_DIR="$HOME/cargo-target/matching-engine"`.
 
 ## How ITCH maps to book commands
 
@@ -73,7 +104,7 @@ While a security is halted, paused or in a quotation-only period, Nasdaq accepts
 ```sh
 cargo build --release --example replay
 "${CARGO_TARGET_DIR:-target}"/release/examples/replay \
-    --check harness/golden/12302019.txt /data/itch/12302019.NASDAQ_ITCH50
+    --check harness/golden/12302019.txt "$ITCH_DIR"/12302019.NASDAQ_ITCH50
 ```
 
 The run takes about five minutes. It recomputes every line of the golden file (the input's size and SHA-256, message counts by type, execution, rejection and unexpected-trade counts, and the replay hash) and exits with status 1, printing the recorded and computed value of each differing line, if anything changed. `--write FILE` records a new golden file; `--limit N` stops after N messages for quick looks; `--diagnose` prints each unexpected trade and rejection with its time and the book's best prices, and breaks down the fallback executions.
@@ -84,7 +115,7 @@ The replay hash is SHA-256 over every event of every book in message order, each
 
 ```sh
 cargo build --release --example diff_slice
-"${CARGO_TARGET_DIR:-target}"/release/examples/diff_slice /data/itch/12302019.NASDAQ_ITCH50
+"${CARGO_TARGET_DIR:-target}"/release/examples/diff_slice "$ITCH_DIR"/12302019.NASDAQ_ITCH50
 ```
 
 By default it takes AAPL, MSFT, AMD, TSLA, QQQ and SPY from the start of the day and stops after 5,000,000 of their book commands, which takes about two and a half minutes. It compares every event with the reference book, and snapshots and invariants every 200 commands per book and at the end. The default slice reaches books of up to 22,282 orders on 4,769 levels with queues of up to 1,336 orders. `--symbols A,B`, `--limit N` (0 for the whole day) and `--snapshot-every K` change the slice.
@@ -92,7 +123,7 @@ By default it takes AAPL, MSFT, AMD, TSLA, QQQ and SPY from the start of the day
 ## Benchmark
 
 ```sh
-scripts/bench.sh > bench.jsonl          # 5 runs, pinned to CPU 5
+scripts/bench.sh > bench.jsonl          # 5 runs, pinned to the last CPU
 scripts/bench.sh -n 3 -c 2 -l 20000000  # 3 quick runs of 20M messages on CPU 2
 ```
 
@@ -100,157 +131,8 @@ Each run makes two passes over the whole day with a fresh replay each time. The 
 
 The release profile uses one codegen unit, fat LTO and full debug info (for `perf`; it costs nothing at run time).
 
-## Comparing two builds
+Comparing two builds, the rule that decides whether an optimisation is kept, the microbenchmarks, the guardrail window and the Kaggle runner are described in [BENCHMARKING.md](BENCHMARKING.md).
 
-On a shared laptop, runs of one build differ by more than a typical optimisation gains, so a candidate is never judged against numbers recorded earlier. Both binaries run in the same session instead, in pairs, on the same input and CPU, and the result comes from the difference within each pair.
+## License
 
-```sh
-scripts/bench-build.sh       # on the baseline commit: prints /root/bench-bins/<short commit>/bench
-scripts/bench-build.sh       # again on the candidate commit
-scripts/compare.sh -s all_p50_ns /root/bench-bins/BASE/bench /root/bench-bins/BASE/bench > aa.jsonl  # A/A method check
-scripts/compare.sh -s all_p50_ns /root/bench-bins/BASE/bench /root/bench-bins/CAND/bench > ab.jsonl
-scripts/compare.sh -r ab.jsonl -s all_p50_ns   # summarise saved runs again without running
-```
-
-`bench-build.sh [LABEL]` builds the release benchmark and the microbenchmarks and copies them to `$BENCH_BINS/LABEL/bench` and `$BENCH_BINS/LABEL/micro` (default `/root/bench-bins`; the default label is the short commit, with `-dirty` when tracked files have uncommitted changes). `commit.txt` (the full commit), `build.txt` (toolchain, build time, SHA-256) and `settings.txt` go beside it. `settings.txt` records how the binary was compiled apart from the source: `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, the other Cargo environment variables that set flags or profile options, the path and SHA-256 of each Cargo config file (never its contents, which can hold registry tokens), the target triple, the release profile from `Cargo.toml` and `rustc -vV`. It never overwrites an existing label.
-
-`compare.sh [-s STAT] [-n PAIRS] [-c CPU] [-l LIMIT] [-t] [-w WINDOW] [-m PART] [-f FLOOR] BASELINE CANDIDATE [FILE]` runs 6 pairs by default, pinned to CPU 5. Pair 1 runs the baseline first, pair 2 the candidate first, and so on. The pair count must be even and at least 6, so that each order has at least 3 pairs. Each run is the latency pass only (`bench --no-throughput`). A full-day run takes about three and a half minutes, so one pair takes about seven minutes and a 6-pair comparison about 42 minutes. `-t` adds the throughput pass and compares throughput too. `-w` and `-m` select the shorter runs described under "Guardrail window" and "Microbenchmarks" below. `compare.sh` refuses two different binaries whose `settings.txt` files differ, and prints the difference, so that a change of compiler, flags or profile cannot pass as a change to the source. Binaries kept before `settings.txt` existed have no record and are refused, except as an A/A comparison of one binary with itself.
-
-For each pair, and for each of the mean, p50, p99 and p99.9 of all messages and of book messages, it computes d = 100 × ln(candidate / baseline), the log ratio of the two runs, which is close to the percentage difference for small changes. The effect is the order-balanced mean of d: the mean over baseline-first pairs and the mean over candidate-first pairs, averaged. That cancels an advantage of running first or second in a pair, which is large on this machine: in the first A/A comparison the second run was about 8% faster at p50 and 12% faster on the mean, and in the second it was about −6% at p50 and −9% on the mean, so the first run was the faster one. Because the advantage multiplies the second run's time, it cancels exactly on the log scale; plain percentage differences would leave a bias of about 0.5% at a 10% advantage. The output shows the advantage as `order`, the percentage by which the second run was faster (negative when the first run was faster), or `not measured` when one order has no pairs.
-
-The uncertainty of the effect comes from the spread of d within each order, which leaves the order advantage out of it. With s1² and n1 the sample variance and count of d over baseline-first pairs and s2² and n2 over candidate-first pairs, and a = s1²/n1 and b = s2²/n2, the standard error is sqrt(a + b) / 2. The bound is the one-sided 99% Student-t value times the standard error, with the Welch–Satterthwaite degrees of freedom (a + b)² / (a²/(n1 − 1) + b²/(n2 − 1)), rounded down and at least 1. That count is n1 + n2 − 2 when the two orders are equally noisy and falls towards n − 1 of the noisier order when they are not, so one quiet order cannot make the bound narrow. Some t values: 6.965 for 2 degrees of freedom, 4.541 for 3, 3.747 for 4 (6 equally noisy pairs), 3.143 for 6 (8 pairs), 2.896 for 8 (10 pairs) and 2.764 for 10 (12 pairs). The arithmetic stays on the log scale; the effect and the two ends of the interval (effect minus and plus the bound) are converted back to percent changes for the tables and the summary line, which also keeps the log-scale values.
-
-`-s STAT` declares, before the run, the one statistic that gets a verdict, for example `all_p50_ns`. Every other statistic is printed with its effect and interval as information only, and without `-s` there is no verdict. The verdict is:
-
-- `improved` when the whole interval lies on the better side of zero (lower latency, higher throughput) and, when `-f` is given, beyond the floor;
-- `regressed` in the mirror case;
-- `inconclusive` otherwise. A saved comparison re-read with `-r` that has unequal or fewer than 3 pairs per order is `inconclusive (too few pairs)`, and the summary shows what the interval alone would give.
-
-An A/A comparison (the same binary passed twice) checks the method: its effect should sit inside its bound, so it should come out `inconclusive`, and the summary says so when the two binaries are the same. An A/A comparison that does not come out `inconclusive` on the declared statistic means the setup is not measuring cleanly. Find the cause before trusting any comparison, and do not rerun the A/A comparison in the hope that it passes. `-f FLOOR` takes an A/A comparison's output and additionally requires the candidate's interval to clear that comparison's absolute effect plus its bound for the declared statistic. The tables show that floor as the percent change each end of the interval must clear: `imp_bar` for `improved` (for latency the high end must be below it, for throughput the low end above it) and `reg_bar` for `regressed`. The floor file must be an A/A comparison by SHA-256 and have the same input, limit, CPU and `-t` setting, and `compare.sh` refuses anything else. `-f` raises the bar considerably on a noisy day, so it is a choice made before the run like the statistic.
-
-stdout gets every run's JSON line (with its pair and role), one line of d values per pair, and a summary line with the declared statistic, the verdict and every statistic's effect, interval, degrees of freedom and order advantage. stderr shows the same as tables, with each run's control-loop times beside its numbers so a loaded run is visible; the control loop never adjusts a result. A run whose wall time or control loop took more than 1.5 times the comparison's median is flagged, since the host may have slept or been busy. The summary is computed by `scripts/compare_summary.py`, and `python3 scripts/test_compare_summary.py` checks its arithmetic and the verdict rule on small hand-made comparisons.
-
-### Procedure for optimisation rounds
-
-A round tries one change and keeps it only when the comparisons say `improved`, so the procedure is fixed before any numbers are seen.
-
-The declared statistic, the pair count and whether `-f` is used are chosen before the first comparison of a round and do not change during it.
-
-The pairs within one comparison share the machine's state, such as its temperature and the load from other work on the host, so they are not fully independent and the interval is narrower than the true uncertainty. A change is therefore kept only when a second comparison, with the same declared statistic and pair count, also says `improved`. The second comparison runs as a separate block, not back to back with the first: at least one other build or measurement runs in between. A first `improved` followed by `inconclusive` or `regressed` means the change is not kept.
-
-`inconclusive` is final for that round. Running the same comparisons again is a new round, and it is logged as one with its own result. A comparison with flagged runs counts as run, and repeating it is also a new round.
-
-A candidate that was not kept may be measured in one more round, and no more. The reason for the second round is written down before it starts, and it has to be something other than the result itself: a guardrail that ran with the wrong statistic, or runs that the control loop flagged as disturbed, which it does without looking at the result. A verdict that went against the candidate is not a reason. The second round repeats everything, the first comparison, the confirming comparison and the guardrail, with the statistic and pair count of the first. A candidate not kept after its second round is dropped. When a candidate is kept on its second round, its entry in `PERF.md` gives the reason for the rerun and the first round's results beside the second's, including the ones that went against it. Two attempts are two chances to pass, so a change kept on a second round is less certain than its intervals say: they describe that round alone and do not account for the choice between rounds.
-
-When there are several alternatives for one part, each is compared once against the baseline with the same declared statistic and pair count, and only the one with the best effect goes on to the confirming comparison. The alternatives are compared on the same microbenchmark part, because effects measured on different parts have different denominators and cannot be ranked against each other. The confirming comparison shows that the chosen alternative beats the baseline again. It does not show that it beats the other alternatives.
-
-A kept change must also pass the guardrail (see "Guardrail window"), reproduce the golden hash and pass the tests.
-
-Every round is logged in `PERF.md`, kept or not, with the part that was changed, the microbenchmark part it was measured on, what that part's adapter includes (the timed fold of read results among it), the effect and interval of each comparison, and the guardrail result.
-
-Over many rounds some kept changes will still be chance, and the effects reported for kept rounds are biased upward, because only the comparisons that came out well were kept. The unbiased figure for the whole exercise is one comparison of the starting commit against the final commit at the end.
-
-Why this procedure: an earlier version accepted a change when every pair agreed and the effect was larger than one A/A comparison's effect. That floor could be near zero by luck, agreement in five pairs happens by chance one time in 32 per statistic, eight statistics gave eight chances, and a round could be rerun until it agreed. The order advantage also made a real gain look worse in baseline-first pairs and better in candidate-first pairs, so it could never pass. The interval now comes from the repeated pairs themselves, the target is named in advance, a gain has to show up twice in separate blocks, and rerunning is counted.
-
-## Microbenchmarks
-
-`examples/micro.rs` times one part of the book at a time, so that a change to one part can be measured in seconds instead of a full-day replay. It needs the `internals` feature, which exposes the parts as `matching_engine::internals`; default builds, the tests and the public API do not change.
-
-```sh
-cargo build --release --features internals --example micro
-taskset -c 5 target/release/examples/micro side /data/itch/12302019.NASDAQ_ITCH50
-```
-
-The parts are:
-
-- `side`: the price levels of one side (`BookSide`): best price, find a level, find or create one, remove one;
-- `level`: the queue of orders at one price (`Level`): push, look at the front, reduce, pop the front, remove from anywhere, and reset when a level is emptied;
-- `orders`: the order-id map (`OrderMap`): insert, get, update, remove;
-- `book`: the book commands applied to `OrderBook`, which includes everything above and reports allocations per command from a counting global allocator;
-- `parse`: splitting and decoding ITCH frames into `Message`, without a book.
-
-The workload is the book commands of AAPL, MSFT, AMD, TSLA, QQQ and SPY from the start of the day until 10:30:00, which includes the first hour of regular trading: 2,922,290 commands. `parse` uses the 256 MiB of frames that start at 09:30:00 (8,357,979 messages). The operations of `side`, `level` and `orders` are derived by replaying those commands through the real book and watching it only through its public API, so they are a sequence of logical operations (for example "remove the order at price p on the sell side of book 3") rather than calls into the current code. A rewritten part runs the same workload through a small adapter in `harness/workload.rs`. Each operation stands for one call the book makes: for example, filling a maker is a lookup in the order map followed by a removal. `tests/workload.rs` checks that the derived operations rebuild the book's state on a hand-made command stream.
-
-The first run derives the workloads, which takes about 15 seconds, and caches them in `micro-cache/` beside the ITCH file (`/data/itch/micro-cache/`), keyed by a hash of the inputs, so later runs start in under a second. A run that loads the cache refuses it unless it encodes back to the same bytes, so a changed encoding cannot run different operations under the same checksum. Preparation is never timed. Each run makes one untimed pass, then a fixed number of timed passes, then two more untimed passes over the part's whole workload, each from empty state. After every pass it checks that the part ends with the orders, levels and resting shares the derivation recorded (9,856,654 shares in 71,966 orders at 16,177 levels); `side` checks levels only, because its operations carry no quantities. For `side`, `level` and `orders` it also checks what the reads returned: every best price, level lookup, front of a queue and order lookup is folded into one number, which must equal the number the workload stores. The stored number comes from the adapters of the binary that derived the workload, which in a comparison is the baseline. One limit: every level lookup in `side` finds a level, and those levels hold no orders, so each lookup folds the same value. For lookups the check therefore proves only that the adapter took a fold step, not that it looked the level up or found the right one; an adapter is a few lines and is read in review, and a wrong level in the real part fails the golden hash and the tests. The fold is a multiply-add per value inside the timed passes, in the baseline's adapter and in a candidate's alike. Its cost does not cancel out of a percentage: it dilutes a difference between two builds, most in the parts with many reads, so a result measures the adapter with its fold, not the part's reads alone. A run takes about 15 seconds. It prints one JSON line with the part, the operation counts, `workload_checksum` (two runs with the same checksum ran the same operations), ns per operation as the median, min and max over the timed passes and their spread, allocations per pass and per operation, and the same host readings as `bench`. Allocations are counted in the three untimed passes only, so the timed passes pay nothing for the counting. Allocation counts can differ by one or two between passes, because the order map's hasher is seeded randomly and that changes when the hash table rehashes in place instead of growing; the line reports the median, min and max.
-
-To compare two builds on one part, keep both with `scripts/bench-build.sh` and pass the `micro` binaries and `-m PART` to `compare.sh`:
-
-```sh
-scripts/compare.sh -m side -n 10 -s ns_per_op_min /root/bench-bins/BASE/micro /root/bench-bins/CAND/micro > side.jsonl
-```
-
-The statistics are `ns_per_op_median` and `ns_per_op_min`, all runs must report the same `workload_checksum`, `passes` and `ops`, and the comparison rule is the one described above. Before the pairs, `compare.sh` runs the baseline once with one timed pass and discards its output, so that a workload derived on first use is derived there and every recorded run loads it from the cache. `-m` cannot be combined with `-l`, `-w` or `-t`.
-
-### What a microbenchmark result means
-
-The microbenchmarks screen changes. They do not measure how much of the real replay's cost a part accounts for, and a percentage measured on one part does not carry over to the replay.
-
-- **The statistics summarise whole passes.** `ns_per_op_min` is the fastest timed pass divided by its operations: the best observed cost of a warmed pass. It is the least disturbed by other work on the host, which is why rounds declare it, but a change that is faster in its best pass and slower in most would also win on it. Each comparison therefore reports the effect on `ns_per_op_median` beside the declared one, and a round whose two effects disagree in sign is logged as such. Neither statistic says anything about the latency of single operations or their tail.
-- **Memory is laid out differently from the real book.** `level` keeps every level in one vector created at the start of each pass, where the book keeps levels inside its price map. `side` runs on levels that hold no orders. `orders` runs the map alone. A queue that stores more inline can win on `level` and lose once it sits inside the price map, and a change that improves locality between the order map and the levels cannot show its gain on either part alone.
-- **The stream is narrower and more regular than the replay.** It holds six symbols, and the work of all other symbols and of the other parts between two operations is removed. Every pass starts from empty state, reuses the memory the previous pass freed, and repeats the same operations, so caches and the branch predictor are warmer than they are during a day's replay, and the state never grows to what the book holds later in the day.
-
-A change whose gain depends on memory layout or on how two parts work together is therefore compared on `book`, not on its own part. This applies to any change that needs the order map inside the `level` adapter. Its log entry says that the result is the cost of pre-decoded book commands, not the cost of queue operations.
-
-## Guardrail window
-
-A change that wins on its part still has to hold up end to end. `bench --window HH:MM:SS-HH:MM:SS` times only the messages in that part of the day: it first replays everything before the window untimed, so the books are in their real state when timing starts, and stops at the first message at or after the end. `compare.sh -w WINDOW` passes the option through.
-
-```sh
-scripts/compare.sh -w 09:30:00-10:00:00 -n 10 -s book_mean_ns /root/bench-bins/BASE/bench /root/bench-bins/CAND/bench > guard.jsonl
-```
-
-The guardrail asks a different question from a round's comparisons: not whether the change is faster, but whether it could be meaningfully slower. Its statistic and its margin are declared before it runs. The statistic is `book_mean_ns`, the mean time of the messages that reach a book, because a mean moves when rare operations get slower and a median does not. The margin is 5%: the tolerance chosen for this project, not something the pairs establish. The guardrail passes if and only if the upper end of the comparison's interval is below +5%, whatever the comparison's verdict against zero. Under the comparison's sampling assumptions (see the procedure above for how far they hold), that rules out a regression of that size at the interval's confidence. The verdict alone settles nothing: `inconclusive` with an interval from −2% to +2% passes, and `inconclusive` with an interval from −2% to +8% does not, because it still allows an 8% regression. When the upper end is at or above the margin, the guardrail is unresolved and the change is not kept. An unresolved guardrail is a result like any other: it is not by itself a reason to measure again, and the guardrail is never repeated alone. The candidate can only get the one second round that "Procedure for optimisation rounds" allows, for one of the reasons given there, with the whole round repeated and the same pair count. Ten pairs decide clear cases and leave noisy ones unresolved.
-
-A pass covers this statistic in this window. It does not cover tail latency, or the state the books reach later in the day.
-
-The guardrail window is 09:30:00 to 10:00:00, the first half hour of regular trading. It is the densest part of the day, with 32,817,244 messages (about an eighth of the day) and the largest bursts, so it exercises the book under the heaviest load. The warm-up before it is only the 6,696,719 pre-market messages, and the input up to 10:00 is 1.24 GB, which stays in the page cache between runs. A run takes about 30 seconds on a quiet machine, so a 10-pair comparison takes about ten minutes.
-
-## Running the comparisons on Kaggle
-
-When the laptop is busy, its timings are not usable (the same binary can differ by a quarter between runs). `scripts/kaggle_bench.py` runs a fixed plan of comparisons on a Kaggle CPU session instead, as a private script kernel. It needs only the Python standard library and the `kaggle` CLI, logged in to the account that will own the run.
-
-A plan is a JSON file in `scripts/kaggle-plans/`. It names a base label, every label's branch, the CPU to pin to (`cpu`, default 3; a Kaggle CPU session has 4 vCPUs) and a stop time (`stop_after_min`, default 630, that is 10 h 30 min, and below 700; Kaggle ends a session at 12 h), then the steps in order:
-
-- `aa`: `compare.sh -m PART` of the base against itself, the method check, which should come out `inconclusive`;
-- `compare`: `compare.sh -m PART` of the base against a candidate, once per candidate and part;
-- `confirm_best`: for a group of earlier `compare` steps (the alternatives for one part), the one with the best effect among those that came out `improved` is compared again with the same statistic and pair count. If that also says `improved`, it is the group's winner: the alternative that beat the baseline twice, not one shown to be better than the other alternatives, which each met the machine at a different time. A winner is kept only if the guardrail, the golden check and the tests also pass. If no alternative improved, nothing runs. No winner is named when an earlier `aa` step of the same part did not finish with `inconclusive`, because the method is then not trustworthy on that machine;
-- `window`: `compare.sh -w WINDOW` of the base's and the group winner's `bench` binaries, the guardrail comparison. The runner records its interval; whether the guardrail passed is read from the interval's upper end against the declared margin, not from the verdict;
-- `golden`: the golden check (`replay --check`) and `cargo test --all-targets` in the group winner's checkout;
-- `bench`: `scripts/bench.sh` of one label, for a baseline table.
-
-`window` and `golden` are skipped when their group has no winner, and their note says why. Each confirmation must run as a separate block, as "Procedure for optimisation rounds" requires: the plan is refused unless at least one `aa`, `bench` or `window` step, or a `compare` of a candidate outside the group, comes between the group's last comparison and its `confirm_best`. When none of those steps finishes on the day, the confirmation is skipped and says so.
-
-On Kaggle the kernel installs Rust with rustup (stable, minimal profile) into `/kaggle/tmp`, fetches each label's branch from the bundle into its own checkout and checks it is at the bundle commit recorded when the kernel was written, fetches the ITCH day into `/kaggle/tmp/itch` with the base checkout's `scripts/fetch-itch.sh`, and builds every label with its own `scripts/bench-build.sh`. After each build it writes the branch's real commit into the build's `commit.txt`, which `compare.sh` passes to the binaries, and a `bench` step's output gets the real commit in place of the bundle commit, so the results carry the real commit ids. Only after every build has finished does it run the steps, one at a time, with the base checkout's `scripts/compare.sh`. A step is `done` only when the script exited 0 and printed its summary line. A failed step, or one whose label did not build, is recorded as `failed`, and the run goes on with the steps that do not depend on it. No command runs past 700 minutes from the kernel's start: one still running then is killed with its whole process group and its step recorded as failed. Everything it keeps is in `/kaggle/working/results`: `<step>.jsonl` (the script's stdout) and `<step>.err` for each step, `STATUS.json` and `SUMMARY.md` (one row per step), both rewritten every time a step or setup phase changes state, `host.txt` (`nproc`, `lscpu`, `lscpu -e`, the pinned CPU's frequency governor and driver where the VM exposes them, memory, kernel version and `rustc -vV`) and the setup and build logs. So that a result can be traced to what produced it, the folder also holds `plan.json` (the plan as it ran), each label's build records (`build-<label>-settings.txt` and `build-<label>-build.txt`), and, in `STATUS.json` and `SUMMARY.md`, a session id (the plan's name and the UTC start time) and the SHA-256 of the runner script as it ran. Each comparison row and each `bench` row carries a steal reading: the share of the pinned CPU's time the hypervisor gave to other guests during that step, from `/proc/stat`. It is there to explain a disturbed step afterwards and changes no verdict; a reading of 0 does not show the host was quiet, because a busy sibling hyperthread or a frequency change does not appear as steal.
-
-Check the plan, then write the dataset and kernel folders and push them (PowerShell; `kaggle datasets create` fails from Git Bash on Windows):
-
-```powershell
-python scripts/kaggle_bench.py --self-test
-python scripts/kaggle_bench.py --dry-run scripts/kaggle-plans/stage3-parse.json   # validates and prints every command
-python scripts/kaggle_bench.py --write-kernel scripts/kaggle-plans/stage3-parse.json $env:TEMP\me-bench-stage3-parse --owner KAGGLE_USER
-kaggle datasets create -p $env:TEMP\me-bench-stage3-parse\src      # later runs of the same plan: kaggle datasets version -p ... -m "new commits"
-kaggle datasets status KAGGLE_USER/me-bench-stage3-parse-src        # wait for "ready"
-kaggle kernels push -p $env:TEMP\me-bench-stage3-parse\kernel
-```
-
-`--write-kernel` writes `src/` (a git bundle with `dataset-metadata.json`) and `kernel/` (this script with the plan, each branch's real commit and its bundle commit embedded, with `kernel-metadata.json`: private, CPU only, internet on, the dataset attached). The bundle holds no history: for each branch the plan names it holds one commit of that branch's files with no parent, author and committer `bench <bench@localhost>`, a fixed date and a fixed message, under `refs/kaggle-bundle/<branch>`. The same tree always gives the same bundle commit. The temporary refs it creates in the local repository are deleted again afterwards. The owner is `--owner` or `$KAGGLE_USERNAME`. Write the kernel again after any branch moves, and version the dataset with it, or the kernel refuses the checkout.
-
-Follow and fetch the run:
-
-```powershell
-kaggle kernels status KAGGLE_USER/me-bench-stage3-parse
-kaggle kernels output KAGGLE_USER/me-bench-stage3-parse -p out\stage3-parse
-```
-
-Kaggle keeps `/kaggle/working` when the run ends; while it runs, the kernel's log shows each step and its verdict as it finishes.
-
-The results are Linux timings from a shared cloud VM, and what they show is limited in four ways.
-
-- **A verdict is evidence from one session.** Both binaries run in the same session on the same CPU, in alternating order, which cancels a stable advantage of running second. It does not cancel a disturbance that changes over time, such as a neighbour's load, a busy sibling hyperthread or a change of clock frequency.
-- **An A/A check that comes out `inconclusive` shows that no problem was seen while it ran.** It does not certify that the host stayed stable during the comparisons before or after it.
-- **A confirming comparison in the same session is a second look under much the same conditions.** The measurement between the two comparisons separates them in time but does not make them independent, so the two results are not two independent tests and their error rates do not multiply.
-- **Effects from different sessions are not ranked against each other.** Each plan runs on its own VM with its own baseline build, the hardware can differ between sessions, and different parts have different denominators. A table may show several groups' effects together only with each one's session, baseline commit, part, statistic and both comparisons' intervals, and it does not say that one group's change is worth more than another's.
-
-Every session is logged, including one whose A/A check failed or that found nothing, and running a plan again is a new round. Absolute numbers (ns per operation, latencies, throughput) belong to that machine only, and `SUMMARY.md` and `host.txt` say so; never set them beside laptop numbers.
-
-The kernel makes three kinds of request: rustup's installer from `https://sh.rustup.rs` (and the toolchain it downloads), crates.io through cargo, and the Nasdaq sample file through `scripts/fetch-itch.sh`, each with the tool's default user agent. The upload carries the plan (labels, branch names and commit ids) and the bundle, which holds the named branches' files under the neutral `bench` identity and none of their history, so no author or committer name or address. Nothing else identifying is sent beyond the Kaggle account the CLI is logged in to, and the script never reads the CLI's credentials file.
+Licensed under either of the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option.

@@ -30,7 +30,7 @@
 # build-<label>-settings.txt and build-<label>-build.txt. Each step that runs a comparison or bench.sh
 # records the pinned CPU's steal and total jiffies from /proc/stat across the step and its wall
 # seconds; the readings are informational and never change a state, a verdict or a winner.
-# README.md, "Running the comparisons on Kaggle", describes the plan format and the step kinds.
+# BENCHMARKING.md, "Running the comparisons on Kaggle", describes the plan format and the step kinds.
 #
 # KAGGLE_BENCH_ROOT (default /kaggle) moves the kernel's root, for trying the kernel elsewhere.
 # Standard library only.

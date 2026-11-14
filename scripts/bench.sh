@@ -3,8 +3,8 @@
 #
 #   scripts/bench.sh [-n RUNS] [-c CPU] [-l LIMIT] [FILE]
 #
-# RUNS defaults to 5, CPU to 5 (any otherwise quiet vCPU will do), FILE to
-# $ITCH_DIR/12302019.NASDAQ_ITCH50 with ITCH_DIR defaulting to /data/itch. LIMIT stops each pass
+# RUNS defaults to 5, CPU to the last CPU (any otherwise quiet CPU will do), FILE to
+# $ITCH_DIR/12302019.NASDAQ_ITCH50 with ITCH_DIR defaulting to ${XDG_DATA_HOME:-$HOME/.local/share}/itch. LIMIT stops each pass
 # after that many messages (for quick checks; results of record use the whole day).
 #
 # stdout gets one JSON line per run as the benchmark prints it, then one summary JSON line with
@@ -12,11 +12,11 @@
 # ((max - min) / median, in percent) across the runs. A readable table goes to stderr.
 # Redirect stdout to a file to keep a baseline that a later run can be compared with.
 #
-# Linux only: results of record come from Linux under WSL2, never native Windows timings.
+# Linux only: results of record come from Linux, never native Windows timings.
 set -euo pipefail
 
 runs=5
-cpu=5
+cpu=$(($(nproc) - 1))
 limit=""
 while getopts "n:c:l:h" opt; do
     case "$opt" in
@@ -30,10 +30,10 @@ while getopts "n:c:l:h" opt; do
     esac
 done
 shift $((OPTIND - 1))
-file="${1:-${ITCH_DIR:-/data/itch}/12302019.NASDAQ_ITCH50}"
+file="${1:-${ITCH_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/itch}/12302019.NASDAQ_ITCH50}"
 
 if [ "$(uname -s)" != "Linux" ]; then
-    echo "bench.sh: refusing to run on $(uname -s); benchmarks of record run on Linux (WSL2)." >&2
+    echo "bench.sh: refusing to run on $(uname -s); benchmarks of record run on Linux." >&2
     exit 2
 fi
 if [ ! -f "$file" ]; then
