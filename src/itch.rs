@@ -176,7 +176,7 @@ impl std::error::Error for ItchError {}
 
 /// The fixed length in bytes (type byte included, length prefix excluded) of every ITCH 5.0
 /// message type, or `None` for a byte that is not a message type.
-pub fn message_length(kind: u8) -> Option<usize> {
+pub const fn message_length(kind: u8) -> Option<usize> {
     Some(match kind {
         b'S' => 12, // system event
         b'R' => 39, // stock directory
@@ -205,102 +205,157 @@ pub fn message_length(kind: u8) -> Option<usize> {
     })
 }
 
+/// [`message_length`] of a known type, usable as an array length at compile time.
+const fn len(kind: u8) -> usize {
+    match message_length(kind) {
+        Some(n) => n,
+        None => panic!("not an ITCH 5.0 message type"),
+    }
+}
+
 /// Decodes one message body (the bytes after the 2-byte length prefix).
+///
+/// Each decoded type checks its length by converting the body to an array of that length, so
+/// every field read is at a constant offset into an array of known size and needs no run-time
+/// bounds check.
 pub fn decode(msg: &[u8]) -> Result<Message, ItchError> {
     let Some(&kind) = msg.first() else {
         return Err(ItchError::Empty);
     };
-    let expected = message_length(kind).ok_or(ItchError::UnknownType { kind })?;
-    if msg.len() != expected {
-        return Err(ItchError::BadLength {
-            kind,
-            expected,
-            actual: msg.len(),
-        });
-    }
-    let header = Header {
-        locate: be16(msg, 1),
-        tracking: be16(msg, 3),
-        timestamp: be48(msg, 5),
-    };
     Ok(match kind {
-        b'S' => Message::SystemEvent {
-            header,
-            event: msg[11],
-        },
-        b'R' => Message::StockDirectory {
-            header,
-            stock: arr8(msg, 11),
-            market_category: msg[19],
-            financial_status: msg[20],
-            round_lot_size: be32(msg, 21),
-            round_lots_only: msg[25],
-            issue_classification: msg[26],
-            issue_subtype: [msg[27], msg[28]],
-            authenticity: msg[29],
-            short_sale_threshold: msg[30],
-            ipo_flag: msg[31],
-            luld_reference_price_tier: msg[32],
-            etp_flag: msg[33],
-            etp_leverage_factor: be32(msg, 34),
-            inverse_indicator: msg[38],
-        },
-        b'H' => Message::StockTradingAction {
-            header,
-            stock: arr8(msg, 11),
-            state: msg[19],
-            reason: [msg[21], msg[22], msg[23], msg[24]],
-        },
-        b'A' | b'F' => Message::AddOrder {
-            header,
-            reference: be64(msg, 11),
-            buy: side(kind, msg[19])?,
-            shares: be32(msg, 20),
-            stock: arr8(msg, 24),
-            price: be32(msg, 32),
-            attribution: (kind == b'F').then(|| [msg[36], msg[37], msg[38], msg[39]]),
-        },
-        b'E' | b'C' => Message::OrderExecuted {
-            header,
-            reference: be64(msg, 11),
-            executed_shares: be32(msg, 19),
-            match_number: be64(msg, 23),
-            with_price: if kind == b'C' {
-                Some(ExecutionPrice {
-                    printable: match msg[31] {
-                        b'Y' => true,
-                        b'N' => false,
-                        value => {
-                            return Err(ItchError::BadField {
-                                kind,
-                                field: "printable",
-                                value,
-                            });
-                        }
-                    },
-                    price: be32(msg, 32),
-                })
-            } else {
-                None
-            },
-        },
-        b'X' => Message::OrderCancel {
-            header,
-            reference: be64(msg, 11),
-            cancelled_shares: be32(msg, 19),
-        },
-        b'D' => Message::OrderDelete {
-            header,
-            reference: be64(msg, 11),
-        },
-        b'U' => Message::OrderReplace {
-            header,
-            original_reference: be64(msg, 11),
-            new_reference: be64(msg, 19),
-            shares: be32(msg, 27),
-            price: be32(msg, 31),
-        },
-        _ => Message::Other { kind, header },
+        b'S' => {
+            let m = fixed::<{ len(b'S') }>(kind, msg)?;
+            Message::SystemEvent {
+                header: header(m),
+                event: m[11],
+            }
+        }
+        b'R' => {
+            let m = fixed::<{ len(b'R') }>(kind, msg)?;
+            Message::StockDirectory {
+                header: header(m),
+                stock: bytes(m, 11),
+                market_category: m[19],
+                financial_status: m[20],
+                round_lot_size: u32::from_be_bytes(bytes(m, 21)),
+                round_lots_only: m[25],
+                issue_classification: m[26],
+                issue_subtype: bytes(m, 27),
+                authenticity: m[29],
+                short_sale_threshold: m[30],
+                ipo_flag: m[31],
+                luld_reference_price_tier: m[32],
+                etp_flag: m[33],
+                etp_leverage_factor: u32::from_be_bytes(bytes(m, 34)),
+                inverse_indicator: m[38],
+            }
+        }
+        b'H' => {
+            let m = fixed::<{ len(b'H') }>(kind, msg)?;
+            Message::StockTradingAction {
+                header: header(m),
+                stock: bytes(m, 11),
+                state: m[19],
+                reason: bytes(m, 21),
+            }
+        }
+        b'A' => {
+            let m = fixed::<{ len(b'A') }>(kind, msg)?;
+            Message::AddOrder {
+                header: header(m),
+                reference: u64::from_be_bytes(bytes(m, 11)),
+                buy: side(kind, m[19])?,
+                shares: u32::from_be_bytes(bytes(m, 20)),
+                stock: bytes(m, 24),
+                price: u32::from_be_bytes(bytes(m, 32)),
+                attribution: None,
+            }
+        }
+        b'F' => {
+            let m = fixed::<{ len(b'F') }>(kind, msg)?;
+            Message::AddOrder {
+                header: header(m),
+                reference: u64::from_be_bytes(bytes(m, 11)),
+                buy: side(kind, m[19])?,
+                shares: u32::from_be_bytes(bytes(m, 20)),
+                stock: bytes(m, 24),
+                price: u32::from_be_bytes(bytes(m, 32)),
+                attribution: Some(bytes(m, 36)),
+            }
+        }
+        b'E' => {
+            let m = fixed::<{ len(b'E') }>(kind, msg)?;
+            Message::OrderExecuted {
+                header: header(m),
+                reference: u64::from_be_bytes(bytes(m, 11)),
+                executed_shares: u32::from_be_bytes(bytes(m, 19)),
+                match_number: u64::from_be_bytes(bytes(m, 23)),
+                with_price: None,
+            }
+        }
+        b'C' => {
+            let m = fixed::<{ len(b'C') }>(kind, msg)?;
+            let printable = match m[31] {
+                b'Y' => true,
+                b'N' => false,
+                value => {
+                    return Err(ItchError::BadField {
+                        kind,
+                        field: "printable",
+                        value,
+                    });
+                }
+            };
+            Message::OrderExecuted {
+                header: header(m),
+                reference: u64::from_be_bytes(bytes(m, 11)),
+                executed_shares: u32::from_be_bytes(bytes(m, 19)),
+                match_number: u64::from_be_bytes(bytes(m, 23)),
+                with_price: Some(ExecutionPrice {
+                    printable,
+                    price: u32::from_be_bytes(bytes(m, 32)),
+                }),
+            }
+        }
+        b'X' => {
+            let m = fixed::<{ len(b'X') }>(kind, msg)?;
+            Message::OrderCancel {
+                header: header(m),
+                reference: u64::from_be_bytes(bytes(m, 11)),
+                cancelled_shares: u32::from_be_bytes(bytes(m, 19)),
+            }
+        }
+        b'D' => {
+            let m = fixed::<{ len(b'D') }>(kind, msg)?;
+            Message::OrderDelete {
+                header: header(m),
+                reference: u64::from_be_bytes(bytes(m, 11)),
+            }
+        }
+        b'U' => {
+            let m = fixed::<{ len(b'U') }>(kind, msg)?;
+            Message::OrderReplace {
+                header: header(m),
+                original_reference: u64::from_be_bytes(bytes(m, 11)),
+                new_reference: u64::from_be_bytes(bytes(m, 19)),
+                shares: u32::from_be_bytes(bytes(m, 27)),
+                price: u32::from_be_bytes(bytes(m, 31)),
+            }
+        }
+        _ => {
+            let expected = message_length(kind).ok_or(ItchError::UnknownType { kind })?;
+            if msg.len() != expected {
+                return Err(bad_length(kind, expected, msg));
+            }
+            // Every ITCH 5.0 message is longer than the 11 bytes of type and header.
+            let Some(m) = msg.first_chunk::<11>() else {
+                unreachable!("every message type is longer than its header");
+            };
+            Message::Other {
+                kind,
+                header: header(m),
+            }
+        }
     })
 }
 
@@ -389,30 +444,37 @@ fn side(kind: u8, byte: u8) -> Result<bool, ItchError> {
     }
 }
 
-// The callers have checked the message length against the type, so these slices are in bounds.
-fn be16(b: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([b[at], b[at + 1]])
+/// `msg` as an array of `N` bytes, the fixed length of message type `kind`, or `BadLength`.
+fn fixed<const N: usize>(kind: u8, msg: &[u8]) -> Result<&[u8; N], ItchError> {
+    msg.try_into().map_err(|_| bad_length(kind, N, msg))
 }
 
-fn be32(b: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+fn bad_length(kind: u8, expected: usize, msg: &[u8]) -> ItchError {
+    ItchError::BadLength {
+        kind,
+        expected,
+        actual: msg.len(),
+    }
 }
 
-fn be48(b: &[u8], at: usize) -> u64 {
-    let mut x = [0u8; 8];
-    x[2..].copy_from_slice(&b[at..at + 6]);
-    u64::from_be_bytes(x)
+/// The header fields at bytes 1..11 of a message. Tracking number and timestamp are read as one
+/// big-endian `u64`: the top 16 bits are the tracking number, the low 48 the timestamp.
+#[inline(always)]
+fn header<const N: usize>(m: &[u8; N]) -> Header {
+    let tracking_and_time = u64::from_be_bytes(bytes(m, 3));
+    Header {
+        locate: u16::from_be_bytes(bytes(m, 1)),
+        tracking: (tracking_and_time >> 48) as u16,
+        timestamp: tracking_and_time & 0xffff_ffff_ffff,
+    }
 }
 
-fn be64(b: &[u8], at: usize) -> u64 {
-    let mut x = [0u8; 8];
-    x.copy_from_slice(&b[at..at + 8]);
-    u64::from_be_bytes(x)
-}
-
-fn arr8(b: &[u8], at: usize) -> [u8; 8] {
-    let mut x = [0u8; 8];
-    x.copy_from_slice(&b[at..at + 8]);
+/// `W` bytes of `m` starting at `at`. Every caller passes a constant `at` with `at + W <= N`, so
+/// once this is inlined the range check is decided at compile time and disappears.
+#[inline(always)]
+fn bytes<const W: usize, const N: usize>(m: &[u8; N], at: usize) -> [u8; W] {
+    let mut x = [0u8; W];
+    x.copy_from_slice(&m[at..at + W]);
     x
 }
 
@@ -449,6 +511,26 @@ mod tests {
             Ok(Message::SystemEvent {
                 header: HEADER(0),
                 event: b'O'
+            })
+        );
+    }
+
+    #[test]
+    fn header_fields_use_all_their_bits() {
+        let mut m = vec![b'D'];
+        m.extend_from_slice(&0xfedcu16.to_be_bytes());
+        m.extend_from_slice(&0xba98u16.to_be_bytes());
+        m.extend_from_slice(&[0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa]);
+        m.extend_from_slice(&7u64.to_be_bytes());
+        assert_eq!(
+            decode(&m),
+            Ok(Message::OrderDelete {
+                header: Header {
+                    locate: 0xfedc,
+                    tracking: 0xba98,
+                    timestamp: 0xffee_ddcc_bbaa,
+                },
+                reference: 7,
             })
         );
     }
