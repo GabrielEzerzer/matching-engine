@@ -1,6 +1,7 @@
 //! Matching: applies commands to the two sides and the order map and emits events.
 
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 
 use crate::orders::{OrderMap, RestingOrder};
 use crate::side::BookSide;
@@ -74,13 +75,15 @@ impl OrderBook {
                 }
             },
             Command::Reduce { id, by } => {
-                let Some(order) = self.orders.get(&id).copied() else {
+                // One probe: the entry both reads the order and updates or removes it.
+                let Entry::Occupied(mut entry) = self.orders.entry(id) else {
                     out.push(Event::Rejected {
                         id,
                         reason: RejectReason::UnknownOrder,
                     });
                     return;
                 };
+                let order = *entry.get();
                 let reason = if by == 0 {
                     Some(RejectReason::ZeroQuantity)
                 } else if by > order.qty {
@@ -94,10 +97,10 @@ impl OrderBook {
                 }
                 let remaining = order.qty - by;
                 if remaining == 0 {
-                    self.orders.remove(&id);
+                    entry.remove();
                     self.side_mut(order.side).remove_order(order.price, id, by);
                 } else {
-                    self.orders.get_mut(&id).expect("checked above").qty = remaining;
+                    entry.get_mut().qty = remaining;
                     self.side_mut(order.side)
                         .level_mut(order.price)
                         .expect("order's level exists")
@@ -111,25 +114,26 @@ impl OrderBook {
                 price,
                 qty,
             } => {
-                let Some(old) = self.orders.get(&id).copied() else {
-                    out.push(Event::Rejected {
-                        id,
-                        reason: RejectReason::UnknownOrder,
-                    });
-                    return;
-                };
-                let reason = if qty == 0 {
-                    Some(RejectReason::ZeroQuantity)
-                } else if new_id != id && self.orders.contains_key(&new_id) {
-                    Some(RejectReason::DuplicateOrderId)
-                } else {
+                // An accepted replace probes the new id and removes the old one, two lookups
+                // before the new order rests. Only a rejection looks again, to report the first
+                // failing check in the documented order.
+                let duplicate = new_id != id && self.orders.contains_key(&new_id);
+                let removed = if qty == 0 || duplicate {
                     None
+                } else {
+                    self.orders.remove(&id)
                 };
-                if let Some(reason) = reason {
+                let Some(old) = removed else {
+                    let reason = if !self.orders.contains_key(&id) {
+                        RejectReason::UnknownOrder
+                    } else if qty == 0 {
+                        RejectReason::ZeroQuantity
+                    } else {
+                        RejectReason::DuplicateOrderId
+                    };
                     out.push(Event::Rejected { id, reason });
                     return;
-                }
-                self.orders.remove(&id);
+                };
                 self.side_mut(old.side).remove_order(old.price, id, old.qty);
                 out.push(Event::Replaced { old_id: id, new_id });
                 self.submit(new_id, old.side, Some(price), qty, out);
@@ -323,12 +327,13 @@ impl OrderBook {
             while qty > 0
                 && let Some(maker_id) = level.front()
             {
-                let maker = orders
-                    .get_mut(&maker_id)
-                    .expect("queued order is in the id map");
-                let fill = qty.min(maker.qty);
+                // One probe: the entry both updates the maker and removes it once it is filled.
+                let Entry::Occupied(mut maker) = orders.entry(maker_id) else {
+                    panic!("queued order {maker_id} is not in the id map");
+                };
+                let fill = qty.min(maker.get().qty);
                 qty -= fill;
-                maker.qty -= fill;
+                maker.get_mut().qty -= fill;
                 level.reduce(fill);
                 out.push(Event::Trade {
                     taker_id,
@@ -336,9 +341,9 @@ impl OrderBook {
                     price,
                     qty: fill,
                 });
-                if maker.qty == 0 {
+                if maker.get().qty == 0 {
                     level.pop_front();
-                    orders.remove(&maker_id);
+                    maker.remove();
                     out.push(Event::Filled { id: maker_id });
                 }
             }

@@ -408,6 +408,25 @@ fn replace_of_an_unknown_id_is_rejected() {
 }
 
 #[test]
+fn replace_reports_the_first_failing_check() {
+    let mut book = OrderBook::new();
+    let setup = [limit(1, Buy, 100, 5), limit(2, Buy, 99, 5)];
+    // Unknown id wins over zero quantity and a duplicate new id.
+    let events = run(&mut book, &setup, replace(3, 2, 98, 0));
+    assert_eq!(events, [rejected(3, RejectReason::UnknownOrder)]);
+    // Zero quantity wins over a duplicate new id.
+    let events = run(&mut book, &[], replace(1, 2, 98, 0));
+    assert_eq!(events, [rejected(1, RejectReason::ZeroQuantity)]);
+    // Replacing an order with its own id is not a duplicate.
+    let events = run(&mut book, &[], replace(1, 1, 98, 0));
+    assert_eq!(events, [rejected(1, RejectReason::ZeroQuantity)]);
+    assert_eq!(
+        book.snapshot().bids,
+        [level(100, &[(1, 5)]), level(99, &[(2, 5)])]
+    );
+}
+
+#[test]
 fn duplicate_live_id_is_rejected() {
     let mut book = OrderBook::new();
     let setup = [limit(1, Buy, 100, 5)];
