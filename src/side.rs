@@ -22,9 +22,9 @@ pub struct BookSide {
     /// always last.
     flip: u32,
     /// `(key, slot in levels)`, sorted by key, worst price first.
-    /// shortcut: creating or removing a level moves every index entry better than it, so a level
-    /// created behind thousands of others costs a memmove of 8 bytes per level; if deep churn on
-    /// very deep books shows in the profile, keep far levels in a separate tree.
+    /// shortcut: inserting or removing a level far from the best price moves every better entry
+    /// (8 bytes each), so its cost grows with book depth; switch to a tree or a chunked index if
+    /// books much deeper than the sample day's become normal.
     index: Vec<(u32, u32)>,
     /// Every level this side has held at once. Slots not in `index` are empty and listed in
     /// `free`.
@@ -73,7 +73,8 @@ impl BookSide {
     fn remove_at(&mut self, position: usize) {
         let (_, slot) = self.index.remove(position);
         let level = &self.levels[slot as usize];
-        debug_assert!(
+        // Checked in release builds too: freeing a level that still holds orders would lose them.
+        assert!(
             level.is_empty() && level.total() == 0,
             "only empty levels are freed"
         );
@@ -267,6 +268,85 @@ mod tests {
                 (7, vec![3])
             );
             assert_eq!(prices(&side), best_first(s, &[99, 101]));
+        }
+    }
+
+    /// Compares `side` with `model` (price to its one resting order): the best price, every level
+    /// best first, and lookups of every level price, the prices next to each and the extremes.
+    fn check_against(side: &BookSide, s: Side, model: &BTreeMap<Price, OrderId>, at: &str) {
+        let keys: Vec<Price> = model.keys().copied().collect();
+        let want = best_first(s, &keys);
+        assert_eq!(side.best_price(), want.first().copied(), "{at}");
+        assert_eq!(prices(side), want, "{at}");
+        let probes = keys.iter().flat_map(|&p| [p - 1, p, p + 1]);
+        for probe in probes.chain([0, u32::MAX]) {
+            assert_eq!(
+                side.level(probe).map(|l| l.ids().collect::<Vec<_>>()),
+                model.get(&probe).map(|&id| vec![id]),
+                "{at}, price {probe}"
+            );
+        }
+    }
+
+    /// Level counts on both sides of `SCAN`, built in orders that put new levels at the best,
+    /// at the worst and in the middle, so lookups go through both the scan and the binary
+    /// search. Each build removes one level at every position in turn, refills the freed slot,
+    /// then drains, checking against a `BTreeMap` after every step.
+    #[test]
+    fn scan_and_binary_search_boundary() {
+        for s in SIDES {
+            for n in [7, 8, 9, 10, 17] {
+                let ascending: Vec<Price> = (0..n).map(|i| 100 + 10 * i as Price).collect();
+                let descending: Vec<Price> = ascending.iter().rev().copied().collect();
+                let interleaved: Vec<Price> = (0..n)
+                    .map(|i| ascending[if i % 2 == 0 { i / 2 } else { n - 1 - i / 2 }])
+                    .collect();
+                for (name, order) in [
+                    ("ascending", &ascending),
+                    ("descending", &descending),
+                    ("interleaved", &interleaved),
+                ] {
+                    for position in 0..n {
+                        let at = format!("{s:?}, {n} levels, {name}, position {position}");
+                        let mut side = BookSide::new(s);
+                        let mut model = BTreeMap::new();
+                        let mut next_id: OrderId = 0;
+                        for &p in order {
+                            next_id += 1;
+                            add(&mut side, p, next_id, 1);
+                            model.insert(p, next_id);
+                            check_against(&side, s, &model, &format!("{at}, insert {p}"));
+                        }
+
+                        // Remove the level at `position` from the best through a cancel.
+                        let p = prices(&side)[position];
+                        side.remove_order(p, model[&p], 1);
+                        model.remove(&p);
+                        check_against(&side, s, &model, &format!("{at}, removed {p}"));
+
+                        // A new level next to the removed one takes its slot.
+                        next_id += 1;
+                        add(&mut side, p + 5, next_id, 1);
+                        model.insert(p + 5, next_id);
+                        assert_eq!(side.levels.len(), n, "{at}: the freed slot was reused");
+                        assert!(side.free.is_empty(), "{at}");
+                        check_against(&side, s, &model, &format!("{at}, inserted {}", p + 5));
+
+                        // Drain the way matching does: empty the level at `position`, or the
+                        // worst once fewer remain, then drop it.
+                        while !model.is_empty() {
+                            let p = prices(&side)[position.min(model.len() - 1)];
+                            let level = side.level_mut(p).expect("level exists");
+                            level.reduce(1);
+                            level.pop_front();
+                            side.remove_level(p);
+                            model.remove(&p);
+                            assert_eq!(side.free.len(), n - model.len(), "{at}");
+                            check_against(&side, s, &model, &format!("{at}, drained {p}"));
+                        }
+                    }
+                }
+            }
         }
     }
 
