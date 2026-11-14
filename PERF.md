@@ -182,7 +182,30 @@ No candidate was measured for this part, because the two kept structural changes
 | `side` | sorted index into a slab (`5d2380b`) | 303 | 0.0001 | 0.2 |
 | `orders`, 4,978,788 operations | baseline and hasher | 82 | 0.0000 | 1.7 |
 
-The baseline allocated when a level's `VecDeque` was first filled or grew and when the `BTreeMap` of levels added a node. The ring keeps every queue node in one slab per book with a free list, and the index keeps every level in a slab and reuses the slot of a removed level. The two changes have not been counted together; the session `stage3-total` records the count for the merged code. What should be left is the growth of the slabs, the index vectors and the id map up to their peak sizes. Sizing them in advance was not tried.
+The baseline allocated when a level's `VecDeque` was first filled or grew and when the `BTreeMap` of levels added a node. The ring keeps every queue node in one slab per book with a free list, and the index keeps every level in a slab and reuses the slot of a removed level. Together, in the session `stage3-total` below, the merged code allocated 463 times per pass of the `book` workload. What should be left is the growth of the slabs, the index vectors and the id map up to their peak sizes. Sizing them in advance was not tried.
+
+### Start against final
+
+Session `stage3-total`, started 14 November 2026 at 06:51 UTC. Baseline `209e9e2`, final `2c792ab` (the hasher, the linked ring and the sorted index together; later commits on `main` change only tests, comments and this file). The plan was the one comparison the README names as the unbiased figure for the whole exercise: part `book`, `ns_per_op_min`, 10 pairs, then the guardrail window and the golden check.
+
+**The comparison did not produce a verdict.** `compare.sh` refuses to compare runs whose workload checksums differ, and they did: `209e9e2` writes workload format 2 and `2c792ab` format 3 (the read checks added to the other parts in #11 changed the format). That was a mistake in the plan, not a result: the baseline for this comparison has to be built with the final harness. Because no winner was named, the session skipped the guardrail window and the golden check. The golden check of `2c792ab` passed locally before it merged.
+
+What the session did record is below. None of it is a verdict under the procedure.
+
+- Both same-binary checks on `book` were inconclusive, as they should be (+0.15%, interval −0.61% to +0.92%, 1 flagged run; +0.39%, interval −0.46% to +1.24%).
+- All twenty `book` runs of the refused comparison completed. They time the same work: the same 2,922,290 commands (identical counts of limit orders, cancels, reductions and replaces), applied by the same function (`run_books` is unchanged between the two commits). A book command took 178.5 ns in the baseline and 113.4 ns in the final build (median over ten runs of each run's best pass). The final build was faster in every pair, by between 35.2% and 37.4%. No run was flagged.
+- Allocations per pass of that workload went from 380,226 to 463 (0.130 to 0.0002 per command).
+- The whole-day benchmark ran three times for each build, the baseline's three runs first and then the final build's. The runs are not paired, so a drift of the machine between the two blocks is not controlled; the control loop's median was 231 ms in the first block and 227 ms in the second.
+
+| Whole day, per message | Baseline `209e9e2` (median, range of 3 runs) | Final `2c792ab` (median, range of 3 runs) | Change of the median |
+|---|---|---|---|
+| p50 | 576.4 ns (567.3 to 577.3) | 423.6 ns (415.5 to 429.1) | −26.5% |
+| mean | 772.4 ns (744.8 to 777.1) | 606.5 ns (590.1 to 611.7) | −21.5% |
+| p99 | 2,494.1 ns (2,379.5 to 2,559.5) | 2,077.7 ns (2,014.1 to 2,085.0) | −16.7% |
+| p99.9 | 11,854.1 ns (10,523.2 to 12,108.6) | 9,177.7 ns (8,610.5 to 9,468.6) | −22.6% |
+| throughput | 1,376,202 messages/s (1,345,661 to 1,405,284) | 1,729,979 messages/s (1,719,672 to 1,749,105) | +25.7% |
+
+These absolute numbers belong to the Kaggle machine and are not comparable with the laptop baseline at the top of this file. The figure of record for the whole exercise is still open: it needs one more session with a baseline that has the starting commit's `src/` under the final harness.
 
 ### Instruction counts
 
