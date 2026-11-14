@@ -139,7 +139,7 @@ Guardrail: `book_mean_ns` −7.63%, interval −14.78% to +0.11%. The upper end 
 
 On the Kaggle machine a price-level operation went from 44.4 ns to 24.9 ns (median over the runs of each run's best pass). In the guardrail window the mean time of a book message was 597.9 ns for the baseline and 562.5 ns for the candidate, and its median 465.1 ns and 431.5 ns (medians over the ten runs of each build). These window numbers are from a different session than the order queue's and are not comparable with them.
 
-The code that merged differs from the measured commit: removing a level checks in release builds too that the level is empty (one comparison per removed level), and it sits on top of the hasher and the linked ring, while the measurement was of the sorted index alone against `209e9e2`. The combination has not been timed.
+The code that merged differs from the measured commit: removing a level checks in release builds too that the level is empty (one comparison per removed level), and it sits on top of the hasher and the linked ring, while the measurement was of the sorted index alone against `209e9e2`. The combination is timed in "Start against final" below.
 
 ### ITCH parsing, round 1
 
@@ -186,26 +186,38 @@ The baseline allocated when a level's `VecDeque` was first filled or grew and wh
 
 ### Start against final
 
-Session `stage3-total`, started 14 November 2026 at 06:51 UTC. Baseline `209e9e2`, final `2c792ab` (the hasher, the linked ring and the sorted index together; later commits on `main` change only tests, comments and this file). The plan was the one comparison the README names as the unbiased figure for the whole exercise: part `book`, `ns_per_op_min`, 10 pairs, then the guardrail window and the golden check.
+The README names one comparison of the starting commit against the final commit as the unbiased figure for the whole exercise. It took two sessions, because the first was planned with a baseline that could not be compared.
 
-**The comparison did not produce a verdict.** `compare.sh` refuses to compare runs whose workload checksums differ, and they did: `209e9e2` writes workload format 2 and `2c792ab` format 3 (the read checks added to the other parts in #11 changed the format). That was a mistake in the plan, not a result: the baseline for this comparison has to be built with the final harness. Because no winner was named, the session skipped the guardrail window and the golden check. The golden check of `2c792ab` passed locally before it merged.
+Session `stage3-total`, started 14 November 2026 at 06:51 UTC, compared `209e9e2` with `2c792ab` and **produced no verdict**. `compare.sh` refuses to compare runs whose workload checksums differ, and they did: `209e9e2` writes workload format 2 and `2c792ab` format 3. That was a mistake in the plan, not a result. Its twenty `book` runs completed and time the same 2,922,290 commands through the same function, so they are kept here for information: 178.5 ns per command for the baseline and 113.4 ns for the final build, the final build faster in every pair by between 35.2% and 37.4%.
 
-What the session did record is below. None of it is a verdict under the procedure.
+Session `stage3-total-r2`, started 14 November 2026 at 08:01 UTC, is the comparison of record. Its reason was written down before it started: the first session's baseline was on another workload format. The size of the effect was already visible in the refused runs, so this session was not started blind, but nothing about the comparison was changed except the baseline commit. Baseline `f84e022`, the commit on `main` just before the first optimisation: its `src/` is identical to `209e9e2`, the baseline of every round above, and it writes the same workload format as the final build. Final `2c792ab` (the hasher, the linked ring and the sorted index together; later commits on `main` change only tests, comments and this file). Part `book`, `ns_per_op_min`, 10 pairs: the plan was `scripts/kaggle-plans/stage3-total.json` with its base label set to `f84e022`. Every run reported the workload checksum `33743cd103e868b2`.
 
-- Both same-binary checks on `book` were inconclusive, as they should be (+0.15%, interval −0.61% to +0.92%, 1 flagged run; +0.39%, interval −0.46% to +1.24%).
-- All twenty `book` runs of the refused comparison completed. They time the same work: the same 2,922,290 commands (identical counts of limit orders, cancels, reductions and replaces), applied by the same function (`run_books` is unchanged between the two commits). A book command took 178.5 ns in the baseline and 113.4 ns in the final build (median over ten runs of each run's best pass). The final build was faster in every pair, by between 35.2% and 37.4%. No run was flagged.
-- Allocations per pass of that workload went from 380,226 to 463 (0.130 to 0.0002 per command).
-- The whole-day benchmark ran three times for each build, the baseline's three runs first and then the final build's. The runs are not paired, so a drift of the machine between the two blocks is not controlled; the control loop's median was 231 ms in the first block and 227 ms in the second.
+| Step | Effect on best pass | Interval | Effect on median pass | Verdict |
+|---|---|---|---|---|
+| Same binary twice | −0.18% | −0.93% to +0.56% | −0.23% | inconclusive, as it should be |
+| Start against final | −38.43% | −38.80% to −38.05% | −37.97% | improved |
+| Same binary twice | +0.87% | −0.97% to +2.74% | +0.40% | inconclusive, as it should be |
+| Confirming comparison | −34.77% | −37.54% to −31.88% | −33.50% | improved |
 
-| Whole day, per message | Baseline `209e9e2` (median, range of 3 runs) | Final `2c792ab` (median, range of 3 runs) | Change of the median |
+No run of these four steps was flagged. The final build was faster in all twenty pairs: by 37.9% to 39.3% in the first comparison and by 29.3% to 39.4% in the confirmation, whose runs spread more. A book command took 172.9 ns in the baseline and 106.6 ns in the final build in the first comparison, and 185.5 ns and 122.0 ns in the confirmation (medians over ten runs of each run's best pass). Allocations per pass of that workload went from 380,226 to 463 (0.130 to 0.0002 per command).
+
+Guardrail: `book_mean_ns` −21.23%, interval −25.69% to −16.50%. The upper end is below +5%, so it passes, and the interval lies wholly below zero: the three changes together are visible end to end. One candidate run was flagged (pair 2, at −10.1%, the smallest gain); the other nine pairs lay between −18.5% and −24.1%. In the window the mean time of a book message was 655.3 ns for the baseline and 507.9 ns for the final build, and its median 499.6 ns and 362.5 ns (medians over the ten runs of each build). The golden replay hash of the final build was `58ff0163…f647`, unchanged, and its tests passed in the session.
+
+**Start against final: a book command takes 38.4% less time (interval 38.1% to 38.8%), confirmed at 34.8% (31.9% to 37.5%), and a book message in the 09:30 to 10:00 window takes 21.2% less time in the mean (16.5% to 25.7%).** The whole gain comes from the three kept changes; the array decoder, which was not kept, is not in the final build.
+
+The whole-day benchmark ran three times for each build, the baseline's three runs first and then the final build's. The runs are not paired, so a drift of the machine between the two blocks is not controlled, and the baseline's three runs spread widely; the control loop's median was 228 ms in both blocks. These numbers are for information.
+
+| Whole day, per message | Baseline `f84e022` (median, range of 3 runs) | Final `2c792ab` (median, range of 3 runs) | Change of the median |
 |---|---|---|---|
-| p50 | 576.4 ns (567.3 to 577.3) | 423.6 ns (415.5 to 429.1) | −26.5% |
-| mean | 772.4 ns (744.8 to 777.1) | 606.5 ns (590.1 to 611.7) | −21.5% |
-| p99 | 2,494.1 ns (2,379.5 to 2,559.5) | 2,077.7 ns (2,014.1 to 2,085.0) | −16.7% |
-| p99.9 | 11,854.1 ns (10,523.2 to 12,108.6) | 9,177.7 ns (8,610.5 to 9,468.6) | −22.6% |
-| throughput | 1,376,202 messages/s (1,345,661 to 1,405,284) | 1,729,979 messages/s (1,719,672 to 1,749,105) | +25.7% |
+| p50 | 607.8 ns (566.0 to 646.0) | 414.1 ns (400.9 to 431.9) | −31.9% |
+| mean | 813.6 ns (749.2 to 883.3) | 573.3 ns (549.8 to 606.0) | −29.5% |
+| p99 | 2,867.1 ns (2,523.4 to 3,156.2) | 2,023.4 ns (1,907.0 to 2,216.1) | −29.4% |
+| p99.9 | 11,978.8 ns (11,520.5 to 13,120.7) | 7,934.8 ns (7,796.6 to 8,393.0) | −33.8% |
+| throughput | 1,422,333 messages/s (1,242,751 to 1,463,893) | 1,775,456 messages/s (1,411,335 to 1,825,881) | +24.8% |
 
-These absolute numbers belong to the Kaggle machine and are not comparable with the laptop baseline at the top of this file. The figure of record for the whole exercise is still open: it needs one more session with a baseline that has the starting commit's `src/` under the final harness.
+The first session's whole-day runs, also three for each build and unpaired, gave a median p50 of 576.4 ns for `209e9e2` and 423.6 ns for the final build (−26.5%), and a throughput of 1,376,202 and 1,729,979 messages per second (+25.7%). The two sessions' whole-day changes differ by several points, which is the size of the uncertainty of three unpaired runs.
+
+All absolute numbers here belong to the Kaggle machine and are not comparable with the laptop baseline at the top of this file.
 
 ### Instruction counts
 
