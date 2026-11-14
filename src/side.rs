@@ -139,9 +139,10 @@ impl BookSide {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use super::BookSide;
+    use crate::level::Nodes;
     use crate::types::{OrderId, Price, Qty, Side};
 
     const SIDES: [Side; 2] = [Side::Buy, Side::Sell];
@@ -150,8 +151,26 @@ mod tests {
         side.levels_best_first().map(|(price, _)| price).collect()
     }
 
-    fn add(side: &mut BookSide, price: Price, id: OrderId, qty: Qty) {
-        side.level_or_insert(price).push_back(id, qty);
+    /// The node slab and the id-to-node map the book keeps beside its two sides.
+    #[derive(Default)]
+    struct Queues {
+        nodes: Nodes,
+        slots: HashMap<OrderId, u32>,
+    }
+
+    impl Queues {
+        fn add(&mut self, side: &mut BookSide, price: Price, id: OrderId, qty: Qty) {
+            let level = side.level_or_insert(price);
+            let slot = level.push_back(&mut self.nodes, id, qty);
+            self.slots.insert(id, slot);
+        }
+
+        /// Cancels the way the book does: unlink the order's node, then remove it from its level.
+        fn cancel(&mut self, side: &mut BookSide, price: Price, id: OrderId, remaining: Qty) {
+            let slot = self.slots.remove(&id).expect("the order was added");
+            self.nodes.unlink(slot);
+            side.remove_order(price, id, remaining);
+        }
     }
 
     /// `prices` sorted best first for `side`.
@@ -181,16 +200,17 @@ mod tests {
     fn one_level() {
         for s in SIDES {
             let mut side = BookSide::new(s);
-            add(&mut side, 100, 1, 10);
-            add(&mut side, 100, 2, 5);
+            let mut queues = Queues::default();
+            queues.add(&mut side, 100, 1, 10);
+            queues.add(&mut side, 100, 2, 5);
             assert_eq!(side.best_price(), Some(100));
             assert_eq!(prices(&side), [100]);
             assert_eq!(side.level(100).map(|l| l.total()), Some(15));
             assert!(side.level(99).is_none());
             assert!(side.level(101).is_none());
-            side.remove_order(100, 1, 10);
+            queues.cancel(&mut side, 100, 1, 10);
             assert_eq!(side.best_price(), Some(100));
-            side.remove_order(100, 2, 5);
+            queues.cancel(&mut side, 100, 2, 5);
             assert_eq!(side.best_price(), None);
             assert!(prices(&side).is_empty());
         }
@@ -200,8 +220,9 @@ mod tests {
     fn insert_below_and_above_the_best() {
         for s in SIDES {
             let mut side = BookSide::new(s);
+            let mut queues = Queues::default();
             for (id, price) in [100, 90, 110, 95, 105].into_iter().enumerate() {
-                add(&mut side, price, id as OrderId, 1);
+                queues.add(&mut side, price, id as OrderId, 1);
             }
             let want = best_first(s, &[100, 90, 110, 95, 105]);
             assert_eq!(side.best_price(), Some(want[0]));
@@ -213,22 +234,23 @@ mod tests {
     fn remove_best_and_remove_last() {
         for s in SIDES {
             let mut side = BookSide::new(s);
+            let mut queues = Queues::default();
             for price in [100, 101, 102] {
-                add(&mut side, price, OrderId::from(price), 1);
+                queues.add(&mut side, price, OrderId::from(price), 1);
             }
             let want = best_first(s, &[100, 101, 102]);
             // Remove the best the way matching does: empty the level, then drop it.
             let best = side.best_price().expect("not empty");
             let level = side.level_mut(best).expect("best level exists");
             level.reduce(1);
-            level.pop_front();
+            level.pop_front(&mut queues.nodes);
             side.remove_level(best);
             assert_eq!(side.best_price(), Some(want[1]));
             assert_eq!(prices(&side), want[1..]);
             // Remove the worst through a cancel.
-            side.remove_order(want[2], OrderId::from(want[2]), 1);
+            queues.cancel(&mut side, want[2], OrderId::from(want[2]), 1);
             assert_eq!(prices(&side), want[1..2]);
-            side.remove_order(want[1], OrderId::from(want[1]), 1);
+            queues.cancel(&mut side, want[1], OrderId::from(want[1]), 1);
             assert_eq!(side.best_price(), None);
         }
     }
@@ -238,8 +260,9 @@ mod tests {
         let extremes = [0, 1, u32::MAX - 1, u32::MAX, 100];
         for s in SIDES {
             let mut side = BookSide::new(s);
+            let mut queues = Queues::default();
             for (id, price) in extremes.into_iter().enumerate() {
-                add(&mut side, price, id as OrderId, 1);
+                queues.add(&mut side, price, id as OrderId, 1);
             }
             let want = best_first(s, &extremes);
             assert_eq!(prices(&side), want);
@@ -256,15 +279,16 @@ mod tests {
     fn freed_slots_are_reused_empty() {
         for s in SIDES {
             let mut side = BookSide::new(s);
-            add(&mut side, 100, 1, 10);
-            add(&mut side, 101, 2, 20);
-            side.remove_order(100, 1, 10);
-            add(&mut side, 99, 3, 7);
+            let mut queues = Queues::default();
+            queues.add(&mut side, 100, 1, 10);
+            queues.add(&mut side, 101, 2, 20);
+            queues.cancel(&mut side, 100, 1, 10);
+            queues.add(&mut side, 99, 3, 7);
             assert_eq!(side.levels.len(), 2, "the freed slot was reused");
             assert!(side.free.is_empty());
             let level = side.level(99).expect("level exists");
             assert_eq!(
-                (level.total(), level.ids().collect::<Vec<_>>()),
+                (level.total(), level.ids(&queues.nodes).collect::<Vec<_>>()),
                 (7, vec![3])
             );
             assert_eq!(prices(&side), best_first(s, &[99, 101]));
@@ -273,7 +297,13 @@ mod tests {
 
     /// Compares `side` with `model` (price to its one resting order): the best price, every level
     /// best first, and lookups of every level price, the prices next to each and the extremes.
-    fn check_against(side: &BookSide, s: Side, model: &BTreeMap<Price, OrderId>, at: &str) {
+    fn check_against(
+        side: &BookSide,
+        nodes: &Nodes,
+        s: Side,
+        model: &BTreeMap<Price, OrderId>,
+        at: &str,
+    ) {
         let keys: Vec<Price> = model.keys().copied().collect();
         let want = best_first(s, &keys);
         assert_eq!(side.best_price(), want.first().copied(), "{at}");
@@ -281,7 +311,7 @@ mod tests {
         let probes = keys.iter().flat_map(|&p| [p - 1, p, p + 1]);
         for probe in probes.chain([0, u32::MAX]) {
             assert_eq!(
-                side.level(probe).map(|l| l.ids().collect::<Vec<_>>()),
+                side.level(probe).map(|l| l.ids(nodes).collect::<Vec<_>>()),
                 model.get(&probe).map(|&id| vec![id]),
                 "{at}, price {probe}"
             );
@@ -309,28 +339,47 @@ mod tests {
                     for position in 0..n {
                         let at = format!("{s:?}, {n} levels, {name}, position {position}");
                         let mut side = BookSide::new(s);
+                        let mut queues = Queues::default();
                         let mut model = BTreeMap::new();
                         let mut next_id: OrderId = 0;
                         for &p in order {
                             next_id += 1;
-                            add(&mut side, p, next_id, 1);
+                            queues.add(&mut side, p, next_id, 1);
                             model.insert(p, next_id);
-                            check_against(&side, s, &model, &format!("{at}, insert {p}"));
+                            check_against(
+                                &side,
+                                &queues.nodes,
+                                s,
+                                &model,
+                                &format!("{at}, insert {p}"),
+                            );
                         }
 
                         // Remove the level at `position` from the best through a cancel.
                         let p = prices(&side)[position];
-                        side.remove_order(p, model[&p], 1);
+                        queues.cancel(&mut side, p, model[&p], 1);
                         model.remove(&p);
-                        check_against(&side, s, &model, &format!("{at}, removed {p}"));
+                        check_against(
+                            &side,
+                            &queues.nodes,
+                            s,
+                            &model,
+                            &format!("{at}, removed {p}"),
+                        );
 
                         // A new level next to the removed one takes its slot.
                         next_id += 1;
-                        add(&mut side, p + 5, next_id, 1);
+                        queues.add(&mut side, p + 5, next_id, 1);
                         model.insert(p + 5, next_id);
                         assert_eq!(side.levels.len(), n, "{at}: the freed slot was reused");
                         assert!(side.free.is_empty(), "{at}");
-                        check_against(&side, s, &model, &format!("{at}, inserted {}", p + 5));
+                        check_against(
+                            &side,
+                            &queues.nodes,
+                            s,
+                            &model,
+                            &format!("{at}, inserted {}", p + 5),
+                        );
 
                         // Drain the way matching does: empty the level at `position`, or the
                         // worst once fewer remain, then drop it.
@@ -338,11 +387,17 @@ mod tests {
                             let p = prices(&side)[position.min(model.len() - 1)];
                             let level = side.level_mut(p).expect("level exists");
                             level.reduce(1);
-                            level.pop_front();
+                            level.pop_front(&mut queues.nodes);
                             side.remove_level(p);
                             model.remove(&p);
                             assert_eq!(side.free.len(), n - model.len(), "{at}");
-                            check_against(&side, s, &model, &format!("{at}, drained {p}"));
+                            check_against(
+                                &side,
+                                &queues.nodes,
+                                s,
+                                &model,
+                                &format!("{at}, drained {p}"),
+                            );
                         }
                     }
                 }
@@ -384,6 +439,7 @@ mod tests {
         for s in SIDES {
             let mut rng = Rng(7);
             let mut side = BookSide::new(s);
+            let mut queues = Queues::default();
             let mut model: BTreeMap<Price, Vec<(OrderId, Qty)>> = BTreeMap::new();
             let mut live: Vec<(Price, OrderId, Qty)> = Vec::new();
             let mut max_levels = 0;
@@ -391,13 +447,13 @@ mod tests {
                 match rng.below(20) {
                     0..=12 => {
                         let (p, qty) = (price(&mut rng), 1 + rng.below(100) as Qty);
-                        add(&mut side, p, step, qty);
+                        queues.add(&mut side, p, step, qty);
                         model.entry(p).or_default().push((step, qty));
                         live.push((p, step, qty));
                     }
                     13..=18 if !live.is_empty() => {
                         let (p, id, qty) = live.swap_remove(rng.below(live.len() as u64) as usize);
-                        side.remove_order(p, id, qty);
+                        queues.cancel(&mut side, p, id, qty);
                         let queue = model.get_mut(&p).expect("model has the level");
                         queue.retain(|&(queued, _)| queued != id);
                         if queue.is_empty() {
@@ -408,9 +464,9 @@ mod tests {
                         if let Some(best) = side.best_price() {
                             let level = side.level_mut(best).expect("best level exists");
                             for (id, qty) in model.remove(&best).expect("model has the best") {
-                                assert_eq!(level.front(), Some(id));
+                                assert_eq!(level.front(&queues.nodes), Some(id));
                                 level.reduce(qty);
-                                level.pop_front();
+                                level.pop_front(&mut queues.nodes);
                             }
                             assert!(level.is_empty());
                             side.remove_level(best);
@@ -442,7 +498,7 @@ mod tests {
                         .collect();
                     let got: Vec<(Price, u64, Vec<OrderId>)> = side
                         .levels_best_first()
-                        .map(|(p, l)| (p, l.total(), l.ids().collect()))
+                        .map(|(p, l)| (p, l.total(), l.ids(&queues.nodes).collect()))
                         .collect();
                     assert_eq!(got, want, "step {step}");
                 }
