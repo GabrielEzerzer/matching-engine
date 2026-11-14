@@ -7,30 +7,38 @@
 #   python scripts/kaggle_bench.py --dry-run PLAN
 #   python scripts/kaggle_bench.py --self-test
 #
-# --write-kernel writes DIR/src (a git bundle of exactly the branches the plan names, with
-# dataset-metadata.json) and DIR/kernel (the kernel's code with the plan and each branch's commit
-# embedded, with kernel-metadata.json: a private script kernel, CPU only, internet on, DIR/src's
-# dataset attached). The Kaggle owner is --owner or $KAGGLE_USERNAME.
+# --write-kernel writes DIR/src (a git bundle with dataset-metadata.json) and DIR/kernel (the
+# kernel's code with the plan and the commit ids embedded, with kernel-metadata.json: a private
+# script kernel, CPU only, internet on, DIR/src's dataset attached). The bundle holds no history:
+# for each branch the plan names, one commit of that branch's tree with no parent, author and
+# committer "bench <bench@localhost>", a fixed date and a fixed message, under
+# refs/kaggle-bundle/<branch>. The real commit ids travel only in the plan, so STATUS.json and
+# SUMMARY.md report them. The Kaggle owner is --owner or $KAGGLE_USERNAME.
 #
 # On Kaggle (run with no arguments under /kaggle) the kernel installs Rust with rustup into
-# /kaggle/tmp, clones each label's branch from the bundle and checks it is at the embedded commit,
-# fetches the ITCH day with the base checkout's scripts/fetch-itch.sh into /kaggle/tmp/itch, builds
-# every label with that label's scripts/bench-build.sh, and only then runs the plan's steps one at
-# a time with the base checkout's scripts/compare.sh (bench.sh for `bench` steps). Each step's
-# stdout goes to /kaggle/working/results/<step>.jsonl and stderr to <step>.err; STATUS.json is
-# rewritten after every step and SUMMARY.md at the end. README.md, "Running the comparisons on
-# Kaggle", describes the plan format and the step kinds.
+# /kaggle/tmp, fetches each label's branch from the bundle and checks it is at the embedded bundle
+# commit, fetches the ITCH day with the base checkout's scripts/fetch-itch.sh into /kaggle/tmp/itch,
+# builds every label with that label's scripts/bench-build.sh (then writes the real commit into the
+# build's commit.txt, which compare.sh passes to the binaries), and only then runs the plan's steps
+# one at a time with the base checkout's scripts/compare.sh (bench.sh for `bench` steps, whose
+# output gets the real commit in place of the bundle commit). Every command stops at a hard limit
+# of 700 minutes from kernel start. Each step's stdout goes to /kaggle/working/results/<step>.jsonl
+# and stderr to <step>.err; STATUS.json and SUMMARY.md are rewritten every time the status changes.
+# README.md, "Running the comparisons on Kaggle", describes the plan format and the step kinds.
 #
 # KAGGLE_BENCH_ROOT (default /kaggle) moves the kernel's root, for trying the kernel elsewhere.
 # Standard library only.
 import argparse
 import ast
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -47,6 +55,13 @@ MICRO_STATS = ("ns_per_op_median", "ns_per_op_min")
 WINDOW_STATS = tuple(f"{s}_{q}_ns" for s in ("all", "book") for q in ("mean", "p50", "p99", "p999"))
 DEFAULT_CPU = 3
 DEFAULT_STOP_MIN = 630  # 10 h 30 min; Kaggle ends a session at 12 h
+HARD_STOP_MIN = 700  # no command runs past this many minutes from kernel start
+SEPARATING_KINDS = ("aa", "bench", "window")  # with a compare outside the group: see separators()
+BUNDLE_REF = "refs/kaggle-bundle/"
+BUNDLE_ENV = {"GIT_AUTHOR_NAME": "bench", "GIT_AUTHOR_EMAIL": "bench@localhost",
+              "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000", "GIT_COMMITTER_NAME": "bench",
+              "GIT_COMMITTER_EMAIL": "bench@localhost", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000"}
+BUNDLE_MESSAGE = "benchmark snapshot"
 MIN_FREE_GB = 40  # ITCH (12 GB with the .gz), a release target per label, test builds
 ITCH_NAME = "12302019.NASDAQ_ITCH50"
 GOLDEN = "harness/golden/12302019.txt"
@@ -76,6 +91,20 @@ def check_pairs(n, where, err):
         err(f"{where}: pairs must be an even number of at least 6, not {n!r}")
 
 
+def separators(steps, i):
+    """The steps between the last of confirm_best steps[i]'s comparisons and the confirmation that
+    separate the two measurements: an aa, bench or window step, or a compare of a candidate outside
+    the group."""
+    ids = [x.get("id") if isinstance(x, dict) else None for x in steps]
+    members = [m for m in steps[i]["steps"] if m in ids[:i]]
+    if not members:
+        return []
+    last = max(ids.index(m) for m in members)
+    cands = {steps[ids.index(m)].get("cand") for m in members}
+    return [x for x in steps[last + 1:i] if isinstance(x, dict) and (
+        x.get("kind") in SEPARATING_KINDS or (x.get("kind") == "compare" and x.get("cand") not in cands))]
+
+
 def validate(plan):
     """Every problem with the plan, as messages; empty when it can run."""
     errs = []
@@ -100,13 +129,14 @@ def validate(plan):
     if not isinstance(cpu, int) or isinstance(cpu, bool) or cpu < 0:
         err(f"cpu must be a CPU number, not {cpu!r}")
     stop = plan.get("stop_after_min", DEFAULT_STOP_MIN)
-    if not isinstance(stop, int) or isinstance(stop, bool) or stop <= 0:
-        err(f"stop_after_min must be a positive number of minutes, not {stop!r}")
+    if not isinstance(stop, int) or isinstance(stop, bool) or stop <= 0 or stop >= HARD_STOP_MIN:
+        err(f"stop_after_min must be a positive number of minutes below the hard limit of "
+            f"{HARD_STOP_MIN}, not {stop!r}")
     steps = plan.get("steps")
     if not isinstance(steps, list):
         err("steps must be a list")
         steps = []
-    seen, groups = {}, set()
+    seen, groups, compared = {}, set(), set()
     for i, s in enumerate(steps, 1):
         if not isinstance(s, dict):
             err(f"step {i} is not an object")
@@ -132,6 +162,10 @@ def validate(plan):
                     err(f"{where}: candidate label {s.get('cand')!r} has no branch in labels")
                 elif s.get("cand") == base:
                     err(f"{where}: the candidate is the base; an A/A comparison is kind aa")
+                elif (s.get("part"), s.get("cand")) in compared:
+                    err(f"{where}: {s['cand']} is compared twice on part {s.get('part')}; "
+                        f"each candidate gets exactly one first comparison")
+                compared.add((s.get("part"), s.get("cand")))
         elif kind == "confirm_best":
             group, members = s.get("group"), s.get("steps")
             if not isinstance(group, str) or not group:
@@ -150,6 +184,9 @@ def validate(plan):
             for key in ("part", "stat", "pairs"):
                 if len({json.dumps(m.get(key)) for m in known}) > 1:
                     err(f"{where}: the alternatives of one group must share their {key}")
+            if known and len(known) == len(members) and not separators(steps, i - 1):
+                err(f"{where}: no other measurement (an aa, bench or window step, or a compare of a "
+                    f"candidate outside the group) between the group's last comparison and its confirmation")
             groups.add(group)
         elif kind in ("window", "golden"):
             if s.get("group") not in groups:
@@ -226,6 +263,13 @@ def golden_argvs(L, label):
             (co, ["cargo", "test", "--all-targets"])]
 
 
+def checkout_argvs(bundle, br, dest):
+    """Branch br from the bundle as a checkout at dest, on a local branch of the same name."""
+    return [["git", "init", "-q", str(dest)],
+            ["git", "-C", str(dest), "fetch", "-q", str(bundle), f"{BUNDLE_REF}{br}:refs/heads/{br}"],
+            ["git", "-C", str(dest), "checkout", "-q", br]]
+
+
 def bench_argv(plan, L, s):
     return [str(L.src / s["label"] / "scripts" / "bench.sh"), "-n", str(s["runs"]),
             "-c", str(plan.get("cpu", DEFAULT_CPU))]
@@ -237,7 +281,7 @@ def setup_lines(plan, L):
              f"sh {rustup_sh} -y --no-modify-path --profile minimal --default-toolchain stable",
              "rustc -vV"]
     for lab, br in plan["labels"].items():
-        lines.append(f"git clone -q --branch {br} <bundle> {L.src / lab}")
+        lines += [shlex.join(a) for a in checkout_argvs("<bundle>", br, L.src / lab)]
     lines.append(f"{L.src / plan['base'] / 'scripts' / 'fetch-itch.sh'} {L.itch}")
     for lab in plan["labels"]:
         lines.append(f"(cd {L.src / lab} && CARGO_TARGET_DIR={L.target / lab} BENCH_BINS={L.bins} "
@@ -263,7 +307,9 @@ def dry_run(plan_path):
             print(f"{shlex.join(compare_argv(plan, L, s, cand))} > {out}.jsonl 2> {out}.err")
         elif k == "confirm_best":
             print(f"# {s['id']}: among {', '.join(s['steps'])}, the improved one with the best effect "
-                  f"is compared again; when that also says improved it is the winner of {s['group']}. None improved: nothing runs")
+                  f"is compared again; when that also says improved it is the winner of {s['group']}. None improved: "
+                  f"nothing runs. No winner when an earlier aa step of the part did not come out inconclusive; "
+                  f"skipped when no step between the last comparison and this one finished")
             for m in s["steps"]:
                 print(f"#   {shlex.join(compare_argv(plan, L, steps[m], steps[m]['cand']))}")
         elif k == "window":
@@ -318,11 +364,15 @@ def past_stop(elapsed_s, stop_min):
     return elapsed_s >= stop_min * 60
 
 
-def write_json(path, obj):
+def write_text(path, text):
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=1) + "\n", encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def write_json(path, obj):
+    write_text(path, json.dumps(obj, indent=1) + "\n")
 
 
 def fmt(x):
@@ -347,7 +397,7 @@ def write_summary(L, status):
         f"Started {status['started']}, last update {status['updated']}, cpu {status['cpu']}, "
         f"stop time {status['stop_at']}.", "", "Setup:", *setup, "", "Labels:", *labels, "",
         *rows, ""])
-    (L.results / "SUMMARY.md").write_text(text, encoding="utf-8")
+    write_text(L.results / "SUMMARY.md", text)
 
 
 # ---------------------------------------------------------------- the kernel
@@ -357,12 +407,13 @@ class Kernel:
         self.plan, self.L = plan, L
         self.cpu = plan.get("cpu", DEFAULT_CPU)
         self.stop_min = plan.get("stop_after_min", DEFAULT_STOP_MIN)
+        self.deadline = T0 + HARD_STOP_MIN * 60  # monotonic time after which no command runs
         start = dt.datetime.now(dt.timezone.utc)
         self.status = {
             "plan": plan["name"], "state": "running", "started": now_iso(), "updated": now_iso(),
             "stop_at": (start + dt.timedelta(minutes=self.stop_min)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "cpu": self.cpu, "rustc": None, "setup": {},
-            "labels": {lab: {"branch": br, "commit": None, "build": None}
+            "labels": {lab: {"branch": br, "commit": None, "bundle_commit": None, "build": None}
                        for lab, br in plan["labels"].items()},
             "steps": [{"id": s["id"], "kind": s["kind"], "state": "pending",
                        **({"group": s["group"]} if "group" in s else {})} for s in plan["steps"]]}
@@ -370,15 +421,28 @@ class Kernel:
     def save(self):
         self.status["updated"] = now_iso()
         write_json(self.L.results / "STATUS.json", self.status)
+        write_summary(self.L, self.status)  # current also when the session is killed
 
     def stopped(self):
         return past_stop(time.monotonic() - T0, self.stop_min)
 
     def sh(self, argv, out, err, cwd=None, env=None, mode="w"):
+        """Exit code of argv. Raises TimeoutError at the hard limit, after killing the command's
+        whole process group (a pinned grandchild would otherwise keep the CPU busy)."""
         log("$ " + shlex.join(str(a) for a in argv))
+        why = f"stopped at the hard limit of {HARD_STOP_MIN} min from kernel start"
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"{why}; not started")
         with open(out, mode) as fo, open(err, mode) as fe:
-            return subprocess.run([str(a) for a in argv], stdout=fo, stderr=fe, cwd=cwd,
-                                  env=env or env_for(self.L)).returncode
+            p = subprocess.Popen([str(a) for a in argv], stdout=fo, stderr=fe, cwd=cwd,
+                                 env=env or env_for(self.L), start_new_session=True)
+            try:
+                return p.wait(timeout=left)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+                raise TimeoutError(f"{why}; its process group was killed") from None
 
     def phase(self, name, fn):
         rec = self.status["setup"][name] = {"state": "running", "start": now_iso()}
@@ -440,16 +504,16 @@ class Kernel:
         for lab, br in self.plan["labels"].items():
             dest = self.L.src / lab
             shutil.rmtree(dest, ignore_errors=True)
-            want = self.plan["commits"][br]
-            if self.sh(["git", "clone", "-q", "--branch", br, bundles[0], dest], out, err, mode="a"):
-                failed.append(f"{lab}: clone failed")
+            want = self.plan["bundle_commits"][br]
+            if any(self.sh(a, out, err, mode="a") for a in checkout_argvs(bundles[0], br, dest)):
+                failed.append(f"{lab}: checkout from the bundle failed")
                 continue
             head = subprocess.run(["git", "-C", dest, "rev-parse", "HEAD"], capture_output=True, text=True)
             got = head.stdout.strip()
             if got != want:
-                failed.append(f"{lab}: at {got}, the plan names {want}")
+                failed.append(f"{lab}: at {got}, the plan names bundle commit {want}")
                 continue
-            self.status["labels"][lab]["commit"] = got
+            self.status["labels"][lab].update(commit=self.plan["commits"][br], bundle_commit=got)
         if any(f.startswith(f"{self.plan['base']}:") for f in failed):
             raise RuntimeError("; ".join(failed))
         for f in failed:
@@ -468,10 +532,15 @@ class Kernel:
     def build(self, lab):
         rec = self.status["labels"][lab]
         log_ = self.L.results / f"build-{lab}.log"
-        code = self.sh([self.L.src / lab / "scripts" / "bench-build.sh", lab], log_, log_.with_suffix(".err"),
-                       cwd=self.L.src / lab, env=env_for(self.L, lab))
-        ok = code == 0 and (self.L.bins / lab / "bench").is_file()
-        rec["build"] = "ok" if ok else f"failed (exit {code}; see build-{lab}.err)"
+        try:
+            code = self.sh([self.L.src / lab / "scripts" / "bench-build.sh", lab], log_,
+                           log_.with_suffix(".err"), cwd=self.L.src / lab, env=env_for(self.L, lab))
+            ok = code == 0 and (self.L.bins / lab / "bench").is_file()
+            rec["build"] = "ok" if ok else f"failed (exit {code}; see build-{lab}.err)"
+            if ok:  # bench-build.sh wrote the bundle commit; compare.sh passes this file to the binaries
+                (self.L.bins / lab / "commit.txt").write_text(rec["commit"] + "\n", encoding="utf-8")
+        except Exception as e:  # recorded; the other labels still build
+            rec["build"] = f"failed ({type(e).__name__}: {e})"
         self.save()
         log(f"build {lab}: {rec['build']}")
 
@@ -483,22 +552,29 @@ class Kernel:
     def run_compare(self, s, rec, cand, out_id=None):
         missing = [x for x in (self.plan["base"], cand) if not self.built(x)]
         if missing:
-            return rec.update(state="skipped", note=f"no build of {', '.join(missing)}")
+            return rec.update(state="failed", note=f"no build of {', '.join(missing)}")
         out = self.L.results / (out_id or s["id"])
         rec["label"] = cand
         code = self.sh(compare_argv(self.plan, self.L, s, cand), f"{out}.jsonl", f"{out}.err",
                        cwd=self.L.src / self.plan["base"])
         summary = read_summary(f"{out}.jsonl")
-        if summary is None:
-            return rec.update(state="failed", note=f"exit {code}, no summary line; see {out.name}.err")
+        if summary is None or code:
+            return rec.update(state="failed", note=f"exit {code}{'' if summary else ', no summary line'}; "
+                                                   f"see {out.name}.err")
         rec.update(state="done", **comparison_fields(summary, s["stat"]))
-        if summary.get("flagged_runs"):
-            rec["note"] = f"{summary['flagged_runs']} flagged run(s)"
+        notes = [f"{summary['flagged_runs']} flagged run(s)"] if summary.get("flagged_runs") else []
         if s["kind"] == "aa" and rec["verdict"] != "inconclusive":
-            rec["note"] = (f"A/A gave {rec['verdict']}: the method check failed for part {s['part']}, "
-                           f"so its comparisons cannot be trusted")
+            notes.append(f"A/A gave {rec['verdict']}: the method check failed for part {s['part']}, "
+                         f"so its comparisons cannot be trusted")
+        if notes:
+            rec["note"] = "; ".join(notes)
 
-    def run_confirm(self, s, rec, by_id, specs):
+    def run_confirm(self, i, rec, by_id, specs):
+        steps = self.plan["steps"]
+        s = steps[i]
+        if not any(by_id[x["id"]]["state"] == "done" for x in separators(steps, i)):
+            return rec.update(state="skipped", note="no step between the group's last comparison and this "
+                                                    "confirmation finished, so the two would not be separate blocks")
         cands = []
         for m in s["steps"]:
             r = by_id[m]
@@ -509,16 +585,24 @@ class Kernel:
             return rec.update(state="done", verdict="none improved",
                               note="no alternative improved; nothing to confirm")
         sid, lab, _ = best
+        part = specs[sid]["part"]
+        bad_aa = [f"{x['id']} {by_id[x['id']]['state']} {by_id[x['id']].get('verdict') or ''}".strip()
+                  for x in steps[:i] if x["kind"] == "aa" and x["part"] == part
+                  and not (by_id[x["id"]]["state"] == "done" and by_id[x["id"]].get("verdict") == "inconclusive")]
         rec["chosen_from"] = sid
         self.run_compare(specs[sid], rec, lab, out_id=s["id"])
         if rec["state"] == "done":
-            rec["winner"] = lab if rec["verdict"] == "improved" else None
-            rec["note"] = (f"{lab} confirmed" if rec["winner"] else f"{lab} not confirmed") + \
-                (f"; {rec['note']}" if rec.get("note") else "")
+            rec["winner"] = lab if rec["verdict"] == "improved" and not bad_aa else None
+            head = f"{lab} confirmed" if rec["winner"] else f"{lab} not confirmed"
+            if bad_aa and rec["verdict"] == "improved":
+                head = (f"{lab} improved again, but no winner is named: the A/A method check for part "
+                        f"{part} did not come out inconclusive ({', '.join(bad_aa)})")
+            rec["note"] = head + (f"; {rec['note']}" if rec.get("note") else "")
 
     def winner(self, by_id, group):
+        """(the group's winner or None, the group's confirm_best record)."""
         conf = next(r for r in by_id.values() if r["kind"] == "confirm_best" and r.get("group") == group)
-        return conf.get("winner")
+        return conf.get("winner"), conf
 
     def run_golden(self, rec, lab):
         out = self.L.results / rec["id"]
@@ -539,14 +623,20 @@ class Kernel:
     def run_bench(self, s, rec):
         lab = s["label"]
         if not self.built(lab):
-            return rec.update(state="skipped", note=f"no build of {lab}")
+            return rec.update(state="failed", note=f"no build of {lab}")
         out = self.L.results / s["id"]
         rec["label"] = lab
         code = self.sh(bench_argv(self.plan, self.L, s), f"{out}.jsonl", f"{out}.err",
                        cwd=self.L.src / lab, env=env_for(self.L, lab))
+        ids = self.status["labels"][lab]
+        for f in (Path(f"{out}.jsonl"), Path(f"{out}.err")):  # bench.sh labels its runs with the bundle commit
+            if ids.get("bundle_commit") and ids.get("commit") and f.is_file():
+                write_text(f, f.read_text(encoding="utf-8", errors="replace")
+                           .replace(ids["bundle_commit"], ids["commit"]))
         summary = read_summary(f"{out}.jsonl")
-        if summary is None:
-            return rec.update(state="failed", note=f"exit {code}, no summary line; see {out.name}.err")
+        if summary is None or code:
+            return rec.update(state="failed", note=f"exit {code}{'' if summary else ', no summary line'}; "
+                                                   f"see {out.name}.err")
         med = {k: (summary.get(k) or {}).get("median") for k in ("all_p50_ns", "throughput_msgs_per_s")}
         rec.update(state="done", note=f"median all_p50_ns {med['all_p50_ns']}, "
                                       f"throughput_msgs_per_s {med['throughput_msgs_per_s']}")
@@ -554,7 +644,7 @@ class Kernel:
     def steps(self):
         specs = {s["id"]: s for s in self.plan["steps"]}
         by_id = {r["id"]: r for r in self.status["steps"]}
-        for s, rec in zip(self.plan["steps"], self.status["steps"]):
+        for i, (s, rec) in enumerate(zip(self.plan["steps"], self.status["steps"])):
             if self.stopped():
                 self.halt("stop time reached")
                 return
@@ -568,11 +658,12 @@ class Kernel:
                 elif k == "compare":
                     self.run_compare(s, rec, s["cand"])
                 elif k == "confirm_best":
-                    self.run_confirm(s, rec, by_id, specs)
+                    self.run_confirm(i, rec, by_id, specs)
                 elif k in ("window", "golden"):
-                    lab = self.winner(by_id, s["group"])
+                    lab, conf = self.winner(by_id, s["group"])
                     if lab is None:
-                        rec.update(state="skipped", note=f"no confirmed winner for {s['group']}")
+                        rec.update(state="skipped", note=f"no confirmed winner for {s['group']} ({conf['id']} "
+                                                         f"{conf['state']}: {conf.get('note') or ''})")
                     elif k == "window":
                         self.run_compare(s, rec, lab)
                     else:
@@ -595,25 +686,28 @@ class Kernel:
     def run(self):
         self.L.results.mkdir(parents=True, exist_ok=True)
         log(f"plan {json.dumps(self.plan)}")
-        self.save()
-        ok = (self.phase("host", self.host) and self.phase("rust", self.rust)
-              and self.phase("clone", self.clone) and self.phase("fetch", self.fetch))
-        if not ok:
-            self.halt("setup failed")
-        else:
-            for lab in self.plan["labels"]:
-                if self.stopped():
-                    self.halt("stop time reached during builds")
-                    break
-                if self.status["labels"][lab]["build"] is None:
-                    self.build(lab)
+        try:
+            self.save()
+            ok = (self.phase("host", self.host) and self.phase("rust", self.rust)
+                  and self.phase("clone", self.clone) and self.phase("fetch", self.fetch))
+            if not ok:
+                self.halt("setup failed")
             else:
-                self.steps()
-        if self.status["state"] == "running":
-            self.status["state"] = "done"
-        self.save()
-        write_summary(self.L, self.status)
-        log(f"STATUS {self.status['state']}")
+                for lab in self.plan["labels"]:
+                    if self.stopped():
+                        self.halt("stop time reached during builds")
+                        break
+                    if self.status["labels"][lab]["build"] is None:
+                        self.build(lab)
+                else:
+                    self.steps()
+        except Exception as e:  # STATUS.json and SUMMARY.md are written below either way
+            self.halt(f"error {type(e).__name__}: {e}")
+        finally:
+            if self.status["state"] == "running":
+                self.status["state"] = "done"
+            self.save()
+            log(f"STATUS {self.status['state']}")
         return 0  # the output is kept either way; STATUS.json says what ran
 
 
@@ -626,11 +720,32 @@ def embed(source, plan):
     return source.replace(marker, f"PLAN = {plan!r}", 1)
 
 
-def git(repo, *args):
-    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+def git(repo, *args, env=None):
+    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=env)
     if r.returncode:
         sys.exit(f"kaggle_bench: git {' '.join(args)} failed: {r.stderr.strip()}")
     return r.stdout.strip()
+
+
+def make_bundle(repo, branches, bundle):
+    """Writes a bundle of one history-free commit per branch (the branch's tree, the neutral
+    BUNDLE_ENV identity and dates, BUNDLE_MESSAGE) under refs/kaggle-bundle/<branch>, so no name or
+    address from the real history leaves the machine. Returns {branch: bundle commit}. The temporary
+    refs are deleted afterwards, also when bundling fails."""
+    env = {**os.environ, **BUNDLE_ENV}
+    made = {}
+    try:
+        for br in branches:
+            sha = git(repo, "commit-tree", "--no-gpg-sign", "-m", BUNDLE_MESSAGE,
+                      f"refs/heads/{br}^{{tree}}", env=env)
+            git(repo, "update-ref", f"{BUNDLE_REF}{br}", sha)
+            made[br] = sha
+        git(repo, "bundle", "create", str(Path(bundle).resolve()), *[f"{BUNDLE_REF}{b}" for b in made])
+    finally:
+        for br in made:
+            subprocess.run(["git", "-C", str(repo), "update-ref", "-d", f"{BUNDLE_REF}{br}"],
+                           capture_output=True)
+    return made
 
 
 def write_kernel(plan_path, out_dir, owner):
@@ -652,10 +767,11 @@ def write_kernel(plan_path, out_dir, owner):
         d.mkdir(parents=True, exist_ok=True)
     name = slug(plan)
     bundle = src / "matching-engine.bundle"
-    git(repo, "bundle", "create", str(bundle.resolve()), *[f"refs/heads/{b}" for b in branches])
+    bundle_commits = make_bundle(repo, branches, bundle)
     write_json(src / "dataset-metadata.json",
                {"id": f"{owner}/{name}-src", "title": f"{name}-src", "licenses": [{"name": "other"}]})
-    code = embed(here.read_text(encoding="utf-8"), {**plan, "commits": commits})
+    code = embed(here.read_text(encoding="utf-8"),
+                 {**plan, "commits": commits, "bundle_commits": bundle_commits})
     (kern / f"{name}.py").write_text(code, encoding="utf-8", newline="\n")
     write_json(kern / "kernel-metadata.json", {
         "id": f"{owner}/{name}", "title": name, "code_file": f"{name}.py", "language": "python",
@@ -663,7 +779,7 @@ def write_kernel(plan_path, out_dir, owner):
         "enable_internet": True, "dataset_sources": [f"{owner}/{name}-src"],
         "competition_sources": [], "kernel_sources": [], "model_sources": []})
     for br, sha in commits.items():
-        print(f"{br} {sha}")
+        print(f"{br} {sha} (bundle commit {bundle_commits[br]})")
     print(f"wrote {bundle} ({bundle.stat().st_size} bytes), {src / 'dataset-metadata.json'}")
     print(f"wrote {kern / (name + '.py')}, {kern / 'kernel-metadata.json'}")
     return 0
@@ -677,11 +793,11 @@ def fixture_plan():
     return {"name": "t", "base": "base", "labels": {"base": "b0", "x": "bx", "y": "by"},
             "steps": [{"id": "aa", "kind": "aa", "part": "side", "pairs": 10, "stat": "ns_per_op_min"},
                       cmp("cx", "x"), cmp("cy", "y"),
+                      {"id": "bench", "kind": "bench", "label": "base", "runs": 3},
                       {"id": "conf", "kind": "confirm_best", "group": "g", "steps": ["cx", "cy"]},
                       {"id": "win", "kind": "window", "group": "g", "window": "09:30:00-10:00:00",
                        "pairs": 6, "stat": "all_p50_ns"},
-                      {"id": "gold", "kind": "golden", "group": "g"},
-                      {"id": "bench", "kind": "bench", "label": "base", "runs": 3}]}
+                      {"id": "gold", "kind": "golden", "group": "g"}]}
 
 
 def summary_line(verdict, effect):
@@ -708,21 +824,174 @@ class SelfTest(unittest.TestCase):
             (lambda p: p["steps"][0].update(kind="nope"), "unknown kind"),
             (lambda p: p["steps"][1].update(cand="z"), "no branch"),
             (lambda p: p.update(base="z"), "base label"),
-            (lambda p: p["steps"][3].update(steps=["cx", "gone"]), "not an earlier step"),
-            (lambda p: p["steps"][3].update(steps=["cx", "aa"]), "not a compare step"),
+            (lambda p: p["steps"][4].update(steps=["cx", "gone"]), "not an earlier step"),
+            (lambda p: p["steps"][4].update(steps=["cx", "aa"]), "not a compare step"),
             (lambda p: p["steps"][1].update(stat="all_p50_ns"), "does not report"),
-            (lambda p: p["steps"][4].update(stat="ns_per_op_min"), "does not report"),
+            (lambda p: p["steps"][5].update(stat="ns_per_op_min"), "does not report"),
             (lambda p: p["steps"][1].update(pairs=7), "even number"),
             (lambda p: p["steps"][1].update(pairs=4), "even number"),
             (lambda p: p["steps"][2].update(pairs=12), "share their pairs"),
-            (lambda p: p["steps"][4].update(group="h"), "no earlier confirm_best"),
-            (lambda p: p["steps"].insert(0, p["steps"].pop(3)), "not an earlier step"),
+            (lambda p: p["steps"][5].update(group="h"), "no earlier confirm_best"),
+            (lambda p: p["steps"].insert(0, p["steps"].pop(4)), "not an earlier step"),
             (lambda p: p["steps"][2].update(id="cx"), "used twice"),
             (lambda p: p["steps"][1].update(cand="base"), "kind aa"),
-            (lambda p: p["steps"][4].update(window="9:30-10:00"), "HH:MM:SS"),
+            (lambda p: p["steps"][5].update(window="9:30-10:00"), "HH:MM:SS"),
+            (lambda p: p["steps"].pop(3), "no other measurement"),  # nothing between cy and conf
+            (lambda p: p["steps"][2].update(cand="x"), "compared twice"),
+            (lambda p: p.update(stop_after_min=HARD_STOP_MIN), "below the hard limit"),
         ]
         for edit, want in cases:
             self.assertIn(want, self.errs(edit))
+
+    def run_steps(self, canned, built=("base", "x", "y")):
+        """Kernel.steps() on the fixture plan with the shell-out replaced. canned maps a step id (the
+        output file's name) to (verdict, effect, exit code); a missing id prints nothing and exits 1.
+        Returns ({step id: record}, the step ids that ran a command)."""
+        with tempfile.TemporaryDirectory() as d:
+            L = layout(d)
+            L.results.mkdir(parents=True)
+            k = Kernel({**fixture_plan(), "commits": {}, "bundle_commits": {}}, L)
+            for lab in built:
+                k.status["labels"][lab]["build"] = "ok"
+            ran = []
+
+            def sh(argv, out, err, cwd=None, env=None, mode="w"):
+                sid = Path(out).stem
+                ran.append(sid)
+                with open(out, mode) as fo, open(err, mode) as fe:
+                    if sid == "gold":
+                        fe.write("golden check passed against x\n")
+                        fo.write("test result: ok. 3 passed\n")
+                        return 0
+                    if sid not in canned:
+                        return 1
+                    verdict, effect, code = canned[sid]
+                    fo.write(summary_line(verdict, effect) + "\n")
+                    return code
+            k.sh = sh
+            with contextlib.redirect_stdout(io.StringIO()):
+                k.steps()
+            self.assertIn("| conf | confirm_best |", (L.results / "SUMMARY.md").read_text())
+            return {r["id"]: r for r in k.status["steps"]}, ran
+
+    def test_step_wiring(self):
+        ok = {"aa": ("inconclusive", 0.1, 0), "bench": ("", 0.0, 0)}
+        better = {"cx": ("improved", -3.0, 0), "cy": ("improved", -5.0, 0), "conf": ("improved", -4.0, 0),
+                  "win": ("improved", -1.0, 0)}
+
+        r, _ = self.run_steps({**ok, **better})  # the best of two improved is confirmed
+        self.assertEqual((r["conf"]["chosen_from"], r["conf"]["winner"]), ("cy", "y"))
+        self.assertEqual((r["win"]["state"], r["win"]["label"]), ("done", "y"))
+        self.assertEqual((r["gold"]["state"], r["gold"]["verdict"]), ("done", "pass"))
+
+        r, ran = self.run_steps({**ok, "cx": ("inconclusive", -1.0, 0), "cy": ("regressed", 2.0, 0)})
+        self.assertEqual(r["conf"]["verdict"], "none improved")  # none improved: no confirmation runs
+        self.assertNotIn("conf", ran)
+        for x in ("win", "gold"):
+            self.assertEqual(r[x]["state"], "skipped")
+            self.assertIn("no confirmed winner for g", r[x]["note"])
+
+        for cx in ({}, {"cx": ("improved", -9.0, 1)}):  # no summary line; a summary but exit 1
+            canned = {**ok, **better}
+            del canned["cx"]
+            r, _ = self.run_steps({**canned, **cx})
+            self.assertEqual(r["cx"]["state"], "failed")
+            self.assertEqual(r["conf"]["chosen_from"], "cy")
+
+        r, _ = self.run_steps({**ok, **better, "conf": ("inconclusive", -1.0, 0)})
+        self.assertEqual((r["conf"]["state"], r["conf"]["winner"]), ("done", None))  # not confirmed
+        self.assertIn("y not confirmed", r["conf"]["note"])
+        self.assertEqual(r["win"]["state"], "skipped")
+
+        for aa in ({"aa": ("regressed", 3.0, 0)}, {"aa": ("inconclusive", 0.1, 1)}):  # A/A check failed
+            r, _ = self.run_steps({**ok, **better, **aa})
+            self.assertEqual((r["conf"]["verdict"], r["conf"]["winner"]), ("improved", None))
+            self.assertIn("A/A method check", r["conf"]["note"])
+            self.assertEqual(r["win"]["state"], "skipped")
+            self.assertIn("A/A method check", r["win"]["note"])
+        r, _ = self.run_steps({**ok, **better, "aa": ("regressed", 3.0, 0)})
+        self.assertIn("A/A gave regressed", r["aa"]["note"])
+
+        r, ran = self.run_steps({"aa": ok["aa"], **better})  # the separating bench step failed
+        self.assertEqual(r["bench"]["state"], "failed")
+        self.assertEqual(r["conf"]["state"], "skipped")
+        self.assertNotIn("conf", ran)
+        self.assertIn("separate blocks", r["gold"]["note"])
+
+        r, _ = self.run_steps({**ok, **better}, built=("base", "x"))  # y did not build
+        self.assertEqual((r["cy"]["state"], r["cy"]["note"]), ("failed", "no build of y"))
+        self.assertEqual(r["conf"]["chosen_from"], "cx")
+
+    def test_hard_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            L = layout(d)
+            L.results.mkdir(parents=True)
+            k = Kernel({**fixture_plan(), "commits": {}, "bundle_commits": {}}, L)
+            for lab in k.status["labels"].values():
+                lab["build"] = "ok"
+            k.deadline = time.monotonic() - 1
+            with contextlib.redirect_stdout(io.StringIO()):
+                k.steps()
+            self.assertEqual(k.status["steps"][0]["state"], "failed")
+            self.assertIn("hard limit of 700 min", k.status["steps"][0]["note"])
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX only")
+    def test_hard_limit_kills_the_process_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            L = layout(d)
+            L.results.mkdir(parents=True)
+            k = Kernel({**fixture_plan(), "commits": {}, "bundle_commits": {}}, L)
+            k.deadline = time.monotonic() + 2
+            out = Path(d) / "x.out"
+            child = ("import subprocess, sys, time; p = subprocess.Popen([sys.executable, '-c', "
+                     "'import time; time.sleep(60)']); print(p.pid, flush=True); time.sleep(60)")
+            with self.assertRaises(TimeoutError):
+                k.sh([sys.executable, "-c", child], out, Path(d) / "x.err")
+            grandchild = int(out.read_text().split()[0])
+            for _ in range(50):
+                try:
+                    os.kill(grandchild, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail(f"grandchild {grandchild} still runs")
+
+    def test_bundle_carries_no_identity(self):
+        name, mail = "Someone Private", "private@example.invalid"
+        with tempfile.TemporaryDirectory() as d:
+            repo, bundle = Path(d) / "repo", Path(d) / "t.bundle"
+            env = {**os.environ, "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": mail,
+                   "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": mail}
+
+            def g(*args, cwd=repo):
+                return subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=cwd, env=env,
+                                      check=True, capture_output=True, text=True).stdout.strip()
+            repo.mkdir()
+            g("init", "-q")
+            g("checkout", "-q", "-b", "b0")
+            (repo / "f.txt").write_text("one\n")
+            g("add", "f.txt")
+            g("commit", "-q", "-m", f"first, by {name}")
+            g("branch", "bx")
+            (repo / "f.txt").write_text("two\n")
+            g("commit", "-q", "-am", f"second <{mail}>")
+            made = make_bundle(repo, ["b0", "bx"], bundle)
+            self.assertEqual(made, make_bundle(repo, ["b0", "bx"], bundle))  # reproducible
+            self.assertEqual(g("for-each-ref", BUNDLE_REF), "")  # temporary refs gone
+            data = bundle.read_bytes()
+            for x in (name, mail):
+                self.assertNotIn(x.encode(), data)
+            for br, sha in made.items():
+                dest = Path(d) / f"clone-{br}"
+                for argv in checkout_argvs(bundle, br, dest):
+                    subprocess.run(argv, check=True, capture_output=True)
+                self.assertEqual(g("rev-parse", "HEAD", cwd=dest), sha)
+                self.assertEqual(g("rev-parse", "HEAD^{tree}", cwd=dest), g("rev-parse", f"{br}^{{tree}}"))
+                history = g("log", "--all", "--format=%an %ae %cn %ce %B", cwd=dest)
+                for x in (name, mail):
+                    self.assertNotIn(x, history)
+                self.assertEqual(history, f"bench bench@localhost bench bench@localhost {BUNDLE_MESSAGE}")
 
     def test_choose_best(self):
         def f(v, e):
