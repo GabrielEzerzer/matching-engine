@@ -91,6 +91,14 @@ impl Harness {
             "command {} {cmd:?}: snapshots differ",
             self.commands
         );
+        for (side, levels) in [(Side::Buy, &snapshot.bids), (Side::Sell, &snapshot.asks)] {
+            assert_eq!(
+                self.book.front_order(side),
+                levels.first().map(|l| l.orders[0].0),
+                "command {} {cmd:?}: front order differs",
+                self.commands
+            );
+        }
         self.commands += 1;
         self.events += got.len() as u64;
         self.trades += got

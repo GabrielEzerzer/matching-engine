@@ -413,10 +413,10 @@ pub fn count_books(books: &[OrderBook]) -> (usize, usize, u64) {
 pub mod parts {
     use std::hint::black_box;
 
-    use matching_engine::Side;
-    use matching_engine::internals::{BookSide, Level, OrderMap, RestingOrder};
+    use matching_engine::internals::{BookSide, Level, Nodes, OrderMap, RestingOrder};
+    use matching_engine::{OrderId, Side};
 
-    use super::{LevelOp, MapOp, Reads, SideOp, Workload};
+    use super::{BookIdx, LevelOp, MapOp, Reads, SideOp, Workload};
 
     /// Folded in place of a read that found nothing.
     pub const NONE: u64 = u64::MAX;
@@ -447,7 +447,7 @@ pub mod parts {
     pub fn final_reads(w: &Workload) -> Reads {
         Reads {
             side: run_sides(w).1,
-            level: run_levels(w).1,
+            level: run_levels(w, &push_books(w)).1,
             map: run_maps(w).1,
         }
     }
@@ -489,30 +489,119 @@ pub mod parts {
         sides.iter().map(|s| s.levels_best_first().count()).sum()
     }
 
-    /// Folds the id at the front.
-    pub fn run_levels(w: &Workload) -> (Vec<Level>, u64) {
+    /// The book of each `Push`, in order: the recorder pairs every push with one map insert, the
+    /// order resting in that book. Prepared outside the timed region, since a real book knows
+    /// which book it is.
+    pub fn push_books(w: &Workload) -> Vec<BookIdx> {
+        let books: Vec<BookIdx> = w
+            .map_ops
+            .iter()
+            .filter_map(|op| match *op {
+                MapOp::Insert { book, .. } => Some(book),
+                _ => None,
+            })
+            .collect();
+        let pushes = w
+            .level_ops
+            .iter()
+            .filter(|op| matches!(op, LevelOp::Push { .. }))
+            .count();
+        assert_eq!(books.len(), pushes, "one map insert per level push");
+        books
+    }
+
+    /// The levels and, per book, the queue slab and the order map the book keeps beside them:
+    /// a removal finds its order's slab node through the map, so the adapter keeps the map as the
+    /// book does (insert on push with the node, remove when the order leaves) and pays for it in
+    /// the timed region. Order quantities are not kept up to date, since the queue never reads
+    /// them. Level `slot` belongs to the book in `books[slot]`; the side and price stored in the
+    /// map are placeholders, since the queue never reads them either.
+    pub struct Levels {
+        pub levels: Vec<Level>,
+        pub books: Vec<BookIdx>,
+        pub nodes: Vec<Nodes>,
+        pub orders: Vec<OrderMap>,
+    }
+
+    impl Levels {
+        /// The orders of level `slot`, oldest first.
+        pub fn ids(&self, slot: u32) -> impl Iterator<Item = OrderId> + '_ {
+            let nodes = &self.nodes[usize::from(self.books[slot as usize])];
+            self.levels[slot as usize].ids(nodes)
+        }
+    }
+
+    /// Folds the id at the front, or [`NONE`] for the look at a level just emptied. The order
+    /// map's inserts and removals are not reads of the queue and are not folded.
+    pub fn run_levels(w: &Workload, push_books: &[BookIdx]) -> (Levels, u64) {
         let mut levels: Vec<Level> = (0..w.level_slots).map(|_| Level::default()).collect();
+        let mut books: Vec<BookIdx> = vec![0; w.level_slots];
+        let mut nodes: Vec<Nodes> = (0..w.books).map(|_| Nodes::default()).collect();
+        let mut orders: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::default()).collect();
+        let mut push_books = push_books.iter();
         let mut reads = 0;
         for &op in &w.level_ops {
             match op {
-                LevelOp::Push { slot, id, qty } => levels[slot as usize].push_back(id, qty),
+                LevelOp::Push { slot, id, qty } => {
+                    let b = usize::from(*push_books.next().expect("a book for every push"));
+                    books[slot as usize] = b as BookIdx;
+                    let node = levels[slot as usize].push_back(&mut nodes[b], id, qty);
+                    let order = RestingOrder {
+                        side: Side::Buy,
+                        price: slot,
+                        qty,
+                        slot: node,
+                    };
+                    orders[b].insert(id, order);
+                }
                 LevelOp::Front { slot } => {
-                    reads = fold(reads, levels[slot as usize].front().unwrap_or(NONE));
+                    let b = usize::from(books[slot as usize]);
+                    let front = levels[slot as usize].front(&nodes[b]);
+                    reads = fold(reads, front.unwrap_or(NONE));
                 }
                 LevelOp::Reduce { slot, qty } => levels[slot as usize].reduce(qty),
-                LevelOp::PopFront { slot } => levels[slot as usize].pop_front(),
-                LevelOp::Remove { slot, id, qty } => levels[slot as usize].remove(id, qty),
+                LevelOp::PopFront { slot } => {
+                    // The book pops the maker it has just looked at. The adapter looks at the
+                    // front again instead of keeping the id from the last `Front`, so `Front`
+                    // stays a read that changes no state, as the read-check tests assume; the
+                    // extra look reads the node `pop_front` reads next.
+                    let b = usize::from(books[slot as usize]);
+                    let level = &mut levels[slot as usize];
+                    let maker = level.front(&nodes[b]).expect("a popped level has a front");
+                    level.pop_front(&mut nodes[b]);
+                    orders[b].remove(&maker);
+                }
+                LevelOp::Remove { slot, id, qty } => {
+                    let b = usize::from(books[slot as usize]);
+                    let order = orders[b].remove(&id).expect("removed order is mapped");
+                    nodes[b].unlink(order.slot);
+                    levels[slot as usize].remove(id, qty);
+                }
                 LevelOp::Reset { slot } => levels[slot as usize] = Level::default(),
             }
         }
-        (levels, reads)
+        let state = Levels {
+            levels,
+            books,
+            nodes,
+            orders,
+        };
+        (state, reads)
     }
 
-    /// Orders queued in the levels, levels that are not empty, and the sum of the level totals.
-    pub fn count_levels(levels: &[Level]) -> (usize, usize, u64) {
-        let orders = levels.iter().map(Level::len).sum();
-        let live = levels.iter().filter(|l| !l.is_empty()).count();
-        let shares = levels.iter().map(Level::total).sum();
+    /// Orders in the levels' queues, which the order maps must hold too, levels that are not
+    /// empty, and the sum of the level totals.
+    pub fn count_levels(state: &Levels) -> (usize, usize, u64) {
+        let orders = (0..state.levels.len() as u32)
+            .map(|slot| state.ids(slot).count())
+            .sum();
+        let mapped: usize = state.orders.iter().map(OrderMap::len).sum();
+        assert_eq!(
+            mapped, orders,
+            "the order maps hold exactly the queued orders"
+        );
+        let live = state.levels.iter().filter(|l| !l.is_empty()).count();
+        let shares = state.levels.iter().map(Level::total).sum();
         (orders, live, shares)
     }
 
@@ -529,7 +618,13 @@ pub mod parts {
                     price,
                     qty,
                 } => {
-                    maps[usize::from(book)].insert(id, RestingOrder { side, price, qty });
+                    let order = RestingOrder {
+                        side,
+                        price,
+                        qty,
+                        slot: 0,
+                    };
+                    maps[usize::from(book)].insert(id, order);
                 }
                 MapOp::Get { book, id } => {
                     reads = fold_order(reads, maps[usize::from(book)].get(&id));
