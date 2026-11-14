@@ -423,7 +423,7 @@ pub mod parts {
 
     /// Adds one value to a fold that starts at 0: a multiply by an odd constant and an add, so
     /// the fold changes with every value and with their order. It runs inside the timed passes,
-    /// two instructions per value, the same for the baseline and any candidate.
+    /// a multiply-add per folded value, in the baseline's adapter and in any candidate's.
     #[inline]
     pub fn fold(acc: u64, value: u64) -> u64 {
         acc.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(value)
@@ -467,9 +467,11 @@ pub mod parts {
                     reads = fold(reads, best.map_or(NONE, u64::from));
                 }
                 SideOp::Find { side, price } => {
-                    // shortcut: side levels hold no orders, so every level found has total 0 and
-                    // the fold cannot tell one level from another; give them contents if a
-                    // candidate side could return the wrong level.
+                    // shortcut: every Find in the workload hits, and side levels hold no orders,
+                    // so each one folds the same 0: the fold proves a fold step ran, not that the
+                    // lookup ran or found the right level (the golden hash and the tests catch a
+                    // wrong level in the real part); give side levels an identity once `src/` may
+                    // change.
                     let level = sides[side as usize].level_mut(price);
                     reads = fold(reads, level.map_or(NONE, |l| l.total()));
                 }
