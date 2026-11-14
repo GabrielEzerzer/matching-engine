@@ -206,6 +206,10 @@ pub fn message_length(kind: u8) -> Option<usize> {
 }
 
 /// Decodes one message body (the bytes after the 2-byte length prefix).
+///
+/// Always inlined, like [`Frames::next`], so that a loop over [`Frames`] holds the whole parse
+/// and the message goes straight into the caller's frame instead of through two return slots.
+#[inline(always)]
 pub fn decode(msg: &[u8]) -> Result<Message, ItchError> {
     let Some(&kind) = msg.first() else {
         return Err(ItchError::Empty);
@@ -355,6 +359,8 @@ impl<'a> Frames<'a> {
 impl Iterator for Frames<'_> {
     type Item = Result<Message, ItchError>;
 
+    // Always inlined together with `decode`; see there.
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
             return None;
