@@ -390,7 +390,7 @@ def runner_sha256():
     """SHA-256 of this file as it runs (the kernel's copy has the plan embedded)."""
     try:
         return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    except OSError:
+    except (OSError, NameError):  # NameError: a host that runs the script without __file__
         return UNAVAILABLE
 
 
