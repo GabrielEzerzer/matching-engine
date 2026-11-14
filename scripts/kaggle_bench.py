@@ -24,6 +24,12 @@
 # output gets the real commit in place of the bundle commit). Every command stops at a hard limit
 # of 700 minutes from kernel start. Each step's stdout goes to /kaggle/working/results/<step>.jsonl
 # and stderr to <step>.err; STATUS.json and SUMMARY.md are rewritten every time the status changes.
+# Before setup the kernel writes plan.json (the plan as it runs, defaults filled in); STATUS.json and
+# SUMMARY.md carry the session id (<plan name>-<UTC start as YYYYMMDDTHHMMSSZ>) and the SHA-256 of
+# this file as it runs. Each label that built gets its settings.txt and build.txt copied to
+# build-<label>-settings.txt and build-<label>-build.txt. Each step that runs a comparison or bench.sh
+# records the pinned CPU's steal and total jiffies from /proc/stat across the step and its wall
+# seconds; the readings are informational and never change a state, a verdict or a winner.
 # README.md, "Running the comparisons on Kaggle", describes the plan format and the step kinds.
 #
 # KAGGLE_BENCH_ROOT (default /kaggle) moves the kernel's root, for trying the kernel elsewhere.
@@ -32,6 +38,7 @@ import argparse
 import ast
 import contextlib
 import datetime as dt
+import hashlib
 import io
 import json
 import os
@@ -44,6 +51,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path, PurePath, PurePosixPath
 from types import SimpleNamespace
 
@@ -68,6 +76,9 @@ GOLDEN = "harness/golden/12302019.txt"
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 LABEL_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
 WINDOW_RE = re.compile(r"\d\d:\d\d:\d\d-\d\d:\d\d:\d\d")
+
+PROC_STAT = Path("/proc/stat")  # the self-test points this at a temporary file
+UNAVAILABLE = "unavailable"
 
 T0 = time.monotonic()
 
@@ -375,25 +386,70 @@ def write_json(path, obj):
     write_text(path, json.dumps(obj, indent=1) + "\n")
 
 
+def runner_sha256():
+    """SHA-256 of this file as it runs (the kernel's copy has the plan embedded)."""
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return UNAVAILABLE
+
+
+def cpu_jiffies(cpu):
+    """(steal, total of every field) from /proc/stat's line for cpu, or None when there is none."""
+    try:
+        lines = PROC_STAT.read_text(encoding="ascii", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        f = line.split()
+        if f and f[0] == f"cpu{cpu}":
+            try:
+                vals = [int(x) for x in f[1:]]
+            except ValueError:
+                return None
+            return (vals[7], sum(vals)) if len(vals) > 7 else None  # steal is the 8th field
+    return None
+
+
+def readings(before, after, wall_s):
+    """A step record's scheduling readings, informational only."""
+    rec = {"steal_jiffies": UNAVAILABLE, "total_jiffies": UNAVAILABLE, "wall_s": round(wall_s, 3)}
+    if before and after:
+        rec.update(steal_jiffies=after[0] - before[0], total_jiffies=after[1] - before[1])
+    return rec
+
+
+def steal_pct(rec):
+    steal, total = rec.get("steal_jiffies"), rec.get("total_jiffies")
+    if isinstance(steal, int) and isinstance(total, int) and total > 0:
+        return f"{100 * steal / total:.1f}"
+    return "n/a"
+
+
 def fmt(x):
     return "" if x is None else f"{x:+.2f}"
 
 
 def write_summary(L, status):
-    rows = ["| step | kind | state | verdict | effect % | interval % | label | note |",
-            "|---|---|---|---|---|---|---|---|"]
+    rows = [f"| step (session {status['session']}) | kind | state | verdict | effect % | interval % | steal % | "
+            f"label | note |", "|---|---|---|---|---|---|---|---|---|"]
     for s in status["steps"]:
         interval = f"{fmt(s.get('low_pct'))} .. {fmt(s.get('high_pct'))}" if s.get("low_pct") is not None else ""
         rows.append(f"| {s['id']} | {s['kind']} | {s['state']} | {s.get('verdict') or ''} | "
-                    f"{fmt(s.get('effect_pct'))} | {interval} | {s.get('label') or ''} | {s.get('note') or ''} |")
+                    f"{fmt(s.get('effect_pct'))} | {interval} | {steal_pct(s)} | {s.get('label') or ''} | "
+                    f"{s.get('note') or ''} |")
     labels = [f"- {lab}: branch {v['branch']}, commit {v.get('commit') or '?'}, build {v.get('build') or 'not run'}"
               for lab, v in status["labels"].items()]
     setup = [f"- {k}: {v['state']}{' (' + v['note'] + ')' if v.get('note') else ''}"
              for k, v in status["setup"].items()]
     text = "\n".join([
-        f"# Plan {status['plan']}: {status['state']}", "",
-        "Timings from a shared Kaggle cloud VM under Linux (see host.txt). The comparisons are "
-        "relative and valid on that machine; absolute numbers belong to that machine only.", "",
+        f"# Plan {status['plan']}, session {status['session']}: {status['state']}", "",
+        "Timings from a shared Kaggle cloud VM under Linux (see host.txt). The comparisons are relative: "
+        "both binaries ran in this session on the same CPU. A verdict is evidence from this session, not a "
+        "property of the code on every machine, and a passing A/A check does not certify that the host was "
+        "stable throughout. Absolute numbers belong to this machine only. A steal reading of 0 does not show "
+        "that the core was uncontended.", "",
+        f"Session {status['session']}, runner SHA-256 {status['runner_sha256']}.", "",
         f"Started {status['started']}, last update {status['updated']}, cpu {status['cpu']}, "
         f"stop time {status['stop_at']}.", "", "Setup:", *setup, "", "Labels:", *labels, "",
         *rows, ""])
@@ -408,9 +464,11 @@ class Kernel:
         self.cpu = plan.get("cpu", DEFAULT_CPU)
         self.stop_min = plan.get("stop_after_min", DEFAULT_STOP_MIN)
         self.deadline = T0 + HARD_STOP_MIN * 60  # monotonic time after which no command runs
-        start = dt.datetime.now(dt.timezone.utc)
+        start = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
         self.status = {
-            "plan": plan["name"], "state": "running", "started": now_iso(), "updated": now_iso(),
+            "plan": plan["name"], "session": f"{plan['name']}-{start:%Y%m%dT%H%M%SZ}",
+            "runner_sha256": runner_sha256(), "state": "running",
+            "started": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "updated": now_iso(),
             "stop_at": (start + dt.timedelta(minutes=self.stop_min)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "cpu": self.cpu, "rustc": None, "setup": {},
             "labels": {lab: {"branch": br, "commit": None, "bundle_commit": None, "build": None}
@@ -423,8 +481,20 @@ class Kernel:
         write_json(self.L.results / "STATUS.json", self.status)
         write_summary(self.L, self.status)  # current also when the session is killed
 
+    def write_plan(self):
+        """results/plan.json: the plan as the kernel runs it, with cpu and stop time filled in."""
+        write_json(self.L.results / "plan.json", {**self.plan, "cpu": self.cpu, "stop_after_min": self.stop_min})
+
     def stopped(self):
         return past_stop(time.monotonic() - T0, self.stop_min)
+
+    def measured_sh(self, rec, argv, out, err, **kw):
+        """self.sh, with the pinned CPU's /proc/stat readings and the wall time put in rec."""
+        before, t = cpu_jiffies(self.cpu), time.monotonic()
+        try:
+            return self.sh(argv, out, err, **kw)
+        finally:
+            rec.update(readings(before, cpu_jiffies(self.cpu), time.monotonic() - t))
 
     def sh(self, argv, out, err, cwd=None, env=None, mode="w"):
         """Exit code of argv. Raises TimeoutError at the hard limit, after killing the command's
@@ -462,10 +532,16 @@ class Kernel:
     def host(self):
         self.L.tmp.mkdir(parents=True, exist_ok=True)
         lines = []
-        for argv in (["nproc"], ["lscpu"], ["sh", "-c", "head -n 5 /proc/meminfo"], ["uname", "-r"],
-                     ["df", "-h", str(self.L.tmp), str(self.L.work)]):
+        for argv in (["nproc"], ["lscpu"], ["lscpu", "-e"], ["sh", "-c", "head -n 5 /proc/meminfo"],
+                     ["uname", "-r"], ["df", "-h", str(self.L.tmp), str(self.L.work)]):
             r = subprocess.run(argv, capture_output=True, text=True)
             lines += [f"$ {shlex.join(argv)}", r.stdout.rstrip(), r.stderr.rstrip()]
+        for name in ("scaling_governor", "scaling_driver"):
+            f = Path(f"/sys/devices/system/cpu/cpu{self.cpu}/cpufreq/{name}")
+            try:
+                lines.append(f"{f}: {f.read_text().strip()}")
+            except OSError:
+                lines.append(f"{f}: {UNAVAILABLE}")
         (self.L.results / "host.txt").write_text("\n".join(x for x in lines if x) + "\n", encoding="utf-8")
         cpus = sorted(os.sched_getaffinity(0))
         if self.cpu not in cpus:
@@ -539,6 +615,14 @@ class Kernel:
             rec["build"] = "ok" if ok else f"failed (exit {code}; see build-{lab}.err)"
             if ok:  # bench-build.sh wrote the bundle commit; compare.sh passes this file to the binaries
                 (self.L.bins / lab / "commit.txt").write_text(rec["commit"] + "\n", encoding="utf-8")
+                rec["build_files"] = {}
+                for name in ("settings.txt", "build.txt"):
+                    copy = f"build-{lab}-{name}"
+                    try:
+                        shutil.copyfile(self.L.bins / lab / name, self.L.results / copy)
+                        rec["build_files"][name] = copy
+                    except OSError:
+                        rec["build_files"][name] = "missing"
         except Exception as e:  # recorded; the other labels still build
             rec["build"] = f"failed ({type(e).__name__}: {e})"
         self.save()
@@ -555,8 +639,8 @@ class Kernel:
             return rec.update(state="failed", note=f"no build of {', '.join(missing)}")
         out = self.L.results / (out_id or s["id"])
         rec["label"] = cand
-        code = self.sh(compare_argv(self.plan, self.L, s, cand), f"{out}.jsonl", f"{out}.err",
-                       cwd=self.L.src / self.plan["base"])
+        code = self.measured_sh(rec, compare_argv(self.plan, self.L, s, cand), f"{out}.jsonl", f"{out}.err",
+                                cwd=self.L.src / self.plan["base"])
         summary = read_summary(f"{out}.jsonl")
         if summary is None or code:
             return rec.update(state="failed", note=f"exit {code}{'' if summary else ', no summary line'}; "
@@ -627,8 +711,8 @@ class Kernel:
         out = self.L.results / s["id"]
         rec["label"] = lab
         try:
-            code = self.sh(bench_argv(self.plan, self.L, s), f"{out}.jsonl", f"{out}.err",
-                           cwd=self.L.src / lab, env=env_for(self.L, lab))
+            code = self.measured_sh(rec, bench_argv(self.plan, self.L, s), f"{out}.jsonl", f"{out}.err",
+                                    cwd=self.L.src / lab, env=env_for(self.L, lab))
         finally:
             ids = self.status["labels"][lab]
             for f in (Path(f"{out}.jsonl"), Path(f"{out}.err")):  # bench.sh labels its runs with the bundle commit
@@ -689,6 +773,7 @@ class Kernel:
         self.L.results.mkdir(parents=True, exist_ok=True)
         log(f"plan {json.dumps(self.plan)}")
         try:
+            self.write_plan()
             self.save()
             ok = (self.phase("host", self.host) and self.phase("rust", self.rust)
                   and self.phase("clone", self.clone) and self.phase("fetch", self.fetch))
@@ -845,21 +930,29 @@ class SelfTest(unittest.TestCase):
         for edit, want in cases:
             self.assertIn(want, self.errs(edit))
 
-    def run_steps(self, canned, built=("base", "x", "y")):
+    def run_steps(self, canned, built=("base", "x", "y"), stat=True):
         """Kernel.steps() on the fixture plan with the shell-out replaced. canned maps a step id (the
         output file's name) to (verdict, effect, exit code); a missing id prints nothing and exits 1.
-        Returns ({step id: record}, the step ids that ran a command)."""
-        with tempfile.TemporaryDirectory() as d:
+        With stat, PROC_STAT is a file whose CPU 3 line gains 5 steal and 97 total jiffies across each
+        command; without, it is missing. Returns ({step id: record}, the step ids that ran a command)."""
+        def proc_stat(n):  # user nice system idle iowait irq softirq steal guest guest_nice
+            return f"cpu  1 2 3 4 5 6 7 8 9 10\ncpu3 {10 * n} 0 {2 * n} {80 * n} 0 0 0 {5 * n} 0 0\n"
+        with tempfile.TemporaryDirectory() as d, \
+                unittest.mock.patch(f"{__name__}.PROC_STAT", Path(d) / "stat"):
             L = layout(d)
             L.results.mkdir(parents=True)
             k = Kernel({**fixture_plan(), "commits": {}, "bundle_commits": {}}, L)
             for lab in built:
                 k.status["labels"][lab]["build"] = "ok"
             ran = []
+            if stat:
+                PROC_STAT.write_text(proc_stat(1))
 
             def sh(argv, out, err, cwd=None, env=None, mode="w"):
                 sid = Path(out).stem
                 ran.append(sid)
+                if stat:
+                    PROC_STAT.write_text(proc_stat(len(ran) + 1))
                 with open(out, mode) as fo, open(err, mode) as fe:
                     if sid == "gold":
                         fe.write("golden check passed against x\n")
@@ -873,7 +966,8 @@ class SelfTest(unittest.TestCase):
             k.sh = sh
             with contextlib.redirect_stdout(io.StringIO()):
                 k.steps()
-            self.assertIn("| conf | confirm_best |", (L.results / "SUMMARY.md").read_text())
+            self.summary = (L.results / "SUMMARY.md").read_text()
+            self.assertIn("| conf | confirm_best |", self.summary)
             return {r["id"]: r for r in k.status["steps"]}, ran
 
     def test_step_wiring(self):
@@ -885,6 +979,17 @@ class SelfTest(unittest.TestCase):
         self.assertEqual((r["conf"]["chosen_from"], r["conf"]["winner"]), ("cy", "y"))
         self.assertEqual((r["win"]["state"], r["win"]["label"]), ("done", "y"))
         self.assertEqual((r["gold"]["state"], r["gold"]["verdict"]), ("done", "pass"))
+        for x in ("aa", "cx", "cy", "bench", "conf", "win"):  # each command's scheduling readings
+            self.assertEqual((r[x]["steal_jiffies"], r[x]["total_jiffies"]), (5, 97), x)
+            self.assertGreaterEqual(r[x]["wall_s"], 0)
+        self.assertNotIn("steal_jiffies", r["gold"])
+        self.assertIn("| -5.00 .. -3.00 | 5.2 | y |", self.summary)  # the conf row: 5 / 97
+
+        r, _ = self.run_steps({**ok, **better}, stat=False)  # no /proc/stat: unavailable, never 0
+        self.assertEqual((r["aa"]["steal_jiffies"], r["aa"]["total_jiffies"]), ("unavailable",) * 2)
+        self.assertIsInstance(r["aa"]["wall_s"], float)
+        self.assertEqual(r["conf"]["winner"], "y")  # the readings change nothing
+        self.assertIn("| -5.00 .. -3.00 | n/a | y |", self.summary)
 
         r, ran = self.run_steps({**ok, "cx": ("inconclusive", -1.0, 0), "cy": ("regressed", 2.0, 0)})
         self.assertEqual(r["conf"]["verdict"], "none improved")  # none improved: no confirmation runs
@@ -923,6 +1028,48 @@ class SelfTest(unittest.TestCase):
         r, _ = self.run_steps({**ok, **better}, built=("base", "x"))  # y did not build
         self.assertEqual((r["cy"]["state"], r["cy"]["note"]), ("failed", "no build of y"))
         self.assertEqual(r["conf"]["chosen_from"], "cx")
+
+    def test_proc_stat_without_the_cpu(self):
+        with tempfile.TemporaryDirectory() as d, \
+                unittest.mock.patch(f"{__name__}.PROC_STAT", Path(d) / "stat"):
+            PROC_STAT.write_text("cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\ncpu3 1 2 3 4\n")
+            self.assertEqual(cpu_jiffies(0), (8, 55))
+            self.assertIsNone(cpu_jiffies(3))  # no steal field
+            self.assertIsNone(cpu_jiffies(2))  # no line
+            self.assertEqual(readings(None, (8, 55), 1.0)["steal_jiffies"], "unavailable")
+
+    def test_session_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            L = layout(d)
+            L.results.mkdir(parents=True)
+            plan = {**fixture_plan(), "commits": {"b0": "0" * 40}, "bundle_commits": {"b0": "1" * 40}}
+            k = Kernel(plan, L)
+            k.write_plan()
+            self.assertEqual(json.loads((L.results / "plan.json").read_text()),
+                             {**plan, "cpu": DEFAULT_CPU, "stop_after_min": DEFAULT_STOP_MIN})
+            session = k.status["session"]  # the plan name and the UTC start, nothing else
+            self.assertRegex(session, r"\At-\d{8}T\d{6}Z\Z")
+            self.assertEqual(session, "t-" + k.status["started"].replace("-", "").replace(":", ""))
+            self.assertEqual(k.status["runner_sha256"], hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+            k.save()
+            text = (L.results / "SUMMARY.md").read_text()
+            self.assertIn(f"# Plan t, session {session}: running", text)
+            self.assertIn(f"runner SHA-256 {k.status['runner_sha256']}", text)
+            self.assertIn(f"| step (session {session}) | kind |", text)
+
+            def sh(argv, out, err, cwd=None, env=None, mode="w"):  # a build that writes only settings.txt
+                (L.bins / "x").mkdir(parents=True)
+                for f in ("bench", "settings.txt"):
+                    (L.bins / "x" / f).write_text(f)
+                return 0
+            k.sh = sh
+            k.status["labels"]["x"]["commit"] = "2" * 40
+            with contextlib.redirect_stdout(io.StringIO()):
+                k.build("x")
+            rec = k.status["labels"]["x"]
+            self.assertEqual(rec["build"], "ok")
+            self.assertEqual(rec["build_files"], {"settings.txt": "build-x-settings.txt", "build.txt": "missing"})
+            self.assertEqual((L.results / "build-x-settings.txt").read_text(), "settings.txt")
 
     def test_hard_limit(self):
         with tempfile.TemporaryDirectory() as d:
