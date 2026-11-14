@@ -149,8 +149,8 @@ A plan is a JSON file in `scripts/kaggle-plans/`. It names a base label, every l
 
 - `aa`: `compare.sh -m PART` of the base against itself, the method check, which should come out `inconclusive`;
 - `compare`: `compare.sh -m PART` of the base against a candidate, once per candidate and part;
-- `confirm_best`: for a group of earlier `compare` steps (the alternatives for one part), the one with the best effect among those that came out `improved` is compared again with the same statistic and pair count. If that also says `improved`, it is the group's winner. If no alternative improved, nothing runs. No winner is named when an earlier `aa` step of the same part did not finish with `inconclusive`, because the method is then not trustworthy on that machine;
-- `window`: `compare.sh -w WINDOW` of the base's and the group winner's `bench` binaries;
+- `confirm_best`: for a group of earlier `compare` steps (the alternatives for one part), the one with the best effect among those that came out `improved` is compared again with the same statistic and pair count. If that also says `improved`, it is the group's winner: the alternative that beat the baseline twice, not one shown to be better than the other alternatives, which each met the machine at a different time. A winner is kept only if the guardrail, the golden check and the tests also pass. If no alternative improved, nothing runs. No winner is named when an earlier `aa` step of the same part did not finish with `inconclusive`, because the method is then not trustworthy on that machine;
+- `window`: `compare.sh -w WINDOW` of the base's and the group winner's `bench` binaries, the guardrail comparison. The runner records its interval; whether the guardrail passed is read from the interval's upper end against the declared margin, not from the verdict;
 - `golden`: the golden check (`replay --check`) and `cargo test --all-targets` in the group winner's checkout;
 - `bench`: `scripts/bench.sh` of one label, for a baseline table.
 
@@ -180,6 +180,13 @@ kaggle kernels output KAGGLE_USER/me-bench-stage3-parse -p out\stage3-parse
 
 Kaggle keeps `/kaggle/working` when the run ends; while it runs, the kernel's log shows each step and its verdict as it finishes.
 
-The results are Linux timings from a shared cloud VM. The comparisons are relative, both binaries run in the same session on the same CPU, so their verdicts hold on that machine. Absolute numbers (ns per operation, latencies, throughput) belong to that machine only, and `SUMMARY.md` and `host.txt` say so; never set them beside laptop numbers.
+The results are Linux timings from a shared cloud VM, and what they show is limited in four ways.
+
+- **A verdict is evidence from one session.** Both binaries run in the same session on the same CPU, in alternating order, which cancels a stable advantage of running second. It does not cancel a disturbance that changes over time, such as a neighbour's load, a busy sibling hyperthread or a change of clock frequency.
+- **An A/A check that comes out `inconclusive` shows that no problem was seen while it ran.** It does not certify that the host stayed stable during the comparisons before or after it.
+- **A confirming comparison in the same session is a second look under much the same conditions.** The measurement between the two comparisons separates them in time but does not make them independent, so the two results are not two independent tests and their error rates do not multiply.
+- **Effects from different sessions are not ranked against each other.** Each plan runs on its own VM with its own baseline build, the hardware can differ between sessions, and different parts have different denominators. A table may show several groups' effects together only with each one's session, baseline commit, part, statistic and both comparisons' intervals, and it does not say that one group's change is worth more than another's.
+
+Every session is logged, including one whose A/A check failed or that found nothing, and running a plan again is a new round. Absolute numbers (ns per operation, latencies, throughput) belong to that machine only, and `SUMMARY.md` and `host.txt` say so; never set them beside laptop numbers.
 
 The kernel makes three kinds of request: rustup's installer from `https://sh.rustup.rs` (and the toolchain it downloads), crates.io through cargo, and the Nasdaq sample file through `scripts/fetch-itch.sh`, each with the tool's default user agent. The upload carries the plan (labels, branch names and commit ids) and the bundle, which holds the named branches' files under the neutral `bench` identity and none of their history, so no author or committer name or address. Nothing else identifying is sent beyond the Kaggle account the CLI is logged in to, and the script never reads the CLI's credentials file.

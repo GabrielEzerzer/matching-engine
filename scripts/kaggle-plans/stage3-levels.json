@@ -63,8 +63,8 @@
       "kind": "window",
       "group": "levels",
       "window": "09:30:00-10:00:00",
-      "pairs": 6,
-      "stat": "all_p50_ns"
+      "pairs": 10,
+      "stat": "book_mean_ns"
     },
     {
       "id": "golden-levels",
