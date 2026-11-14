@@ -142,7 +142,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use super::BookSide;
-    use crate::level::Nodes;
+    use crate::level::{Level, Nodes};
     use crate::types::{OrderId, Price, Qty, Side};
 
     const SIDES: [Side; 2] = [Side::Buy, Side::Sell];
@@ -170,6 +170,14 @@ mod tests {
             let slot = self.slots.remove(&id).expect("the order was added");
             self.nodes.unlink(slot);
             side.remove_order(price, id, remaining);
+        }
+
+        /// Takes the level's front order off the way a fill does: pop its node, then forget it.
+        /// The caller reduces the level's total first, as matching does.
+        fn pop_front(&mut self, level: &mut Level) {
+            let id = level.front(&self.nodes).expect("an order rests");
+            level.pop_front(&mut self.nodes);
+            self.slots.remove(&id).expect("the order was added");
         }
     }
 
@@ -243,7 +251,7 @@ mod tests {
             let best = side.best_price().expect("not empty");
             let level = side.level_mut(best).expect("best level exists");
             level.reduce(1);
-            level.pop_front(&mut queues.nodes);
+            queues.pop_front(level);
             side.remove_level(best);
             assert_eq!(side.best_price(), Some(want[1]));
             assert_eq!(prices(&side), want[1..]);
@@ -387,7 +395,7 @@ mod tests {
                             let p = prices(&side)[position.min(model.len() - 1)];
                             let level = side.level_mut(p).expect("level exists");
                             level.reduce(1);
-                            level.pop_front(&mut queues.nodes);
+                            queues.pop_front(level);
                             side.remove_level(p);
                             model.remove(&p);
                             assert_eq!(side.free.len(), n - model.len(), "{at}");
@@ -466,7 +474,7 @@ mod tests {
                             for (id, qty) in model.remove(&best).expect("model has the best") {
                                 assert_eq!(level.front(&queues.nodes), Some(id));
                                 level.reduce(qty);
-                                level.pop_front(&mut queues.nodes);
+                                queues.pop_front(level);
                             }
                             assert!(level.is_empty());
                             side.remove_level(best);
