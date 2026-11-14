@@ -1,0 +1,55 @@
+{
+  "name": "stage3-book-r2",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "m-base",
+    "r-queue-b": "r-queue-b"
+  },
+  "steps": [
+    {
+      "id": "aa-book",
+      "kind": "aa",
+      "part": "book",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-r-queue-b",
+      "kind": "compare",
+      "part": "book",
+      "cand": "r-queue-b",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "aa-book-2",
+      "kind": "aa",
+      "part": "book",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "confirm-queue",
+      "kind": "confirm_best",
+      "group": "queue",
+      "steps": [
+        "cmp-r-queue-b"
+      ]
+    },
+    {
+      "id": "window-queue",
+      "kind": "window",
+      "group": "queue",
+      "window": "09:30:00-10:00:00",
+      "pairs": 10,
+      "stat": "book_mean_ns"
+    },
+    {
+      "id": "golden-queue",
+      "kind": "golden",
+      "group": "queue"
+    }
+  ]
+}
