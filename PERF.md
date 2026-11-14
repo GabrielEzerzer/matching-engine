@@ -86,7 +86,26 @@ Session `stage3-book`, started 14 November 2026 at 04:56 UTC. Baseline `209e9e2`
 | Same binary twice | none | +0.23% | −0.75% to +1.23% | +0.64% | inconclusive, as it should be |
 | Confirming comparison | linked ring | −6.80% | −16.76% to +4.37% | −5.92% | inconclusive (2 flagged runs) |
 
-Not kept in this round: lazy removal (inconclusive) and the linked ring (confirmation inconclusive). The host was busy during the last two pairs of the confirmation; the other eight pairs lay between −9.3% and −11.1%. An inconclusive result is final for its round whatever the cause, so the guardrail and the golden check did not run. The linked ring is being measured once more as round 2. The reason, written down before that round started, is that the control loop flagged two runs of the confirming comparison; the flag comes from the loop's own timing and not from the result.
+Not kept in this round: lazy removal (inconclusive) and the linked ring (confirmation inconclusive). The host was busy during the last two pairs of the confirmation; the other eight pairs lay between −9.3% and −11.1%. An inconclusive result is final for its round whatever the cause, so the guardrail and the golden check did not run. The linked ring was measured once more as round 2, below.
+
+### Order queue at a price level, round 2
+
+Session `stage3-book-r2`, started 14 November 2026 at 05:41 UTC. Baseline `209e9e2`, candidate `4a2bce7` (the linked ring alone), part `book`, the same statistic and pair count as round 1. This is the one second round the procedure allows. Its reason was written down before it started: the control loop flagged two runs of round 1's confirming comparison, and the flag comes from the loop's own timing, not from the result.
+
+| Step | Change | Effect on best pass | Interval | Effect on median pass | Verdict |
+|---|---|---|---|---|---|
+| Same binary twice | none | +0.12% | −0.81% to +1.06% | −0.38% | inconclusive, as it should be |
+| First comparison | linked ring | −10.09% | −12.23% to −7.90% | −9.22% | improved (2 flagged runs, on the candidate) |
+| Same binary twice | none | −0.54% | −1.76% to +0.70% | −2.12% | inconclusive, as it should be |
+| Confirming comparison | linked ring | −10.36% | −11.59% to −9.11% | −12.34% | improved |
+
+Guardrail: `book_mean_ns` −9.87%, interval −13.98% to −5.57%. The upper end is below +5%, so it passes, and the interval lies wholly below zero: this change is visible end to end. Two baseline runs were flagged (pairs 8 and 9, at −14.2% and −3.5%); all ten pairs were negative, from −3.5% to −15.8%. The golden replay hash was unchanged and the tests passed in the session.
+
+**Kept on its second round: the linked ring.** Both rounds side by side: round 1's first comparison −9.48%, its confirmation −6.80% with an interval from −16.76% to +4.37% (inconclusive, not kept); round 2's first comparison −10.09%, its confirmation −10.36%. Two rounds are two chances to pass, so this result is less certain than round 2's intervals say on their own.
+
+On the Kaggle machine a book command went from 177.3 ns to 159.7 ns (median over the runs of each run's best pass), and in the guardrail window the mean time of a book message went from 777.7 ns to 701.6 ns and its median from 564.4 ns to 482.6 ns (medians over the ten runs of each build).
+
+The code that merged differs from the measured commit in two places that the `book` measurement does not touch: `Level::check`, which only the tests and the invariant checker call, now also fails for a ring shorter than the level's count, and the `level` microbenchmark's adapter was rewritten for the merged setup's read checks.
 
 ### Instruction counts
 
