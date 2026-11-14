@@ -157,9 +157,9 @@ impl OrderBook {
     /// The order with time priority at the best price of `side`: the one an incoming order on
     /// the opposite side would trade with first. `None` if the side is empty.
     pub fn front_order(&self, side: Side) -> Option<OrderId> {
-        let side = self.side(side);
-        let price = side.best_price()?;
-        side.level(price)?.front()
+        let book_side = self.side(side);
+        let price = book_side.best_price()?;
+        book_side.level(price)?.front(&self.orders, side, price)
     }
 
     /// Levels of one side, best price first.
@@ -181,7 +181,10 @@ impl OrderBook {
                 .levels_best_first()
                 .map(|(price, level)| LevelSnapshot {
                     price,
-                    orders: level.ids().map(|id| (id, self.orders[&id].qty)).collect(),
+                    orders: level
+                        .ids(&self.orders, side, price)
+                        .map(|id| (id, self.orders[&id].qty))
+                        .collect(),
                 })
                 .collect()
         };
@@ -206,8 +209,9 @@ impl OrderBook {
                 if level.is_empty() {
                     return Err(format!("{side:?} level {price} is empty"));
                 }
+                level.check(&self.orders, side, price)?;
                 let mut sum = 0u64;
-                for id in level.ids() {
+                for id in level.ids(&self.orders, side, price) {
                     if !seen.insert(id) {
                         return Err(format!("order {id} is queued twice"));
                     }
@@ -281,15 +285,24 @@ impl OrderBook {
         if remaining == 0 {
             out.push(Event::Filled { id });
         } else if let Some(price) = limit {
-            self.side_mut(side)
-                .level_or_insert(price)
-                .push_back(id, remaining);
+            let book_side = match side {
+                Side::Buy => &mut self.bids,
+                Side::Sell => &mut self.asks,
+            };
+            let seq = book_side.level_or_insert(price).push_back(
+                &mut self.orders,
+                side,
+                price,
+                id,
+                remaining,
+            );
             self.orders.insert(
                 id,
                 RestingOrder {
                     side,
                     price,
                     qty: remaining,
+                    seq,
                 },
             );
         }
@@ -306,9 +319,9 @@ impl OrderBook {
         mut qty: Qty,
         out: &mut Vec<Event>,
     ) -> Qty {
-        let (opposite, orders) = match side {
-            Side::Buy => (&mut self.asks, &mut self.orders),
-            Side::Sell => (&mut self.bids, &mut self.orders),
+        let (opposite, maker_side, orders) = match side {
+            Side::Buy => (&mut self.asks, Side::Sell, &mut self.orders),
+            Side::Sell => (&mut self.bids, Side::Buy, &mut self.orders),
         };
         while qty > 0 {
             let Some(price) = opposite.best_price() else {
@@ -320,12 +333,18 @@ impl OrderBook {
                 break;
             }
             let level = opposite.level_mut(price).expect("best level exists");
-            while qty > 0
-                && let Some(maker_id) = level.front()
-            {
-                let maker = orders
+            while qty > 0 && !level.is_empty() {
+                let entry = level
+                    .front_entry()
+                    .expect("a level with live orders has entries");
+                let maker_id = entry.id;
+                let Some(maker) = orders
                     .get_mut(&maker_id)
-                    .expect("queued order is in the id map");
+                    .filter(|maker| entry.matches(maker, maker_side, price))
+                else {
+                    level.pop_dead_front();
+                    continue;
+                };
                 let fill = qty.min(maker.qty);
                 qty -= fill;
                 maker.qty -= fill;
