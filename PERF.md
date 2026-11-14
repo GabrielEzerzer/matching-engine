@@ -141,6 +141,35 @@ On the Kaggle machine a price-level operation went from 44.4 ns to 24.9 ns (medi
 
 The code that merged differs from the measured commit: removing a level checks in release builds too that the level is empty (one comparison per removed level), and it sits on top of the hasher and the linked ring, while the measurement was of the sorted index alone against `209e9e2`. The combination has not been timed.
 
+### ITCH parsing, round 1
+
+Session `stage3-parse`, started 14 November 2026 at 04:51 UTC. Baseline `209e9e2`. Measured part: `parse`, the 8,357,979 messages in the 256 MiB of frames that start at 09:30:00, split and decoded without a book.
+
+| Step | Change | Effect on best pass | Interval | Effect on median pass | Verdict |
+|---|---|---|---|---|---|
+| Same binary twice | none | −0.86% | −4.61% to +3.03% | −0.68% | inconclusive, as it should be (1 flagged run) |
+| First comparison | one length check per message, then fields read from fixed-size arrays (`ef0160d`) | −16.86% | −17.53% to −16.19% | −16.48% | improved (1 flagged run, on the candidate) |
+| First comparison | the three rare message types decoded out of line (`985fe7a`) | −9.43% | −10.41% to −8.43% | −8.68% | improved |
+| First comparison | the frame splitter and decoder inlined into the consuming loop (`85197a8`) | −7.21% | −8.35% to −6.06% | −7.86% | improved (1 flagged run, on the baseline) |
+| Confirming comparison | fields from fixed-size arrays | −17.03% | −18.74% to −15.28% | −16.87% | improved (2 flagged runs, on the baseline) |
+
+Between the first comparisons and the confirmation the session ran the whole-day benchmark of the baseline, not a second same-binary check. The golden replay hash was unchanged and the tests passed in the session. The session's window comparison ran with the statistic an earlier draft of the plan declared (`all_p50_ns`, 6 pairs: −0.34%, interval −4.67% to +4.19%; `book_mean_ns` in the same runs +0.09%, interval −11.13% to +12.72%). That is not the declared guardrail, so nothing was kept in this round. The two alternatives that improved less were not confirmed, because only the best of a group goes to the confirming comparison.
+
+### ITCH parsing, round 2
+
+Session `stage3-parse-r2`, started 14 November 2026 at 06:18 UTC. Baseline `209e9e2`, candidate `ef0160d` (the array decoder alone), part `parse`, the same statistic and pair count as round 1. This is the one second round the procedure allows. Its reason was written down before it started: round 1's guardrail ran the wrong statistic and too few pairs.
+
+| Step | Change | Effect on best pass | Interval | Effect on median pass | Verdict |
+|---|---|---|---|---|---|
+| Same binary twice | none | +1.62% | −4.34% to +7.95% | +1.64% | inconclusive, as it should be |
+| First comparison | fields from fixed-size arrays | −14.52% | −15.67% to −13.36% | −14.36% | improved |
+| Same binary twice | none | +0.10% | −1.25% to +1.46% | +1.06% | inconclusive, as it should be (1 flagged run) |
+| Confirming comparison | fields from fixed-size arrays | −14.78% | −15.66% to −13.90% | −15.00% | improved |
+
+Guardrail: `book_mean_ns` +0.44%, interval −4.73% to +5.90%. The upper end is not below +5%, so the guardrail does not pass. No run was flagged; the ten pairs lay between −8.33% and +8.55%, and the window's median book message was 384.9 ns for both builds. The golden replay hash was unchanged and the tests passed in the session.
+
+**Not kept, and dropped: the array decoder.** It improved and was confirmed on its own part in both rounds (a parsed message went from 22.3 ns to 19.0 ns in this session), but it did not pass the guardrail in the one round where the guardrail was of record, and a candidate gets no third round. The decoder is a few nanoseconds of a book message that takes about 520 ns in the window, which is less than this comparison can resolve in ten pairs: the result does not show that the change slows the book, only that a slowdown of 5% was not ruled out. The code stays on the unmerged branch `parse-arrays`.
+
 ### Instruction counts
 
 Instruction counts from `cachegrind` on the laptop are deterministic and are given as supporting numbers only; they are not timings and decide nothing. One pass of the part, candidate against `209e9e2`: on `orders`, the hasher −21.9% and the flat table −25.1%; on `book`, lazy removal +4.2%, the linked ring −4.2% and the map-entry change −0.8%. The flat table executes fewer instructions than the hasher and was still the slower of the two in time.
