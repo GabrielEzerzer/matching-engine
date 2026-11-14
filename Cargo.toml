@@ -7,6 +7,15 @@ publish = false
 
 [dependencies]
 
+[features]
+# Exposes the book's parts as `matching_engine::internals` for the microbenchmarks
+# (`examples/micro.rs`). Default builds and the public API are unchanged.
+internals = []
+
+[[example]]
+name = "micro"
+required-features = ["internals"]
+
 [dev-dependencies]
 proptest = "1"
 sha2 = "0.10"

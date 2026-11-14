@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
-# Builds the release benchmark for the current checkout and keeps a copy of the binary, so that
-# scripts/compare.sh can later run it against another build.
+# Builds the release benchmark and the microbenchmarks for the current checkout and keeps a copy
+# of both binaries, so that scripts/compare.sh can later run them against another build.
 #
 #   scripts/bench-build.sh [LABEL]
 #
-# The copy goes to $BENCH_BINS/LABEL/bench, with BENCH_BINS defaulting to /root/bench-bins and
-# LABEL to the short commit (with "-dirty" when tracked files have uncommitted changes). Beside it,
+# The copies go to $BENCH_BINS/LABEL/bench and LABEL/micro (built with --features internals), with
+# BENCH_BINS defaulting to /root/bench-bins and LABEL to the short commit (with "-dirty" when
+# tracked files have uncommitted changes). Beside them,
 # commit.txt holds the full commit label (see scripts/commit-label.sh), build.txt the toolchain,
 # build time and SHA-256, and settings.txt every build setting apart from the source: RUSTFLAGS,
 # CARGO_ENCODED_RUSTFLAGS, the other Cargo environment variables that change flags or the profile,
 # the path and SHA-256 of each Cargo config file, the target triple, the release profile from
 # Cargo.toml and rustc -vV. scripts/compare.sh refuses to compare two binaries whose settings.txt
 # differ. An existing LABEL is never overwritten; remove its directory first. The last line of
-# stdout is the binary's path.
+# stdout is the bench binary's path.
 #
 # Linux only, like scripts/bench.sh: the binaries are for benchmarks of record under WSL2.
 set -euo pipefail
 
 if [ "$#" -gt 1 ] || [ "${1:-}" = "-h" ]; then
-    sed -n '2,17p' "$0"
+    sed -n '2,18p' "$0"
     exit 2
 fi
 if [ "$(uname -s)" != "Linux" ]; then
@@ -46,14 +47,16 @@ if [ -e "$dir" ]; then
 fi
 
 cargo build --release --example bench >&2
-src="${CARGO_TARGET_DIR:-$repo/target}/release/examples/bench"
+cargo build --release --features internals --example micro >&2
+src="${CARGO_TARGET_DIR:-$repo/target}/release/examples"
 mkdir -p "$dir"
-cp "$src" "$dir/bench"
+cp "$src/bench" "$src/micro" "$dir/"
 echo "$commit" > "$dir/commit.txt"
 {
     echo "built $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     rustc --version
     echo "sha256 $(sha256sum "$dir/bench" | cut -d' ' -f1)"
+    echo "micro sha256 $(sha256sum "$dir/micro" | cut -d' ' -f1)"
 } > "$dir/build.txt"
 {
     echo "RUSTFLAGS=${RUSTFLAGS-(unset)}"
