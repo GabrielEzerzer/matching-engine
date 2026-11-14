@@ -5,7 +5,7 @@
 #   scripts/commit-label.sh
 #
 # A worktree checked out from Windows has a .git file with a Windows path that Linux git cannot
-# follow; WSL can still run the Windows git.
+# follow, so git.exe is tried too (it can be run from Linux under WSL).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 for g in git git.exe; do

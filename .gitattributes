@@ -1,6 +1,6 @@
-# Shell scripts run under Linux/WSL; keep them LF even with core.autocrlf=true.
+# Shell scripts run under Linux; keep them LF even with core.autocrlf=true.
 *.sh text eol=lf
 # The golden files are compared line by line; keep them LF everywhere.
 harness/golden/* text eol=lf
-# The comparison summary and its test are run under Linux/WSL too.
+# The comparison summary and its test are run under Linux too.
 *.py text eol=lf

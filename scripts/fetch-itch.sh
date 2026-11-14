@@ -4,7 +4,7 @@
 #
 #   scripts/fetch-itch.sh [DIR]
 #
-# DIR defaults to $ITCH_DIR, then /data/itch. Work already done is skipped: a complete .gz is
+# DIR defaults to $ITCH_DIR, then ${XDG_DATA_HOME:-$HOME/.local/share}/itch. Work already done is skipped: a complete .gz is
 # not downloaded again (a partial one is resumed), and an existing decompressed file is kept.
 # The .gz is checked against the pinned size and SHA-256 before it is decompressed. The golden
 # check (`replay --check`) verifies the decompressed file's own SHA-256 as part of its run.
@@ -16,7 +16,7 @@
 # The download is a plain curl request with curl's default user agent and no other headers.
 set -euo pipefail
 
-dir="${1:-${ITCH_DIR:-/data/itch}}"
+dir="${1:-${ITCH_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/itch}}"
 url="${ITCH_URL:-https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/12302019.NASDAQ_ITCH50.gz}"
 gz_sha256="${ITCH_GZ_SHA256:-ef03df46a27e6bda4dead017f84c2e3979df7211f02c7868b51d53fceb99c689}"
 gz_size="${ITCH_GZ_SIZE:-3524013057}"

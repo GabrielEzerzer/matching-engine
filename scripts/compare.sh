@@ -8,8 +8,8 @@
 # BASELINE and CANDIDATE are bench binaries kept by scripts/bench-build.sh; their recorded build
 # settings must match (two copies of one binary need none). Pair 1 runs the baseline then the
 # candidate, pair 2 the candidate then the baseline, and so on. PAIRS must be even and at least 6
-# (3 in each order) and defaults to 6; CPU defaults to 5, FILE to $ITCH_DIR/12302019.NASDAQ_ITCH50
-# (ITCH_DIR defaults to /data/itch). LIMIT stops each run after that many messages. Each run is the
+# (3 in each order) and defaults to 6; CPU defaults to the last CPU, FILE to $ITCH_DIR/12302019.NASDAQ_ITCH50
+# (ITCH_DIR defaults to ${XDG_DATA_HOME:-$HOME/.local/share}/itch). LIMIT stops each run after that many messages. Each run is the
 # latency pass only; -t adds the throughput pass and compares throughput too. -w WINDOW
 # (HH:MM:SS-HH:MM:SS) passes --window to bench, so only that part of the day is timed.
 #
@@ -48,11 +48,11 @@
 # control-loop times next to each run so a loaded run is visible; they never adjust a result.
 # The summary is computed by scripts/compare_summary.py (Python 3).
 #
-# Linux only: results of record come from Linux under WSL2, never native Windows timings.
+# Linux only: results of record come from Linux, never native Windows timings.
 set -euo pipefail
 
 pairs=6
-cpu=5
+cpu=$(($(nproc) - 1))
 limit=""
 tput=0
 floor=""
@@ -78,7 +78,7 @@ done
 shift $((OPTIND - 1))
 die() { echo "compare.sh: $*" >&2; exit 2; }
 [ "$(uname -s)" = "Linux" ] ||
-    die "refusing to run on $(uname -s); benchmarks of record run on Linux (WSL2)."
+    die "refusing to run on $(uname -s); benchmarks of record run on Linux."
 command -v python3 >/dev/null || die "python3 not found"
 summarise=(python3 "$(dirname "$0")/compare_summary.py" ${target:+-s "$target"} ${floor:+-f "$floor"})
 
@@ -92,7 +92,7 @@ fi
 { [ "$#" -ge 2 ] && [ "$#" -le 3 ]; } || usage
 base="$1"
 cand="$2"
-file="${3:-${ITCH_DIR:-/data/itch}/12302019.NASDAQ_ITCH50}"
+file="${3:-${ITCH_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/itch}/12302019.NASDAQ_ITCH50}"
 case "$pairs" in '' | *[!0-9]*) die "bad -n $pairs" ;; esac
 { [ $((pairs % 2)) -eq 0 ] && [ "$pairs" -ge 6 ]; } ||
     die "-n must be even and at least 6, so that each order has at least 3 pairs"
