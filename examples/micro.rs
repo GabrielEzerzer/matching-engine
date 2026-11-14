@@ -20,11 +20,13 @@
 //! keyed by its inputs; later runs load the cache. Preparation is never timed.
 //!
 //! The timed region is one pass over the part's whole workload from empty state. One untimed
-//! pass runs first, then `--passes` timed ones (a default per part keeps a run near ten seconds
-//! after preparation). The JSON line on stdout reports ns per operation as the median over the
+//! pass runs first, then `--passes` timed ones (a default per part keeps a run near fifteen
+//! seconds in all). The JSON line on stdout reports ns per operation as the median over the
 //! passes, the min, the max and the spread ((max - min) / median), the operation counts, the
-//! allocations per pass from a counting global allocator (deterministic, identical in every
-//! pass), and `workload_checksum`, a SHA-256 prefix of the part's workload: two runs with the
+//! allocations per pass from a counting global allocator (the median over the passes, with the
+//! min and max: the order map's default hasher is seeded randomly per map, which moves where
+//! hashbrown rehashes in place instead of growing, so the count can differ by a few between
+//! passes), and `workload_checksum`, a SHA-256 prefix of the part's workload: two runs with the
 //! same checksum ran the same operations. After each pass the part's final state is checked
 //! against the counts the derivation recorded.
 
@@ -69,10 +71,10 @@ const fn hms(h: u64, m: u64, s: u64) -> u64 {
 }
 
 const PARTS: [(&str, usize); 5] = [
-    ("side", 30),
-    ("level", 30),
-    ("orders", 30),
-    ("book", 10),
+    ("side", 60),
+    ("level", 120),
+    ("orders", 60),
+    ("book", 20),
     ("parse", 30),
 ];
 
@@ -316,12 +318,19 @@ fn run(args: &Args) -> Result<String, String> {
         (sorted[n - 1] - sorted[0]) / median * 100.0,
         2,
     );
-    out.num("allocs_per_pass", timing.allocs);
-    out.num("alloc_bytes_per_pass", timing.alloc_bytes);
-    out.float("allocs_per_op", timing.allocs as f64 / ops.max(1) as f64, 4);
+    let mut counts: Vec<u64> = timing.allocs.iter().map(|&(a, _)| a).collect();
+    let mut bytes: Vec<u64> = timing.allocs.iter().map(|&(_, b)| b).collect();
+    counts.sort_unstable();
+    bytes.sort_unstable();
+    let (allocs, alloc_bytes) = (counts[counts.len() / 2], bytes[bytes.len() / 2]);
+    out.num("allocs_per_pass", allocs);
+    out.num("allocs_per_pass_min", counts[0]);
+    out.num("allocs_per_pass_max", counts[counts.len() - 1]);
+    out.num("alloc_bytes_per_pass", alloc_bytes);
+    out.float("allocs_per_op", allocs as f64 / ops.max(1) as f64, 4);
     out.float(
         "alloc_bytes_per_op",
-        timing.alloc_bytes as f64 / ops.max(1) as f64,
+        alloc_bytes as f64 / ops.max(1) as f64,
         2,
     );
     out.float("timed_s", timing.timed.as_secs_f64(), 3);
@@ -350,13 +359,12 @@ struct Timing {
     control_ms_start: f64,
     ns_per_op: Vec<f64>,
     timed: Duration,
-    allocs: u64,
-    alloc_bytes: u64,
+    /// Allocations and allocated bytes of each timed pass.
+    allocs: Vec<(u64, u64)>,
 }
 
 /// One untimed pass, then `passes` timed ones. Each pass starts from empty state; the state it
-/// returns is checked and dropped outside the timed region. Allocation counts must be the same
-/// in every pass.
+/// returns is checked and dropped outside the timed region.
 fn time_passes<S>(
     passes: usize,
     ops: usize,
@@ -371,7 +379,7 @@ fn time_passes<S>(
     drop(warm);
     let mut ns_per_op = Vec::with_capacity(passes);
     let mut timed = Duration::ZERO;
-    let mut counts = None;
+    let mut allocs = Vec::with_capacity(passes);
     for _ in 0..passes {
         let (a0, b0) = (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed));
         let t0 = Instant::now();
@@ -382,15 +390,8 @@ fn time_passes<S>(
         drop(state);
         timed += dt;
         ns_per_op.push(dt.as_nanos() as f64 / ops.max(1) as f64);
-        let this = (a1 - a0, b1 - b0);
-        if counts.is_some_and(|c| c != this) {
-            return Err(format!(
-                "allocations differ between passes: {counts:?} then {this:?}"
-            ));
-        }
-        counts = Some(this);
+        allocs.push((a1 - a0, b1 - b0));
     }
-    let (allocs, alloc_bytes) = counts.expect("at least one pass");
     Ok(Timing {
         started,
         loadavg_start,
@@ -398,7 +399,6 @@ fn time_passes<S>(
         ns_per_op,
         timed,
         allocs,
-        alloc_bytes,
     })
 }
 

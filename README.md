@@ -107,9 +107,9 @@ scripts/compare.sh -s all_p50_ns /root/bench-bins/BASE/bench /root/bench-bins/CA
 scripts/compare.sh -r ab.jsonl -s all_p50_ns   # summarise saved runs again without running
 ```
 
-`bench-build.sh [LABEL]` builds the release benchmark and copies it to `$BENCH_BINS/LABEL/bench` (default `/root/bench-bins`; the default label is the short commit, with `-dirty` when tracked files have uncommitted changes). `commit.txt` (the full commit), `build.txt` (toolchain, build time, SHA-256) and `settings.txt` go beside it. `settings.txt` records how the binary was compiled apart from the source: `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, the other Cargo environment variables that set flags or profile options, the path and SHA-256 of each Cargo config file (never its contents, which can hold registry tokens), the target triple, the release profile from `Cargo.toml` and `rustc -vV`. It never overwrites an existing label.
+`bench-build.sh [LABEL]` builds the release benchmark and the microbenchmarks and copies them to `$BENCH_BINS/LABEL/bench` and `$BENCH_BINS/LABEL/micro` (default `/root/bench-bins`; the default label is the short commit, with `-dirty` when tracked files have uncommitted changes). `commit.txt` (the full commit), `build.txt` (toolchain, build time, SHA-256) and `settings.txt` go beside it. `settings.txt` records how the binary was compiled apart from the source: `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, the other Cargo environment variables that set flags or profile options, the path and SHA-256 of each Cargo config file (never its contents, which can hold registry tokens), the target triple, the release profile from `Cargo.toml` and `rustc -vV`. It never overwrites an existing label.
 
-`compare.sh [-s STAT] [-n PAIRS] [-c CPU] [-l LIMIT] [-t] [-f FLOOR] BASELINE CANDIDATE [FILE]` runs 6 pairs by default, pinned to CPU 5. Pair 1 runs the baseline first, pair 2 the candidate first, and so on. The pair count must be even and at least 6, so that each order has at least 3 pairs. Each run is the latency pass only (`bench --no-throughput`). A full-day run takes about three and a half minutes, so one pair takes about seven minutes and a 6-pair comparison about 42 minutes. `-t` adds the throughput pass and compares throughput too. `compare.sh` refuses two different binaries whose `settings.txt` files differ, and prints the difference, so that a change of compiler, flags or profile cannot pass as a change to the source. Binaries kept before `settings.txt` existed have no record and are refused, except as an A/A comparison of one binary with itself.
+`compare.sh [-s STAT] [-n PAIRS] [-c CPU] [-l LIMIT] [-t] [-w WINDOW] [-m PART] [-f FLOOR] BASELINE CANDIDATE [FILE]` runs 6 pairs by default, pinned to CPU 5. Pair 1 runs the baseline first, pair 2 the candidate first, and so on. The pair count must be even and at least 6, so that each order has at least 3 pairs. Each run is the latency pass only (`bench --no-throughput`). A full-day run takes about three and a half minutes, so one pair takes about seven minutes and a 6-pair comparison about 42 minutes. `-t` adds the throughput pass and compares throughput too. `-w` and `-m` select the shorter runs described under "Guardrail window" and "Microbenchmarks" below. `compare.sh` refuses two different binaries whose `settings.txt` files differ, and prints the difference, so that a change of compiler, flags or profile cannot pass as a change to the source. Binaries kept before `settings.txt` existed have no record and are refused, except as an A/A comparison of one binary with itself.
 
 For each pair, and for each of the mean, p50, p99 and p99.9 of all messages and of book messages, it computes d = 100 × ln(candidate / baseline), the log ratio of the two runs, which is close to the percentage difference for small changes. The effect is the order-balanced mean of d: the mean over baseline-first pairs and the mean over candidate-first pairs, averaged. That cancels an advantage of running first or second in a pair, which is large on this machine: in the first A/A comparison the second run was about 9% faster at p50 and 13% faster on the mean, and in the second the first run was faster. Because the advantage multiplies the second run's time, it cancels exactly on the log scale; plain percentage differences would leave a bias of about 0.5% at a 10% advantage. The output shows the advantage as `order`, or `not measured` when one order has no pairs.
 
@@ -140,3 +140,42 @@ When there are several alternatives for one part, each is compared once against 
 Over many rounds some kept changes will still be chance, and the effects reported for kept rounds are biased upward, because only the comparisons that came out well were kept. The unbiased figure for the whole exercise is one comparison of the starting commit against the final commit at the end.
 
 Why this procedure: an earlier version accepted a change when every pair agreed and the effect was larger than one A/A comparison's effect. That floor could be near zero by luck, agreement in five pairs happens by chance one time in 32 per statistic, eight statistics gave eight chances, and a round could be rerun until it agreed. The order advantage also made a real gain look worse in baseline-first pairs and better in candidate-first pairs, so it could never pass. The interval now comes from the repeated pairs themselves, the target is named in advance, a gain has to show up twice in separate blocks, and rerunning is counted.
+
+## Microbenchmarks
+
+`examples/micro.rs` times one part of the book at a time, so that a change to one part can be measured in seconds instead of a full-day replay. It needs the `internals` feature, which exposes the parts as `matching_engine::internals`; default builds, the tests and the public API do not change.
+
+```sh
+cargo build --release --features internals --example micro
+taskset -c 5 target/release/examples/micro side /data/itch/12302019.NASDAQ_ITCH50
+```
+
+The parts are:
+
+- `side`: the price levels of one side (`BookSide`): best price, find a level, find or create one, remove one;
+- `level`: the queue of orders at one price (`Level`): push, look at the front, reduce, pop the front, remove from anywhere, and reset when a level is emptied;
+- `orders`: the order-id map (`OrderMap`): insert, get, update, remove;
+- `book`: the book commands applied to `OrderBook`, which includes everything above and reports allocations per command from a counting global allocator;
+- `parse`: splitting and decoding ITCH frames into `Message`, without a book.
+
+The workload is the book commands of AAPL, MSFT, AMD, TSLA, QQQ and SPY from the start of the day until 10:30:00, which includes the first hour of regular trading: 2,922,290 commands. `parse` uses the 256 MiB of frames that start at 09:30:00 (8,357,979 messages). The operations of `side`, `level` and `orders` are derived by replaying those commands through the real book and watching it only through its public API, so they are a sequence of logical operations (for example "remove the order at price p on the sell side of book 3") rather than calls into the current code. A rewritten part runs the same workload through a small adapter in `harness/workload.rs`. `tests/workload.rs` checks that the derived operations rebuild the book's state on a hand-made command stream.
+
+The first run derives the workloads, which takes about 15 seconds, and caches them in `micro-cache/` beside the ITCH file (`/data/itch/micro-cache/`), keyed by a hash of the inputs, so later runs start in under a second. Preparation is never timed. Each run makes one untimed pass and then a fixed number of timed passes over the part's whole workload, each from empty state, and checks the final state after every pass. A run takes about 15 seconds. It prints one JSON line with the part, the operation counts, `workload_checksum` (two runs with the same checksum ran the same operations), ns per operation as the median, min and max over the passes and their spread, allocations per pass and per operation, and the same host readings as `bench`. Allocation counts can differ by one or two between passes, because the order map's hasher is seeded randomly and that changes when the hash table rehashes in place instead of growing; the line reports the median, min and max.
+
+To compare two builds on one part, keep both with `scripts/bench-build.sh` and pass the `micro` binaries and `-m PART` to `compare.sh`:
+
+```sh
+scripts/compare.sh -m side -n 10 -s ns_per_op_min /root/bench-bins/BASE/micro /root/bench-bins/CAND/micro > side.jsonl
+```
+
+The statistics are `ns_per_op_median` and `ns_per_op_min`, all runs must report the same `workload_checksum`, and the comparison rule is the one described above. `-m` cannot be combined with `-l`, `-w` or `-t`.
+
+## Guardrail window
+
+A change that wins on its part still has to hold up end to end. `bench --window HH:MM:SS-HH:MM:SS` times only the messages in that part of the day: it first replays everything before the window untimed, so the books are in their real state when timing starts, and stops at the first message at or after the end. `compare.sh -w WINDOW` passes the option through.
+
+```sh
+scripts/compare.sh -w 09:30:00-10:00:00 -s all_p50_ns /root/bench-bins/BASE/bench /root/bench-bins/CAND/bench > guard.jsonl
+```
+
+The guardrail window is 09:30:00 to 10:00:00, the first half hour of regular trading. It is the densest part of the day, with 32,817,244 messages (about an eighth of the day) and the largest bursts, so it exercises the book under the heaviest load. The warm-up before it is only the 6,696,719 pre-market messages, and the input up to 10:00 is 1.24 GB, which stays in the page cache between runs. A run takes about 30 seconds on a quiet machine, so a 10-pair comparison takes about ten minutes.
