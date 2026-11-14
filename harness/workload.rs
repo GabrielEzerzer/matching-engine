@@ -537,7 +537,7 @@ pub mod parts {
         let mut levels: Vec<Level> = (0..w.level_slots).map(|_| Level::default()).collect();
         let mut books: Vec<BookIdx> = vec![0; w.level_slots];
         let mut nodes: Vec<Nodes> = (0..w.books).map(|_| Nodes::default()).collect();
-        let mut orders: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::new()).collect();
+        let mut orders: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::default()).collect();
         let mut push_books = push_books.iter();
         let mut reads = 0;
         for &op in &w.level_ops {
