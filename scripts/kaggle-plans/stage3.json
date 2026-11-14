@@ -4,51 +4,259 @@
   "cpu": 3,
   "stop_after_min": 630,
   "labels": {
-    "base": "perf-rig-s1",
+    "base": "m-base",
     "m-levels-a": "m-levels-a",
     "m-levels-b": "m-levels-b",
     "m-levels-c": "m-levels-c",
-    "m-queue-a": "m-queue-a",
-    "m-queue-b": "m-queue-b",
-    "m-ordermap-a": "m-ordermap-a",
-    "m-ordermap-c": "m-ordermap-c",
+    "r-queue-a": "r-queue-a",
+    "r-queue-b": "r-queue-b",
+    "r-ordermap-a": "r-ordermap-a",
+    "r-ordermap-c": "r-ordermap-c",
     "m-ordermap-b": "m-ordermap-b",
     "m-parse-a": "m-parse-a",
     "m-parse-b": "m-parse-b",
     "m-parse-c": "m-parse-c"
   },
   "steps": [
-    {"id": "aa-side", "kind": "aa", "part": "side", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "aa-level", "kind": "aa", "part": "level", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "aa-orders", "kind": "aa", "part": "orders", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "aa-book", "kind": "aa", "part": "book", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "aa-parse", "kind": "aa", "part": "parse", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-levels-a", "kind": "compare", "part": "side", "cand": "m-levels-a", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-levels-b", "kind": "compare", "part": "side", "cand": "m-levels-b", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-levels-c", "kind": "compare", "part": "side", "cand": "m-levels-c", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-queue-a", "kind": "compare", "part": "level", "cand": "m-queue-a", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-queue-b", "kind": "compare", "part": "level", "cand": "m-queue-b", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-ordermap-a", "kind": "compare", "part": "orders", "cand": "m-ordermap-a", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-ordermap-c", "kind": "compare", "part": "orders", "cand": "m-ordermap-c", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-ordermap-b", "kind": "compare", "part": "book", "cand": "m-ordermap-b", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-parse-a", "kind": "compare", "part": "parse", "cand": "m-parse-a", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-parse-b", "kind": "compare", "part": "parse", "cand": "m-parse-b", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "cmp-m-parse-c", "kind": "compare", "part": "parse", "cand": "m-parse-c", "pairs": 10, "stat": "ns_per_op_min"},
-    {"id": "confirm-levels", "kind": "confirm_best", "group": "levels", "steps": ["cmp-m-levels-a", "cmp-m-levels-b", "cmp-m-levels-c"]},
-    {"id": "confirm-queue", "kind": "confirm_best", "group": "queue", "steps": ["cmp-m-queue-a", "cmp-m-queue-b"]},
-    {"id": "confirm-ordermap", "kind": "confirm_best", "group": "ordermap", "steps": ["cmp-m-ordermap-a", "cmp-m-ordermap-c"]},
-    {"id": "confirm-ordermap-book", "kind": "confirm_best", "group": "ordermap-book", "steps": ["cmp-m-ordermap-b"]},
-    {"id": "confirm-parse", "kind": "confirm_best", "group": "parse", "steps": ["cmp-m-parse-a", "cmp-m-parse-b", "cmp-m-parse-c"]},
-    {"id": "window-levels", "kind": "window", "group": "levels", "window": "09:30:00-10:00:00", "pairs": 6, "stat": "all_p50_ns"},
-    {"id": "golden-levels", "kind": "golden", "group": "levels"},
-    {"id": "window-queue", "kind": "window", "group": "queue", "window": "09:30:00-10:00:00", "pairs": 6, "stat": "all_p50_ns"},
-    {"id": "golden-queue", "kind": "golden", "group": "queue"},
-    {"id": "window-ordermap", "kind": "window", "group": "ordermap", "window": "09:30:00-10:00:00", "pairs": 6, "stat": "all_p50_ns"},
-    {"id": "golden-ordermap", "kind": "golden", "group": "ordermap"},
-    {"id": "window-ordermap-book", "kind": "window", "group": "ordermap-book", "window": "09:30:00-10:00:00", "pairs": 6, "stat": "all_p50_ns"},
-    {"id": "golden-ordermap-book", "kind": "golden", "group": "ordermap-book"},
-    {"id": "window-parse", "kind": "window", "group": "parse", "window": "09:30:00-10:00:00", "pairs": 6, "stat": "all_p50_ns"},
-    {"id": "golden-parse", "kind": "golden", "group": "parse"},
-    {"id": "bench-base", "kind": "bench", "label": "base", "runs": 3}
+    {
+      "id": "aa-side",
+      "kind": "aa",
+      "part": "side",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "aa-level",
+      "kind": "aa",
+      "part": "level",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "aa-orders",
+      "kind": "aa",
+      "part": "orders",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "aa-book",
+      "kind": "aa",
+      "part": "book",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "aa-parse",
+      "kind": "aa",
+      "part": "parse",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-levels-a",
+      "kind": "compare",
+      "part": "side",
+      "cand": "m-levels-a",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-levels-b",
+      "kind": "compare",
+      "part": "side",
+      "cand": "m-levels-b",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-levels-c",
+      "kind": "compare",
+      "part": "side",
+      "cand": "m-levels-c",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-r-queue-a",
+      "kind": "compare",
+      "part": "book",
+      "cand": "r-queue-a",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-r-queue-b",
+      "kind": "compare",
+      "part": "book",
+      "cand": "r-queue-b",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-r-ordermap-a",
+      "kind": "compare",
+      "part": "orders",
+      "cand": "r-ordermap-a",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-r-ordermap-c",
+      "kind": "compare",
+      "part": "orders",
+      "cand": "r-ordermap-c",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-ordermap-b",
+      "kind": "compare",
+      "part": "book",
+      "cand": "m-ordermap-b",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-parse-a",
+      "kind": "compare",
+      "part": "parse",
+      "cand": "m-parse-a",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-parse-b",
+      "kind": "compare",
+      "part": "parse",
+      "cand": "m-parse-b",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-parse-c",
+      "kind": "compare",
+      "part": "parse",
+      "cand": "m-parse-c",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "confirm-levels",
+      "kind": "confirm_best",
+      "group": "levels",
+      "steps": [
+        "cmp-m-levels-a",
+        "cmp-m-levels-b",
+        "cmp-m-levels-c"
+      ]
+    },
+    {
+      "id": "confirm-queue",
+      "kind": "confirm_best",
+      "group": "queue",
+      "steps": [
+        "cmp-r-queue-a",
+        "cmp-r-queue-b"
+      ]
+    },
+    {
+      "id": "confirm-ordermap",
+      "kind": "confirm_best",
+      "group": "ordermap",
+      "steps": [
+        "cmp-r-ordermap-a",
+        "cmp-r-ordermap-c"
+      ]
+    },
+    {
+      "id": "confirm-ordermap-book",
+      "kind": "confirm_best",
+      "group": "ordermap-book",
+      "steps": [
+        "cmp-m-ordermap-b"
+      ]
+    },
+    {
+      "id": "confirm-parse",
+      "kind": "confirm_best",
+      "group": "parse",
+      "steps": [
+        "cmp-m-parse-a",
+        "cmp-m-parse-b",
+        "cmp-m-parse-c"
+      ]
+    },
+    {
+      "id": "window-levels",
+      "kind": "window",
+      "group": "levels",
+      "window": "09:30:00-10:00:00",
+      "pairs": 6,
+      "stat": "all_p50_ns"
+    },
+    {
+      "id": "golden-levels",
+      "kind": "golden",
+      "group": "levels"
+    },
+    {
+      "id": "window-queue",
+      "kind": "window",
+      "group": "queue",
+      "window": "09:30:00-10:00:00",
+      "pairs": 6,
+      "stat": "all_p50_ns"
+    },
+    {
+      "id": "golden-queue",
+      "kind": "golden",
+      "group": "queue"
+    },
+    {
+      "id": "window-ordermap",
+      "kind": "window",
+      "group": "ordermap",
+      "window": "09:30:00-10:00:00",
+      "pairs": 6,
+      "stat": "all_p50_ns"
+    },
+    {
+      "id": "golden-ordermap",
+      "kind": "golden",
+      "group": "ordermap"
+    },
+    {
+      "id": "window-ordermap-book",
+      "kind": "window",
+      "group": "ordermap-book",
+      "window": "09:30:00-10:00:00",
+      "pairs": 6,
+      "stat": "all_p50_ns"
+    },
+    {
+      "id": "golden-ordermap-book",
+      "kind": "golden",
+      "group": "ordermap-book"
+    },
+    {
+      "id": "window-parse",
+      "kind": "window",
+      "group": "parse",
+      "window": "09:30:00-10:00:00",
+      "pairs": 6,
+      "stat": "all_p50_ns"
+    },
+    {
+      "id": "golden-parse",
+      "kind": "golden",
+      "group": "parse"
+    },
+    {
+      "id": "bench-base",
+      "kind": "bench",
+      "label": "base",
+      "runs": 3
+    }
   ]
 }

@@ -1,0 +1,74 @@
+{
+  "name": "stage3-parse",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "m-base",
+    "m-parse-a": "m-parse-a",
+    "m-parse-b": "m-parse-b",
+    "m-parse-c": "m-parse-c"
+  },
+  "steps": [
+    {
+      "id": "aa-parse",
+      "kind": "aa",
+      "part": "parse",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-parse-a",
+      "kind": "compare",
+      "part": "parse",
+      "cand": "m-parse-a",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-parse-b",
+      "kind": "compare",
+      "part": "parse",
+      "cand": "m-parse-b",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "cmp-m-parse-c",
+      "kind": "compare",
+      "part": "parse",
+      "cand": "m-parse-c",
+      "pairs": 10,
+      "stat": "ns_per_op_min"
+    },
+    {
+      "id": "bench-base",
+      "kind": "bench",
+      "label": "base",
+      "runs": 3
+    },
+    {
+      "id": "confirm-parse",
+      "kind": "confirm_best",
+      "group": "parse",
+      "steps": [
+        "cmp-m-parse-a",
+        "cmp-m-parse-b",
+        "cmp-m-parse-c"
+      ]
+    },
+    {
+      "id": "window-parse",
+      "kind": "window",
+      "group": "parse",
+      "window": "09:30:00-10:00:00",
+      "pairs": 6,
+      "stat": "all_p50_ns"
+    },
+    {
+      "id": "golden-parse",
+      "kind": "golden",
+      "group": "parse"
+    }
+  ]
+}
