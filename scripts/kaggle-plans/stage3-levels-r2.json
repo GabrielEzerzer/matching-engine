@@ -1,0 +1,18 @@
+{
+  "name": "stage3-levels-r2",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "m-base",
+    "m-levels-c": "m-levels-c"
+  },
+  "steps": [
+    {"id": "aa-side", "kind": "aa", "part": "side", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-m-levels-c", "kind": "compare", "part": "side", "cand": "m-levels-c", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "aa-side-2", "kind": "aa", "part": "side", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-levels", "kind": "confirm_best", "group": "levels", "steps": ["cmp-m-levels-c"]},
+    {"id": "window-levels", "kind": "window", "group": "levels", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-levels", "kind": "golden", "group": "levels"}
+  ]
+}
