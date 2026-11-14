@@ -31,7 +31,10 @@
 //! min and max (the order map's default hasher is seeded randomly per map, which moves where
 //! hashbrown rehashes in place instead of growing, so the count can differ by a few between
 //! passes). After each pass the part's final state is checked against the orders, levels and
-//! resting shares the derivation recorded.
+//! resting shares the derivation recorded. For `side`, `level` and `orders` the adapter also
+//! folds the result of every read into one number (`parts::fold`, inside the timed region), and
+//! that is checked against the fold the baseline adapters gave when the workload was derived,
+//! so an adapter that skips a read or returns a wrong value from one fails the run.
 
 #[path = "../harness/host.rs"]
 mod host;
@@ -67,7 +70,7 @@ const PARSE_START: u64 = hms(9, 30, 0);
 /// Whole frames up to this many bytes, far more than the caches hold, as in the full replay.
 const PARSE_BYTES: u64 = 256 << 20;
 /// Bump when the derivation or the encoding changes, so old caches are not reused.
-const WORKLOAD_VERSION: u32 = 2;
+const WORKLOAD_VERSION: u32 = 3;
 
 const fn hms(h: u64, m: u64, s: u64) -> u64 {
     ((h * 60 + m) * 60 + s) * 1_000_000_000
@@ -245,7 +248,10 @@ fn run(args: &Args) -> Result<String, String> {
                 w.side_ops.len(),
                 || parts::run_sides(w),
                 // Side operations carry no quantities: the levels a side holds stay empty.
-                |sides| expect("levels", parts::count_sides(sides), w.final_levels),
+                |(sides, reads)| {
+                    expect("levels", parts::count_sides(sides), w.final_levels)?;
+                    expect_reads(*reads, w.final_reads.side)
+                },
             )?;
             (digest(&[&s[0], &s[2]]), t, w.side_ops.len())
         }
@@ -256,11 +262,12 @@ fn run(args: &Args) -> Result<String, String> {
                 args.passes,
                 w.level_ops.len(),
                 || parts::run_levels(w),
-                |levels| {
+                |(levels, reads)| {
                     let (orders, live, shares) = parts::count_levels(levels);
                     expect("orders", orders, w.final_orders)?;
                     expect("levels", live, w.final_levels)?;
-                    expect("shares", shares, w.final_shares)
+                    expect("shares", shares, w.final_shares)?;
+                    expect_reads(*reads, w.final_reads.level)
                 },
             )?;
             (digest(&[&s[0], &s[3]]), t, w.level_ops.len())
@@ -271,10 +278,11 @@ fn run(args: &Args) -> Result<String, String> {
                 args.passes,
                 w.map_ops.len(),
                 || parts::run_maps(w),
-                |maps| {
+                |(maps, reads)| {
                     let (orders, shares) = parts::count_maps(maps);
                     expect("orders", orders, w.final_orders)?;
-                    expect("shares", shares, w.final_shares)
+                    expect("shares", shares, w.final_shares)?;
+                    expect_reads(*reads, w.final_reads.map)
                 },
             )?;
             (digest(&[&s[0], &s[4]]), t, w.map_ops.len())
@@ -364,6 +372,16 @@ fn expect<T: PartialEq + std::fmt::Display>(what: &str, got: T, want: T) -> Resu
     } else {
         Err(format!(
             "after a pass the part holds {got} {what}, the workload ends with {want}"
+        ))
+    }
+}
+
+fn expect_reads(got: u64, want: u64) -> Result<(), String> {
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "after a pass the part's reads fold to {got:016x}, the workload's fold to {want:016x}"
         ))
     }
 }
@@ -645,7 +663,8 @@ fn read_cache(bytes: &[u8]) -> Result<CacheParts, String> {
 }
 
 /// Replays the book messages of [`SYMBOLS`] up to [`WORKLOAD_END`] through one book per symbol
-/// and records each part's operations; finds the parse byte range on the way.
+/// and records each part's operations; finds the parse byte range on the way. Then runs the
+/// operations once through this build's adapters to record what their reads return.
 fn derive(file: &Path) -> Result<(Workload, (u64, u64, u64)), String> {
     let started = Instant::now();
     let mut reader = ChunkReader::open(file, DEFAULT_CHUNK).map_err(|e| e.to_string())?;
@@ -741,7 +760,8 @@ fn derive(file: &Path) -> Result<(Workload, (u64, u64, u64)), String> {
     }
     let start = parse_start.ok_or("the file has no message after the parse start")?;
     let end = parse_end.unwrap_or(consumed);
-    let w = recorder.finish();
+    let mut w = recorder.finish();
+    w.final_reads = parts::final_reads(&w);
     eprintln!(
         "micro: derived {} commands, {} side, {} level and {} map operations in {:.1} s",
         w.commands.len(),

@@ -15,6 +15,10 @@
 //! emitted, the book's answer to [`OrderBook::order`] for the id it names (asked before the
 //! command) and for its own id and the makers it traded with (asked after). Nothing reads the
 //! book's internals, so the derivation does not change when a part does.
+//!
+//! A replay of a part's operations is checked twice: its end state against the orders, shares
+//! and levels the book held after the last command, and the results of its reads against
+//! [`Workload::final_reads`], so an adapter cannot skip a read without failing.
 
 use std::collections::HashMap;
 
@@ -42,7 +46,8 @@ pub enum SideOp {
 pub enum LevelOp {
     /// Append `id` with `qty` shares at the back.
     Push { slot: u32, id: OrderId, qty: Qty },
-    /// The id at the front (the next maker).
+    /// The id at the front (the next maker). After a taker with quantity left empties the level,
+    /// the book looks once more and finds nothing, just before the level is dropped.
     Front { slot: u32 },
     /// One of the level's orders lost `qty` shares (the level total drops).
     Reduce { slot: u32, qty: Qty },
@@ -89,6 +94,24 @@ pub struct Workload {
     pub final_orders: usize,
     pub final_shares: u64,
     pub final_levels: usize,
+    /// What the reads of each part returned, as the baseline adapters fold it. [`Recorder`]
+    /// leaves it zero; the derivation fills it from `parts::final_reads`, which needs the
+    /// `internals` feature.
+    pub final_reads: Reads,
+}
+
+/// One fold (`parts::fold`) per part of the results of that part's reads, in operation order.
+/// A replay of the operations must give the same folds, so an adapter that skips a read or
+/// returns a wrong value from one fails even when it ends in the right state. The `book` and
+/// `parse` parts have no entry: they time the library's own code, not an adapter in `parts`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reads {
+    /// Best price and find-a-level.
+    pub side: u64,
+    /// Front.
+    pub level: u64,
+    /// Get and remove.
+    pub map: u64,
 }
 
 /// Derives a [`Workload`] one command at a time.
@@ -295,6 +318,15 @@ impl Recorder {
                             book: b,
                             id: maker_id,
                         });
+                        // While the taker has quantity left the book looks at the front again.
+                        // After the level's last maker that look finds nothing, and the level is
+                        // dropped after it. The taker has quantity left unless its own Filled
+                        // comes straight after this maker's.
+                        if self.levels[&(o, price)].1 == 1
+                            && events.get(i + 2) != Some(&Event::Filled { id })
+                        {
+                            self.w.level_ops.push(LevelOp::Front { slot });
+                        }
                         self.order_left_level(o, price);
                     } else {
                         let left = book
@@ -375,7 +407,8 @@ pub fn count_books(books: &[OrderBook]) -> (usize, usize, u64) {
 }
 
 /// Adapters that drive the current parts with the logical operations. A round that changes a
-/// part changes only its adapter here.
+/// part changes only its adapter here. Each adapter returns the part's end state and the fold
+/// of everything its reads returned (see `Reads`).
 #[cfg(feature = "internals")]
 pub mod parts {
     use std::hint::black_box;
@@ -383,19 +416,62 @@ pub mod parts {
     use matching_engine::Side;
     use matching_engine::internals::{BookSide, Level, OrderMap, RestingOrder};
 
-    use super::{LevelOp, MapOp, SideOp, Workload};
+    use super::{LevelOp, MapOp, Reads, SideOp, Workload};
 
-    pub fn run_sides(w: &Workload) -> Vec<BookSide> {
+    /// Folded in place of a read that found nothing.
+    pub const NONE: u64 = u64::MAX;
+
+    /// Adds one value to a fold that starts at 0: a multiply by an odd constant and an add, so
+    /// the fold changes with every value and with their order. It runs inside the timed passes,
+    /// two instructions per value, the same for the baseline and any candidate.
+    #[inline]
+    pub fn fold(acc: u64, value: u64) -> u64 {
+        acc.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(value)
+    }
+
+    /// Folds what the book uses of a looked-up or removed order (its side and price, then its
+    /// quantity), or [`NONE`] when there was no such order.
+    #[inline]
+    pub fn fold_order(acc: u64, order: Option<&RestingOrder>) -> u64 {
+        match order {
+            Some(o) => {
+                let side_price = (u64::from(o.price) << 1) | u64::from(o.side == Side::Sell);
+                fold(fold(acc, side_price), u64::from(o.qty))
+            }
+            None => fold(acc, NONE),
+        }
+    }
+
+    /// The read folds of these adapters (the baseline's) over the whole workload, which the
+    /// derivation stores as [`Workload::final_reads`].
+    pub fn final_reads(w: &Workload) -> Reads {
+        Reads {
+            side: run_sides(w).1,
+            level: run_levels(w).1,
+            map: run_maps(w).1,
+        }
+    }
+
+    /// Folds the best price, and whether a level was found and its total. Finding or creating a
+    /// level is not folded: the level it returns is empty, like every level here, and a level it
+    /// creates shows in the end state.
+    pub fn run_sides(w: &Workload) -> (Vec<BookSide>, u64) {
         let mut sides: Vec<BookSide> = (0..w.books)
             .flat_map(|_| [BookSide::new(Side::Buy), BookSide::new(Side::Sell)])
             .collect();
+        let mut reads = 0;
         for &op in &w.side_ops {
             match op {
                 SideOp::Best { side } => {
-                    black_box(sides[side as usize].best_price());
+                    let best = sides[side as usize].best_price();
+                    reads = fold(reads, best.map_or(NONE, u64::from));
                 }
                 SideOp::Find { side, price } => {
-                    black_box(sides[side as usize].level_mut(price).is_some());
+                    // shortcut: side levels hold no orders, so every level found has total 0 and
+                    // the fold cannot tell one level from another; give them contents if a
+                    // candidate side could return the wrong level.
+                    let level = sides[side as usize].level_mut(price);
+                    reads = fold(reads, level.map_or(NONE, |l| l.total()));
                 }
                 SideOp::FindOrCreate { side, price } => {
                     black_box(sides[side as usize].level_or_insert(price));
@@ -403,7 +479,7 @@ pub mod parts {
                 SideOp::Remove { side, price } => sides[side as usize].remove_level(price),
             }
         }
-        sides
+        (sides, reads)
     }
 
     /// Levels alive in the sides.
@@ -411,13 +487,15 @@ pub mod parts {
         sides.iter().map(|s| s.levels_best_first().count()).sum()
     }
 
-    pub fn run_levels(w: &Workload) -> Vec<Level> {
+    /// Folds the id at the front.
+    pub fn run_levels(w: &Workload) -> (Vec<Level>, u64) {
         let mut levels: Vec<Level> = (0..w.level_slots).map(|_| Level::default()).collect();
+        let mut reads = 0;
         for &op in &w.level_ops {
             match op {
                 LevelOp::Push { slot, id, qty } => levels[slot as usize].push_back(id, qty),
                 LevelOp::Front { slot } => {
-                    black_box(levels[slot as usize].front());
+                    reads = fold(reads, levels[slot as usize].front().unwrap_or(NONE));
                 }
                 LevelOp::Reduce { slot, qty } => levels[slot as usize].reduce(qty),
                 LevelOp::PopFront { slot } => levels[slot as usize].pop_front(),
@@ -425,7 +503,7 @@ pub mod parts {
                 LevelOp::Reset { slot } => levels[slot as usize] = Level::default(),
             }
         }
-        levels
+        (levels, reads)
     }
 
     /// Orders queued in the levels, levels that are not empty, and the sum of the level totals.
@@ -436,8 +514,10 @@ pub mod parts {
         (orders, live, shares)
     }
 
-    pub fn run_maps(w: &Workload) -> Vec<OrderMap> {
+    /// Folds the order a get found and the order a removal took out ([`fold_order`]).
+    pub fn run_maps(w: &Workload) -> (Vec<OrderMap>, u64) {
         let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::new()).collect();
+        let mut reads = 0;
         for &op in &w.map_ops {
             match op {
                 MapOp::Insert {
@@ -450,7 +530,7 @@ pub mod parts {
                     maps[usize::from(book)].insert(id, RestingOrder { side, price, qty });
                 }
                 MapOp::Get { book, id } => {
-                    black_box(maps[usize::from(book)].get(&id).map(|o| o.qty));
+                    reads = fold_order(reads, maps[usize::from(book)].get(&id));
                 }
                 MapOp::Update { book, id, qty } => {
                     maps[usize::from(book)]
@@ -459,11 +539,12 @@ pub mod parts {
                         .qty = qty;
                 }
                 MapOp::Remove { book, id } => {
-                    black_box(maps[usize::from(book)].remove(&id).is_some());
+                    let removed = maps[usize::from(book)].remove(&id);
+                    reads = fold_order(reads, removed.as_ref());
                 }
             }
         }
-        maps
+        (maps, reads)
     }
 
     /// Orders in the maps and the sum of their quantities.
@@ -483,7 +564,7 @@ pub mod parts {
 pub mod codec {
     use matching_engine::{Command, Side};
 
-    use super::{LevelOp, MapOp, SideOp, Workload};
+    use super::{LevelOp, MapOp, Reads, SideOp, Workload};
 
     #[derive(Default)]
     struct W(Vec<u8>);
@@ -551,7 +632,9 @@ pub mod codec {
         }
     }
 
-    /// The sections in a fixed order: header, book commands, side, level, map.
+    /// The sections in a fixed order: header, book commands, side, level, map. The header is
+    /// books, level slots, final orders, final shares, final levels, then the read folds of
+    /// side, level and map, each a `u64`.
     pub fn encode(w: &Workload) -> [Vec<u8>; 5] {
         let mut h = W::default();
         for v in [w.books, w.level_slots, w.final_orders] {
@@ -559,6 +642,10 @@ pub mod codec {
         }
         h.u64(w.final_shares);
         h.u64(w.final_levels as u64);
+        let r = w.final_reads;
+        for v in [r.side, r.level, r.map] {
+            h.u64(v);
+        }
 
         let mut c = W::default();
         c.u64(w.commands.len() as u64);
@@ -688,6 +775,11 @@ pub mod codec {
             final_orders: h.len()?,
             final_shares: h.u64()?,
             final_levels: h.len()?,
+            final_reads: Reads {
+                side: h.u64()?,
+                level: h.u64()?,
+                map: h.u64()?,
+            },
             ..Workload::default()
         };
         h.done()?;
