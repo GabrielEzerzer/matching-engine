@@ -1,0 +1,20 @@
+{
+  "name": "stage3-total",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "m-base",
+    "final": "m-final"
+  },
+  "steps": [
+    {"id": "aa-book", "kind": "aa", "part": "book", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-final", "kind": "compare", "part": "book", "cand": "final", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "aa-book-2", "kind": "aa", "part": "book", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-total", "kind": "confirm_best", "group": "total", "steps": ["cmp-final"]},
+    {"id": "window-total", "kind": "window", "group": "total", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-total", "kind": "golden", "group": "total"},
+    {"id": "bench-base", "kind": "bench", "label": "base", "runs": 3},
+    {"id": "bench-final", "kind": "bench", "label": "final", "runs": 3}
+  ]
+}
