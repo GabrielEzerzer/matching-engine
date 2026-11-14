@@ -9,34 +9,34 @@ use std::collections::VecDeque;
 use crate::types::{OrderId, Qty};
 
 #[derive(Debug, Default)]
-pub(crate) struct Level {
+pub struct Level {
     total: u64,
     queue: VecDeque<OrderId>,
 }
 
 impl Level {
-    pub(crate) fn push_back(&mut self, id: OrderId, qty: Qty) {
+    pub fn push_back(&mut self, id: OrderId, qty: Qty) {
         self.queue.push_back(id);
         self.total += u64::from(qty);
     }
 
-    pub(crate) fn front(&self) -> Option<OrderId> {
+    pub fn front(&self) -> Option<OrderId> {
         self.queue.front().copied()
     }
 
     /// Removes the front order, which must already have been reduced to zero.
-    pub(crate) fn pop_front(&mut self) {
+    pub fn pop_front(&mut self) {
         self.queue.pop_front();
     }
 
     /// Lowers the total after one of this level's orders lost `qty` shares.
-    pub(crate) fn reduce(&mut self, qty: Qty) {
+    pub fn reduce(&mut self, qty: Qty) {
         self.total -= u64::from(qty);
     }
 
     /// Removes `id`, which has `remaining` shares, from anywhere in the queue.
     /// shortcut: linear scan of the queue; stage 3 measures and replaces it.
-    pub(crate) fn remove(&mut self, id: OrderId, remaining: Qty) {
+    pub fn remove(&mut self, id: OrderId, remaining: Qty) {
         let pos = self
             .queue
             .iter()
@@ -46,19 +46,19 @@ impl Level {
         self.reduce(remaining);
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
-    pub(crate) fn total(&self) -> u64 {
+    pub fn total(&self) -> u64 {
         self.total
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.queue.len()
     }
 
-    pub(crate) fn ids(&self) -> impl Iterator<Item = OrderId> + '_ {
+    pub fn ids(&self) -> impl Iterator<Item = OrderId> + '_ {
         self.queue.iter().copied()
     }
 }

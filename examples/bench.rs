@@ -1,7 +1,8 @@
 //! Latency and throughput benchmark: the full ITCH day through one book per instrument.
 //!
 //! ```text
-//! bench [--limit N] [--commit LABEL] [--no-throughput] [--allow-non-linux] FILE
+//! bench [--limit N] [--window HH:MM:SS-HH:MM:SS] [--commit LABEL] [--no-throughput]
+//!       [--allow-non-linux] FILE
 //! ```
 //!
 //! Prints one JSON line. Run it through `scripts/bench.sh`, which pins it to one CPU, repeats it
@@ -23,11 +24,18 @@
 //!   to the HDR histograms after the chunk, outside any timed region. Reported values include
 //!   the timer's own cost, which is measured and printed next to them (`timer_overhead_ns_*`).
 //!
+//! `--window` times only the messages whose timestamp (Eastern time, as in the feed) falls in the
+//! window. Each pass first replays every earlier message untimed, so the books hold the full
+//! day's state when the window opens, and stops at the first message past it. `--limit` then
+//! counts timed messages, and `messages` and `book_messages` count only the window.
+//!
 //! Under WSL2 the hypervisor does not report steal time, so a run slowed by other work on the
 //! host cannot be seen from inside. Each run therefore times a fixed CPU-bound loop before and
 //! after its passes (`control_ms_start`, `control_ms_end`); a run whose control time is out of
 //! line with the others ran on a contended or slower CPU.
 
+#[path = "../harness/host.rs"]
+mod host;
 #[path = "../harness/stream.rs"]
 mod stream;
 
@@ -37,6 +45,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use host::{Json, control_ms, cpus_allowed, loadavg};
 use matching_engine::itch::{Frames, ItchError};
 use matching_engine::replay::Replay;
 use stream::{ChunkReader, DEFAULT_CHUNK};
@@ -99,6 +108,8 @@ mod tsc {
 
 struct Args {
     limit: Option<u64>,
+    /// Timed window as nanoseconds since midnight, start inclusive, end exclusive.
+    window: Option<(u64, u64)>,
     commit: String,
     throughput: bool,
     allow_non_linux: bool,
@@ -107,6 +118,7 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut limit = None;
+    let mut window = None;
     let mut commit = "unknown".to_string();
     let mut throughput = true;
     let mut allow_non_linux = false;
@@ -118,6 +130,10 @@ fn parse_args() -> Result<Args, String> {
                 let v = args.next().ok_or("--limit needs a number")?;
                 limit = Some(v.parse().map_err(|_| format!("bad --limit {v}"))?);
             }
+            "--window" => {
+                let v = args.next().ok_or("--window needs HH:MM:SS-HH:MM:SS")?;
+                window = Some(parse_window(&v).ok_or(format!("bad --window {v}"))?);
+            }
             "--commit" => commit = args.next().ok_or("--commit needs a label")?,
             "--no-throughput" => throughput = false,
             "--allow-non-linux" => allow_non_linux = true,
@@ -127,14 +143,29 @@ fn parse_args() -> Result<Args, String> {
     }
     Ok(Args {
         limit,
+        window,
         commit,
         throughput,
         allow_non_linux,
         file: file.ok_or(
-            "usage: bench [--limit N] [--commit LABEL] [--no-throughput] [--allow-non-linux] FILE"
+            "usage: bench [--limit N] [--window HH:MM:SS-HH:MM:SS] [--commit LABEL] \
+             [--no-throughput] [--allow-non-linux] FILE"
                 .to_string(),
         )?,
     })
+}
+
+/// `HH:MM:SS-HH:MM:SS` as nanoseconds since midnight; the end must be after the start.
+fn parse_window(v: &str) -> Option<(u64, u64)> {
+    let ns = |t: &str| -> Option<u64> {
+        let mut parts = t.split(':').map(|p| p.parse::<u64>().ok());
+        let (h, m, s) = (parts.next()??, parts.next()??, parts.next()??);
+        (parts.next().is_none() && h < 24 && m < 60 && s < 60)
+            .then(|| ((h * 60 + m) * 60 + s) * 1_000_000_000)
+    };
+    let (a, b) = v.split_once('-')?;
+    let (start, end) = (ns(a)?, ns(b)?);
+    (start < end).then_some((start, end))
 }
 
 fn main() -> ExitCode {
@@ -170,34 +201,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Fields of the output line, in order.
-struct Json(Vec<(String, String)>);
-
-impl Json {
-    fn num(&mut self, k: &str, v: impl std::fmt::Display) {
-        self.0.push((k.to_string(), v.to_string()));
-    }
-    fn float(&mut self, k: &str, v: f64, decimals: usize) {
-        self.0.push((k.to_string(), format!("{v:.decimals$}")));
-    }
-    fn text(&mut self, k: &str, v: &str) {
-        let escaped: String = v
-            .chars()
-            .flat_map(|c| match c {
-                '"' => vec!['\\', '"'],
-                '\\' => vec!['\\', '\\'],
-                c if c.is_control() => vec![],
-                c => vec![c],
-            })
-            .collect();
-        self.0.push((k.to_string(), format!("\"{escaped}\"")));
-    }
-    fn render(&self) -> String {
-        let body: Vec<String> = self.0.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
-        format!("{{{}}}", body.join(","))
-    }
-}
-
 fn run(args: &Args) -> Result<String, String> {
     let mut out = Json(Vec::new());
     out.text("commit", &args.commit);
@@ -222,6 +225,17 @@ fn run(args: &Args) -> Result<String, String> {
     out.text(
         "limit",
         &args.limit.map_or("none".to_string(), |l| l.to_string()),
+    );
+    // Dots, not colons: the scripts split the flat JSON line on colons.
+    out.text(
+        "window",
+        &args.window.map_or("none".to_string(), |(a, b)| {
+            let hms = |ns: u64| {
+                let s = ns / 1_000_000_000;
+                format!("{:02}.{:02}.{:02}", s / 3600, s / 60 % 60, s % 60)
+            };
+            format!("{}-{}", hms(a), hms(b))
+        }),
     );
     out.float("loadavg_start", loadavg(), 2);
     out.float("control_ms_start", control_ms(), 2);
@@ -259,6 +273,8 @@ fn run(args: &Args) -> Result<String, String> {
     let latency = latency_pass(args)?;
     out.num("messages", latency.messages);
     out.num("book_messages", latency.book_messages);
+    out.num("warmup_messages", latency.warmup.messages);
+    out.float("warmup_s", latency.warmup.wall.as_secs_f64(), 3);
     if let Some(throughput) = throughput {
         if (throughput.messages, throughput.book_messages)
             != (latency.messages, latency.book_messages)
@@ -388,6 +404,8 @@ fn throughput_pass(args: &Args) -> Result<Throughput, String> {
     let wall = Instant::now();
     let mut reader = ChunkReader::open(&args.file, DEFAULT_CHUNK).map_err(|e| e.to_string())?;
     let mut replay = Replay::new();
+    let warm = warm_up(&mut reader, &mut replay, args.window)?;
+    let end = args.window.map_or(u64::MAX, |(_, end)| end);
     let mut busy = Duration::ZERO;
     let limit = args.limit.unwrap_or(u64::MAX);
     loop {
@@ -405,9 +423,13 @@ fn throughput_pass(args: &Args) -> Result<Throughput, String> {
                 Err(ItchError::Truncated { .. }) if !eof => break,
                 Err(e) => return Err(e.to_string()),
             };
+            if msg.header().timestamp >= end {
+                done = true;
+                break;
+            }
             let applied = replay.apply(&msg).map_err(|e| e.to_string())?;
             black_box(applied.events.len());
-            if replay.stats().messages >= limit {
+            if replay.stats().messages - warm.messages >= limit {
                 done = true;
                 break;
             }
@@ -420,14 +442,15 @@ fn throughput_pass(args: &Args) -> Result<Throughput, String> {
         }
     }
     Ok(Throughput {
-        messages: replay.stats().messages,
-        book_messages: replay.stats().book_messages,
+        messages: replay.stats().messages - warm.messages,
+        book_messages: replay.stats().book_messages - warm.book_messages,
         busy,
         wall: wall.elapsed(),
     })
 }
 
 struct Latency {
+    warmup: Warmup,
     messages: u64,
     book_messages: u64,
     all: Histogram<u64>,
@@ -442,6 +465,8 @@ fn latency_pass(args: &Args) -> Result<Latency, String> {
     let wall = Instant::now();
     let mut reader = ChunkReader::open(&args.file, DEFAULT_CHUNK).map_err(|e| e.to_string())?;
     let mut replay = Replay::new();
+    let warmup = warm_up(&mut reader, &mut replay, args.window)?;
+    let end = args.window.map_or(u64::MAX, |(_, end)| end);
     let new_hist =
         || Histogram::<u64>::new_with_bounds(1, u64::from(u32::MAX), 3).expect("valid bounds");
     let mut all = new_hist();
@@ -471,6 +496,10 @@ fn latency_pass(args: &Args) -> Result<Latency, String> {
                 Err(ItchError::Truncated { .. }) if !eof => break,
                 Err(e) => return Err(e.to_string()),
             };
+            if msg.header().timestamp >= end {
+                done = true;
+                break;
+            }
             let applied = replay.apply(&msg).map_err(|e| e.to_string())?;
             let is_book = applied.command.is_some();
             black_box(applied.events.len());
@@ -505,12 +534,13 @@ fn latency_pass(args: &Args) -> Result<Latency, String> {
             break;
         }
     }
-    if messages != replay.stats().messages {
+    if messages + warmup.messages != replay.stats().messages {
         return Err("latency pass lost count of messages".into());
     }
     Ok(Latency {
+        book_messages: replay.stats().book_messages - warmup.book_messages,
+        warmup,
         messages,
-        book_messages: replay.stats().book_messages,
         all,
         book,
         all_ticks,
@@ -520,37 +550,54 @@ fn latency_pass(args: &Args) -> Result<Latency, String> {
     })
 }
 
-/// Time for a fixed chain of 100 million dependent xorshift steps: a CPU-only workload with no
-/// memory traffic, so it varies only with the CPU's clock and with contention for the core.
-fn control_ms() -> f64 {
-    let t = Instant::now();
-    let mut x = black_box(0x9E37_79B9_7F4A_7C15u64);
-    for _ in 0..100_000_000 {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
+/// What the untimed replay before the window did.
+struct Warmup {
+    messages: u64,
+    book_messages: u64,
+    wall: Duration,
+}
+
+/// Replays every message before the window's start untimed, so the books hold the day's state
+/// when timing begins, and leaves the first message of the window unread in `reader`. Without a
+/// window it does nothing.
+fn warm_up(
+    reader: &mut ChunkReader,
+    replay: &mut Replay,
+    window: Option<(u64, u64)>,
+) -> Result<Warmup, String> {
+    let wall = Instant::now();
+    if let Some((start, _)) = window {
+        'chunks: loop {
+            reader.fill().map_err(|e| e.to_string())?;
+            if reader.data().is_empty() {
+                break;
+            }
+            let eof = reader.eof();
+            let mut frames = Frames::new(reader.data());
+            loop {
+                let before = frames.offset();
+                match frames.next() {
+                    None => break,
+                    Some(Ok(msg)) if msg.header().timestamp >= start => {
+                        reader.consume(before);
+                        break 'chunks;
+                    }
+                    Some(Ok(msg)) => {
+                        replay.apply(&msg).map_err(|e| e.to_string())?;
+                    }
+                    Some(Err(ItchError::Truncated { .. })) if !eof => break,
+                    Some(Err(e)) => return Err(e.to_string()),
+                }
+            }
+            let used = frames.offset();
+            reader.consume(used);
+        }
     }
-    black_box(x);
-    t.elapsed().as_secs_f64() * 1e3
-}
-
-fn cpus_allowed() -> String {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines().find_map(|l| {
-                l.strip_prefix("Cpus_allowed_list:")
-                    .map(|v| v.trim().to_string())
-            })
-        })
-        .unwrap_or_else(|| "unknown".into())
-}
-
-fn loadavg() -> f64 {
-    std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
-        .unwrap_or(f64::NAN)
+    Ok(Warmup {
+        messages: replay.stats().messages,
+        book_messages: replay.stats().book_messages,
+        wall: wall.elapsed(),
+    })
 }
 
 /// Whether the kernel reports an invariant TSC (`constant_tsc` and `nonstop_tsc`).

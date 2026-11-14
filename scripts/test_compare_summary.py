@@ -232,5 +232,57 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("throughput needs -t", err)
 
 
+def micro_comparison(ab, ba, part="level", sha_c=SHA_B, checksums=("c0ffee",), passes=(20,),
+                     ops=(1000,)):
+    """A compare.sh -m comparison: ns_per_op_median has the given d, and the runs carry the
+    microbenchmark's fields, cycling through `checksums`, `passes` and `ops` for workload_checksum,
+    passes and ops."""
+    lines = [{"meta": True, "cpu": "5", "file": "f", "limit": "none", "throughput_pass": False,
+              "part": part, "baseline": "base", "candidate": "cand", "baseline_sha256": SHA_A,
+              "candidate_sha256": sha_c}]
+    ds = [(x, True) for x in ab] + [(x, False) for x in ba]
+    n = 0
+    for p, (x, base_first) in enumerate(ds, 1):
+        roles = ("baseline", "candidate") if base_first else ("candidate", "baseline")
+        for pos, role in enumerate(roles, 1):
+            v = 10.0 if role == "baseline" else 10.0 * (1 + x / 100)
+            lines.append({"pair": p, "position": pos, "role": role, "timed_s": 9.0,
+                          "control_ms_start": 300.0, "control_ms_end": 300.0,
+                          "ns_per_op_median": v, "ns_per_op_min": v, "spread_pct": 1.0,
+                          "allocs_per_op": 0.1, "workload_checksum": checksums[n % len(checksums)],
+                          "passes": passes[n % len(passes)], "ops": ops[n % len(ops)]})
+            n += 1
+    return lines
+
+
+class Micro(unittest.TestCase):
+    def test_micro_statistics(self):
+        _, s, err = summarise("-s", "ns_per_op_median", write(micro_comparison([-6, -4, -5], [-1, -3, -2])))
+        self.assertEqual(s["part"], "level")
+        self.assertEqual(s["verdict"], "improved")
+        self.assertNotIn("all_p50_ns", s)
+        self.assertIn("ns_per_op_min", err)
+
+    def test_workload_checksums_must_agree(self):
+        lines = micro_comparison([-6, -4, -5], [-1, -3, -2], checksums=("aa", "bb"))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            cs.main([write(lines)])
+        self.assertIn("workload checksums", err.getvalue())
+
+    def test_passes_and_ops_must_agree(self):
+        for field, what in (({"passes": (20, 21)}, "pass counts"), ({"ops": (1000, 999)}, "operation counts")):
+            with self.subTest(what):
+                lines = micro_comparison([-6, -4, -5], [-1, -3, -2], **field)
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+                    cs.main([write(lines)])
+                self.assertIn(what, err.getvalue())
+
+    def test_floor_must_be_the_same_part(self):
+        aa = write(micro_comparison([-1, 1, 0], [1, -1, 0], part="side", sha_c=SHA_A))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            cs.main(["-f", aa, write(micro_comparison([-6, -4, -5], [-1, -3, -2]))])
+        self.assertIn("part", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
