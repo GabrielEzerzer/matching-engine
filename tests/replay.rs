@@ -209,6 +209,19 @@ fn execution_of_the_front_order_replays_as_an_aggressor() {
 }
 
 #[test]
+fn default_replay_numbers_takers_like_new() {
+    // A default replay must keep synthetic taker ids away from ITCH references: a taker id of 1
+    // would collide with resting reference 1 and abort the replay.
+    let mut r = Replay::default();
+    run(&mut r, add(1, false, 2, 1000));
+    let (cmd, _) = run(&mut r, exec(1, 1));
+    assert!(matches!(cmd, Some(Command::Limit { id, .. }) if id == TAKER_ID_BASE));
+    let (cmd, events) = run(&mut r, exec(1, 1));
+    assert!(matches!(cmd, Some(Command::Limit { id, .. }) if id == TAKER_ID_BASE + 1));
+    assert!(events.contains(&Event::Filled { id: 1 }));
+}
+
+#[test]
 fn execution_behind_the_front_falls_back_to_reduce() {
     let mut r = Replay::new();
     run(&mut r, add(1, true, 50, 1000));

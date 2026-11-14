@@ -216,7 +216,7 @@ pub struct Applied<'a> {
 }
 
 /// One order book per stock locate, driven by ITCH messages.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Replay {
     books: Vec<OrderBook>,
     symbols: Vec<Option<Symbol>>,
@@ -229,11 +229,23 @@ pub struct Replay {
     stats: Stats,
 }
 
+/// The same as [`Replay::new`]; synthetic taker ids start at [`TAKER_ID_BASE`] either way.
+impl Default for Replay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Replay {
     pub fn new() -> Self {
         Self {
+            books: Vec::new(),
+            symbols: Vec::new(),
+            trading_states: Vec::new(),
+            diverged: Vec::new(),
+            events: Vec::new(),
             next_taker: TAKER_ID_BASE,
-            ..Self::default()
+            stats: Stats::default(),
         }
     }
 
