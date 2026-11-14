@@ -287,8 +287,8 @@ impl Replay {
         self.books.get(usize::from(locate))
     }
 
-    /// Every book that has received a command, by ascending locate (books never touched by a
-    /// command are empty and may be skipped).
+    /// Every book up to the highest locate that has received a command, by ascending locate.
+    /// Books of locates that never received one are empty.
     pub fn books(&self) -> impl Iterator<Item = (Locate, &OrderBook)> {
         self.books.iter().enumerate().map(|(i, book)| {
             (
