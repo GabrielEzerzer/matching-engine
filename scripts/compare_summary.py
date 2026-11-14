@@ -11,6 +11,11 @@
 # line of an earlier compare.sh output. --check only validates STAT and FLOOR against that
 # metadata. stdout: one {"pair_diff":true,...} line per pair, then one {"summary":true,...} line.
 # Tables go to stderr. A refusal exits with status 2.
+#
+# All arithmetic is on d = 100 * ln(candidate / baseline), so that a multiplicative advantage of
+# running second cancels exactly between the two orders. Effects, interval ends, order effects and
+# floors are converted back to percent changes for display; the JSON keeps both, the log-scale
+# values under names ending in _ln_x100.
 import argparse
 import json
 import math
@@ -48,6 +53,11 @@ def var(xs):
     return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
 
 
+def pct(x):
+    """A difference of 100 * ln(ratio) as a percent change."""
+    return None if x is None else 100 * math.expm1(x / 100)
+
+
 def load(path):
     """The metadata line, the runs by (pair, role), and the pairs that have both runs."""
     meta, runs = None, {}
@@ -66,6 +76,10 @@ def load(path):
     return meta, runs, pairs
 
 
+def same_binary(meta):
+    return bool(meta.get("baseline_sha256")) and meta.get("baseline_sha256") == meta.get("candidate_sha256")
+
+
 def stats_of(meta):
     if meta.get("part"):
         return MICRO
@@ -77,8 +91,7 @@ def baseline_first(runs, p):
 
 
 def d(runs, p, stat):
-    b, c = runs[p, "baseline"][stat], runs[p, "candidate"][stat]
-    return (c - b) / b * 100
+    return 100 * math.log(runs[p, "candidate"][stat] / runs[p, "baseline"][stat])
 
 
 def diffs(runs, pairs, stat):
@@ -89,48 +102,65 @@ def diffs(runs, pairs, stat):
 
 
 def estimate(ab, ba, higher_is_better):
-    """Effect, order effect and the effect's uncertainty, in percent; None where not measured."""
-    e = dict(effect_pct=None, order_effect_pct=None, se_pct=None, df=None, t=None, bound_pct=None)
+    """Effect, order effect and the effect's uncertainty, as 100 * ln(ratio); None where not
+    measured."""
+    e = dict(effect=None, order=None, se=None, df=None, t=None, bound=None)
     if ab and ba:
-        e["effect_pct"] = (mean(ab) + mean(ba)) / 2
+        e["effect"] = (mean(ab) + mean(ba)) / 2
         # Half the gap between the two orders' means: how much running second helps.
         order = (mean(ba) - mean(ab)) / 2
-        e["order_effect_pct"] = -order if higher_is_better else order
+        e["order"] = -order if higher_is_better else order
     if len(ab) >= 2 and len(ba) >= 2:
         # The variance within each order only, so the constant order effect stays out of it.
-        se = math.sqrt(var(ab) / len(ab) + var(ba) / len(ba)) / 2
-        df = len(ab) + len(ba) - 2
-        e.update(se_pct=se, df=df, t=t99(df), bound_pct=t99(df) * se)
+        a, b = var(ab) / len(ab), var(ba) / len(ba)
+        if a + b == 0:
+            e.update(se=0.0, bound=0.0)
+        else:
+            # Welch-Satterthwaite degrees of freedom: the two orders may be unequally noisy.
+            df = max(1, math.floor((a + b) ** 2 / (a * a / (len(ab) - 1) + b * b / (len(ba) - 1))))
+            se = math.sqrt(a + b) / 2
+            e.update(se=se, df=df, t=t99(df), bound=t99(df) * se)
     return e
 
 
 def rule(e, higher_is_better, floor=0.0):
     """What the interval says on its own, or None when there is no bound."""
-    if e["bound_pct"] is None:
+    if e["bound"] is None:
         return None
-    gain = e["effect_pct"] if higher_is_better else -e["effect_pct"]
-    if gain - e["bound_pct"] > floor:
+    gain = e["effect"] if higher_is_better else -e["effect"]
+    if gain - e["bound"] > floor:
         return "improved"
-    if gain + e["bound_pct"] < -floor:
+    if gain + e["bound"] < -floor:
         return "regressed"
     return "inconclusive"
 
 
 def floors(path, meta, stats):
-    """Per statistic, the A/A comparison's absolute effect plus its own bound."""
+    """Per statistic, the A/A comparison's absolute effect plus its own bound (log scale)."""
     fmeta, fruns, fpairs = load(path)
-    if fmeta.get("baseline_sha256") != fmeta.get("candidate_sha256"):
-        die(f"{path} is not an A/A comparison (the same binary twice)")
+    if not same_binary(fmeta):
+        die(f"{path} is not an A/A comparison (the same binary twice, by SHA-256)")
     for key in ("file", "limit", "cpu", "throughput_pass", "window", "part"):
         if fmeta.get(key) != meta.get(key):
             die(f"{path} was measured with {key} {fmeta.get(key)}, this comparison has {meta.get(key)}")
     out = {}
     for s in stats:
         e = estimate(*diffs(fruns, fpairs, s), s == THROUGHPUT)
-        if e["bound_pct"] is None:
+        if e["bound"] is None:
             die(f"{path} has too few pairs in each order to give a bound for {s}")
-        out[s] = abs(e["effect_pct"]) + e["bound_pct"]
+        out[s] = abs(e["effect"]) + e["bound"]
     return out
+
+
+def report(e, floor):
+    """The numbers of one statistic for the summary line: percent changes and the log scale."""
+    lo = hi = None
+    if e["bound"] is not None:
+        lo, hi = e["effect"] - e["bound"], e["effect"] + e["bound"]
+    return {"effect_pct": pct(e["effect"]), "low_pct": pct(lo), "high_pct": pct(hi),
+            "order_effect_pct": pct(e["order"]), "floor_pct": pct(floor), "df": e["df"], "t": e["t"],
+            "effect_ln_x100": e["effect"], "se_ln_x100": e["se"], "bound_ln_x100": e["bound"],
+            "order_effect_ln_x100": e["order"], "floor_ln_x100": floor}
 
 
 def median(xs):
@@ -197,20 +227,19 @@ def main(argv=None):
               f"{r['control_ms_end']:>10.1f} {r[wall]:>9.1f}"
               + "".join(f" {r[c]:>16.2f}" for c in cols), file=err)
 
-    print("\nd = (candidate - baseline) / baseline * 100, per pair (order AB: baseline ran first)",
-          file=err)
+    print("\nd = 100 * ln(candidate / baseline), per pair (order AB: baseline ran first)", file=err)
     print(f"{'pair':<4} {'order':<5}" + "".join(f" {s:>12}" for s in stats), file=err)
     for p in pairs:
         o = "AB" if baseline_first(runs, p) else "BA"
         line = {"pair_diff": True, "pair": p, "order": o}
-        line.update({f"{s}_pct": round(d(runs, p, s), 3) for s in stats})
+        line.update({f"{s}_ln_x100": round(d(runs, p, s), 3) for s in stats})
         print(json.dumps(line, separators=(",", ":")))
         print(f"{p:<4} {o:<5}" + "".join(f" {d(runs, p, s):>12.2f}" for s in stats), file=err)
 
     n1 = sum(1 for p in pairs if baseline_first(runs, p))
     n2 = len(pairs) - n1
     balanced = n1 == n2 and n1 >= MIN_PER_ORDER
-    aa = meta.get("baseline_sha256") == meta.get("candidate_sha256")
+    aa = same_binary(meta)
     warnings = flagged(order, wall)
     summary = {"summary": True, "aa": aa, "flagged_runs": len(warnings), "pairs": len(pairs),
                "pairs_baseline_first": n1, "pairs_candidate_first": n2}
@@ -222,12 +251,11 @@ def main(argv=None):
     summary["verdict"] = None
     by_rule = None
 
-    print(f"\n{'statistic':<22} {'effect%':>9} {'bound%':>9} {'se%':>8} {'df':>3} {'order%':>13} "
+    print(f"\n{'statistic':<22} {'effect%':>9} {'low%':>9} {'high%':>9} {'df':>3} {'order%':>13} "
           f"{'floor%':>8}  verdict", file=err)
     for s in stats:
         hib = s == THROUGHPUT
         e = estimate(*diffs(runs, pairs, s), hib)
-        e["floor_pct"] = fl.get(s)
         shown = "information"
         if s == a.target:
             by_rule = rule(e, hib, fl.get(s, 0.0))
@@ -235,20 +263,23 @@ def main(argv=None):
             if not balanced:
                 summary["rule_verdict"] = by_rule
             shown = summary["verdict"]
-        summary[s] = {k: round(x, 3) if isinstance(x, float) else x for k, x in e.items()}
-        print(f"{s:<22} {num(e['effect_pct']):>9} {num(e['bound_pct']):>9} {num(e['se_pct']):>8} "
-              f"{'-' if e['df'] is None else e['df']:>3} {num(e['order_effect_pct'], 'not measured'):>13} "
-              f"{num(e['floor_pct']):>8}  {shown}", file=err)
+        r = report(e, fl.get(s))
+        summary[s] = {k: round(x, 3) if isinstance(x, float) else x for k, x in r.items()}
+        print(f"{s:<22} {num(r['effect_pct']):>9} {num(r['low_pct']):>9} {num(r['high_pct']):>9} "
+              f"{'-' if e['df'] is None else e['df']:>3} {num(r['order_effect_pct'], 'not measured'):>13} "
+              f"{num(r['floor_pct']):>8}  {shown}", file=err)
     print(json.dumps(summary, separators=(",", ":")))
 
     print(f"""
 {len(pairs)} pairs: {n1} baseline-first (AB), {n2} candidate-first (BA).
-effect: the order-balanced mean of d (the mean over AB pairs and the mean over BA pairs, averaged).
-se: sqrt(s1^2/n1 + s2^2/n2) / 2, from the variance of d within each order.
-bound: the one-sided 99% Student-t value for n1 + n2 - 2 degrees of freedom, times se.
+d is 100 * ln(candidate / baseline). With m1, v1, n1 the mean, sample variance and count of d over
+AB pairs and m2, v2, n2 over BA pairs: effect = (m1 + m2) / 2, se = sqrt(v1/n1 + v2/n2) / 2, and
+bound = t * se, with t the one-sided 99% Student-t value for the Welch-Satterthwaite degrees of
+freedom (df, rounded down). low and high are effect - bound and effect + bound.
 order: how much running second in a pair helped (half the gap between the two orders' means).
 floor: with -f, the A/A comparison's absolute effect plus its own bound.
-Rule for the declared statistic: improved when effect +/- bound lies wholly on the better side of
+Effects, interval ends, order and floor are shown as percent changes.
+Rule for the declared statistic: improved when the interval lies wholly on the better side of
 zero (lower latency, higher throughput) and, with -f, beyond the floor; regressed in the mirror
 case; otherwise inconclusive.""", file=err)
     if a.target is None:
@@ -262,8 +293,9 @@ case; otherwise inconclusive.""", file=err)
         print("Both binaries are the same file: this is an A/A check of the method, and a sound method "
               "gives inconclusive.", file=err)
         if by_rule in ("improved", "regressed"):
-            print(f"WARNING: this A/A comparison gives {by_rule} for {a.target}; do not trust verdicts "
-                  "from this host and method until an A/A comparison comes out inconclusive.", file=err)
+            print(f"WARNING: this A/A comparison gives {by_rule} for {a.target}, so the setup is not "
+                  "measuring cleanly. Find the cause before trusting any comparison; do not rerun the "
+                  "A/A comparison in the hope that it passes.", file=err)
     for w in warnings:
         print(f"WARNING: {w}.", file=err)
     if warnings:

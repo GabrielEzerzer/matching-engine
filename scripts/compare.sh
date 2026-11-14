@@ -21,18 +21,20 @@
 # STAT, declared before the run, is the one statistic that gets a verdict, for example all_p50_ns.
 # Every other statistic is printed as information. Without -s there is no verdict.
 #
-# For every pair, d = (candidate - baseline) / baseline * 100. With m1, s1^2, n1 the mean, sample
-# variance and count of d over baseline-first pairs and m2, s2^2, n2 over candidate-first pairs:
-# effect = (m1 + m2) / 2, se = sqrt(s1^2/n1 + s2^2/n2) / 2, and bound = t * se, where t is the
-# one-sided 99% Student-t value for n1 + n2 - 2 degrees of freedom (4.541 for 3, 3.747 for 4,
-# 3.143 for 6, 2.896 for 8, 2.764 for 10). Averaging the two orders cancels the constant advantage
-# of running first or second, and taking the variance within each order keeps it out of se.
-# Verdict for STAT: "improved" when effect +/- bound lies wholly on the better side of zero (lower
-# latency, higher throughput) and, with -f, beyond the floor; "regressed" in the mirror case;
-# otherwise "inconclusive". The floor is an A/A comparison's (the same binary passed twice)
-# absolute effect plus its bound for that statistic, recomputed from the FLOOR file's runs; FLOOR
-# must have the same FILE, LIMIT, CPU and -t setting. An A/A comparison is a check of the method:
-# a sound method gives "inconclusive" for it.
+# For every pair, d = 100 * ln(candidate / baseline), so that a multiplicative advantage of
+# running first or second cancels exactly. With m1, s1^2, n1 the mean, sample variance and count
+# of d over baseline-first pairs and m2, s2^2, n2 over candidate-first pairs: effect = (m1 + m2) / 2,
+# se = sqrt(a + b) / 2 with a = s1^2/n1 and b = s2^2/n2, and bound = t * se, where t is the
+# one-sided 99% Student-t value for the Welch-Satterthwaite degrees of freedom
+# (a + b)^2 / (a^2/(n1 - 1) + b^2/(n2 - 1)), rounded down and at least 1 (t is 6.965 for 2, 4.541
+# for 3, 3.747 for 4, 3.143 for 6, 2.896 for 8, 2.764 for 10). Taking the variance within each
+# order keeps the order advantage out of se. The effect and the interval ends are printed as
+# percent changes. Verdict for STAT: "improved" when effect +/- bound lies wholly on the better
+# side of zero (lower latency, higher throughput) and, with -f, beyond the floor; "regressed" in
+# the mirror case; otherwise "inconclusive". The floor is an A/A comparison's (the same binary
+# passed twice) absolute effect plus its bound for that statistic, recomputed from the FLOOR file's
+# runs; FLOOR must have the same FILE, LIMIT, CPU and -t setting. An A/A comparison is a check of
+# the method: a sound method gives "inconclusive" for it.
 #
 # -r EARLIER summarises the runs saved in an earlier compare.sh output again instead of running. A
 # file with unequal or too few pairs per order gets "inconclusive (too few pairs)", with what the
@@ -56,7 +58,7 @@ rerun=""
 target=""
 window=""
 part=""
-usage() { sed -n '2,47p' "$0"; exit 2; }
+usage() { sed -n '2,49p' "$0"; exit 2; }
 while getopts "s:n:c:l:tw:m:f:r:h" opt; do
     case "$opt" in
         s) target="$OPTARG" ;;
@@ -112,6 +114,7 @@ if [ "$aa" = false ]; then
         [ -f "$s" ] || die "no build settings recorded at $s; rebuild that binary with scripts/bench-build.sh"
     done
     if ! delta="$(diff "$set_b" "$set_c")"; then
+        case "$delta" in *"cargo config file"*) delta="$delta"$'\n'"A Cargo config file differs (paths above)." ;; esac
         die "the two binaries were built with different settings (< baseline, > candidate):"$'\n'"$delta"
     fi
 fi

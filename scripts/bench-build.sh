@@ -4,20 +4,22 @@
 #
 #   scripts/bench-build.sh [LABEL]
 #
-# The copies go to $BENCH_BINS/LABEL/bench and LABEL/micro, with BENCH_BINS defaulting to /root/bench-bins and
-# LABEL to the short commit (with "-dirty" when tracked files have uncommitted changes). Beside it,
+# The copies go to $BENCH_BINS/LABEL/bench and LABEL/micro (built with --features internals), with
+# BENCH_BINS defaulting to /root/bench-bins and LABEL to the short commit (with "-dirty" when
+# tracked files have uncommitted changes). Beside them,
 # commit.txt holds the full commit label (see scripts/commit-label.sh), build.txt the toolchain,
 # build time and SHA-256, and settings.txt every build setting apart from the source: RUSTFLAGS,
 # CARGO_ENCODED_RUSTFLAGS, the other Cargo environment variables that change flags or the profile,
-# any Cargo config files, the target triple, the release profile from Cargo.toml and rustc -vV.
-# scripts/compare.sh refuses to compare two binaries whose settings.txt differ. An existing LABEL
-# is never overwritten; remove its directory first. The last line of stdout is the binary's path.
+# the path and SHA-256 of each Cargo config file, the target triple, the release profile from
+# Cargo.toml and rustc -vV. scripts/compare.sh refuses to compare two binaries whose settings.txt
+# differ. An existing LABEL is never overwritten; remove its directory first. The last line of
+# stdout is the bench binary's path.
 #
 # Linux only, like scripts/bench.sh: the binaries are for benchmarks of record under WSL2.
 set -euo pipefail
 
 if [ "$#" -gt 1 ] || [ "${1:-}" = "-h" ]; then
-    sed -n '2,16p' "$0"
+    sed -n '2,18p' "$0"
     exit 2
 fi
 if [ "$(uname -s)" != "Linux" ]; then
@@ -61,12 +63,13 @@ echo "$commit" > "$dir/commit.txt"
     echo "CARGO_ENCODED_RUSTFLAGS=${CARGO_ENCODED_RUSTFLAGS-(unset)}"
     env | grep -E '^CARGO_(BUILD_RUSTFLAGS|PROFILE_[A-Z0-9_]+|TARGET_[A-Z0-9_]+_RUSTFLAGS)=' | sort || true
     # The Cargo config files Cargo reads for a build here: every .cargo/config(.toml) from the
-    # repository up to /, then CARGO_HOME's. Contents only, so the path of a worktree does not count.
+    # repository up to /, then CARGO_HOME's. Path and SHA-256 only, never the contents, which can
+    # hold registry tokens; a path inside the repository is relative, so worktrees compare equal.
     dirs=() d="$repo"
     while [ "$d" != / ]; do dirs+=("$d/.cargo"); d="$(dirname "$d")"; done
     for c in "${dirs[@]}" /.cargo "${CARGO_HOME:-$HOME/.cargo}"; do
         for f in "$c/config" "$c/config.toml"; do
-            if [ -f "$f" ]; then echo "cargo config:"; cat "$f"; fi
+            if [ -f "$f" ]; then echo "cargo config file ${f#"$repo"/} sha256 $(sha256sum "$f" | cut -d' ' -f1)"; fi
         done
     done
     echo "target ${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
