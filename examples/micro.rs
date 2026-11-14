@@ -252,10 +252,11 @@ fn run(args: &Args) -> Result<String, String> {
         "level" => {
             count_level_ops(&mut out, &w.level_ops);
             out.num("level_slots", w.level_slots);
+            let books = parts::push_books(w);
             let t = time_passes(
                 args.passes,
                 w.level_ops.len(),
-                || parts::run_levels(w),
+                || parts::run_levels(w, &books),
                 |levels| {
                     let (orders, live, shares) = parts::count_levels(levels);
                     expect("orders", orders, w.final_orders)?;

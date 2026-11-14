@@ -366,15 +366,15 @@ fn adapters_rebuild_the_books_state() {
 
     let sides = parts::run_sides(&w);
     assert_eq!(parts::count_sides(&sides), e.side_levels.len());
-    let level_parts = parts::run_levels(&w);
+    let level_parts = parts::run_levels(&w, &parts::push_books(&w));
     assert_eq!(
         parts::count_levels(&level_parts),
         (e.map.len(), e.side_levels.len(), shares(&e))
     );
-    let mut levels: Vec<(Vec<OrderId>, u64)> = level_parts
-        .iter()
-        .filter(|l| !l.is_empty())
-        .map(|l| (l.ids().collect(), l.total()))
+    let mut levels: Vec<(Vec<OrderId>, u64)> = (0..)
+        .zip(&level_parts.levels)
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(slot, l)| (level_parts.ids(slot).collect(), l.total()))
         .collect();
     levels.sort();
     assert_eq!(levels, e.queues);
@@ -404,7 +404,7 @@ fn share_totals_catch_skipped_updates_and_reduces() {
     w.level_ops
         .retain(|op| !matches!(op, LevelOp::Reduce { .. }));
     assert_ne!(
-        parts::count_levels(&parts::run_levels(&w)).2,
+        parts::count_levels(&parts::run_levels(&w, &parts::push_books(&w))).2,
         w.final_shares
     );
 }

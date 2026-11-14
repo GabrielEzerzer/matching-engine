@@ -380,10 +380,10 @@ pub fn count_books(books: &[OrderBook]) -> (usize, usize, u64) {
 pub mod parts {
     use std::hint::black_box;
 
-    use matching_engine::Side;
     use matching_engine::internals::{BookSide, Level, OrderMap, RestingOrder};
+    use matching_engine::{OrderId, Side};
 
-    use super::{LevelOp, MapOp, SideOp, Workload};
+    use super::{BookIdx, LevelOp, MapOp, SideOp, Workload};
 
     pub fn run_sides(w: &Workload) -> Vec<BookSide> {
         let mut sides: Vec<BookSide> = (0..w.books)
@@ -411,28 +411,114 @@ pub mod parts {
         sides.iter().map(|s| s.levels_best_first().count()).sum()
     }
 
-    pub fn run_levels(w: &Workload) -> Vec<Level> {
+    /// The book of each `Push`, in order: the recorder pairs every push with one map insert, the
+    /// order resting in that book. Prepared outside the timed region, since a real book knows
+    /// which book it is.
+    pub fn push_books(w: &Workload) -> Vec<BookIdx> {
+        let books: Vec<BookIdx> = w
+            .map_ops
+            .iter()
+            .filter_map(|op| match *op {
+                MapOp::Insert { book, .. } => Some(book),
+                _ => None,
+            })
+            .collect();
+        let pushes = w
+            .level_ops
+            .iter()
+            .filter(|op| matches!(op, LevelOp::Push { .. }))
+            .count();
+        assert_eq!(books.len(), pushes, "one map insert per level push");
+        books
+    }
+
+    /// The levels and, because a queue entry is live only while its book's order map holds the
+    /// order at the level's side, price and sequence number, one order map per book, kept as the
+    /// book keeps it (insert on push, remove when the order leaves) and paid for in the timed
+    /// region. Order quantities are not kept up to date, since the queue never reads them.
+    /// Level `slot` stands for the level at side [`LEVEL_SIDE`] and price `slot` of the book in
+    /// `books[slot]`, which no other live level of that book shares.
+    pub struct Levels {
+        pub levels: Vec<Level>,
+        pub books: Vec<BookIdx>,
+        pub orders: Vec<OrderMap>,
+    }
+
+    pub const LEVEL_SIDE: Side = Side::Buy;
+
+    impl Levels {
+        /// The live orders of level `slot`, oldest first.
+        pub fn ids(&self, slot: u32) -> impl Iterator<Item = OrderId> + '_ {
+            let orders = &self.orders[usize::from(self.books[slot as usize])];
+            self.levels[slot as usize].ids(orders, LEVEL_SIDE, slot)
+        }
+    }
+
+    pub fn run_levels(w: &Workload, push_books: &[BookIdx]) -> Levels {
         let mut levels: Vec<Level> = (0..w.level_slots).map(|_| Level::default()).collect();
+        let mut books: Vec<BookIdx> = vec![0; w.level_slots];
+        let mut orders: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::new()).collect();
+        let mut push_books = push_books.iter();
+        // The maker the last `Front` found, which the book still holds when it pops the front.
+        let mut maker = 0;
         for &op in &w.level_ops {
             match op {
-                LevelOp::Push { slot, id, qty } => levels[slot as usize].push_back(id, qty),
+                LevelOp::Push { slot, id, qty } => {
+                    let b = *push_books.next().expect("a book for every push");
+                    books[slot as usize] = b;
+                    let orders = &mut orders[usize::from(b)];
+                    let (side, price) = (LEVEL_SIDE, slot);
+                    let seq = levels[slot as usize].push_back(orders, side, price, id, qty);
+                    let order = RestingOrder {
+                        side,
+                        price,
+                        qty,
+                        seq,
+                    };
+                    orders.insert(id, order);
+                }
                 LevelOp::Front { slot } => {
-                    black_box(levels[slot as usize].front());
+                    // The book's matching loop: drop dead entries until the front one is live.
+                    let orders = &orders[usize::from(books[slot as usize])];
+                    let level = &mut levels[slot as usize];
+                    maker = loop {
+                        let entry = level
+                            .front_entry()
+                            .expect("a level with orders has entries");
+                        if entry.is_live(orders, LEVEL_SIDE, slot) {
+                            break entry.id;
+                        }
+                        level.pop_dead_front();
+                    };
+                    black_box(maker);
                 }
                 LevelOp::Reduce { slot, qty } => levels[slot as usize].reduce(qty),
-                LevelOp::PopFront { slot } => levels[slot as usize].pop_front(),
-                LevelOp::Remove { slot, id, qty } => levels[slot as usize].remove(id, qty),
+                LevelOp::PopFront { slot } => {
+                    levels[slot as usize].pop_front();
+                    orders[usize::from(books[slot as usize])].remove(&maker);
+                }
+                LevelOp::Remove { slot, id, qty } => {
+                    orders[usize::from(books[slot as usize])].remove(&id);
+                    levels[slot as usize].remove(id, qty);
+                }
                 LevelOp::Reset { slot } => levels[slot as usize] = Level::default(),
             }
         }
-        levels
+        Levels {
+            levels,
+            books,
+            orders,
+        }
     }
 
-    /// Orders queued in the levels, levels that are not empty, and the sum of the level totals.
-    pub fn count_levels(levels: &[Level]) -> (usize, usize, u64) {
-        let orders = levels.iter().map(Level::len).sum();
-        let live = levels.iter().filter(|l| !l.is_empty()).count();
-        let shares = levels.iter().map(Level::total).sum();
+    /// Live orders in the levels, read through the order maps, levels that are not empty, and
+    /// the sum of the level totals.
+    pub fn count_levels(state: &Levels) -> (usize, usize, u64) {
+        let orders = (0..state.levels.len() as u32)
+            .map(|slot| state.ids(slot).count())
+            .sum();
+        let live = state.levels.iter().filter(|l| !l.is_empty()).count();
+        let shares = state.levels.iter().map(Level::total).sum();
         (orders, live, shares)
     }
 
@@ -447,7 +533,13 @@ pub mod parts {
                     price,
                     qty,
                 } => {
-                    maps[usize::from(book)].insert(id, RestingOrder { side, price, qty });
+                    let order = RestingOrder {
+                        side,
+                        price,
+                        qty,
+                        seq: 0,
+                    };
+                    maps[usize::from(book)].insert(id, order);
                 }
                 MapOp::Get { book, id } => {
                     black_box(maps[usize::from(book)].get(&id).map(|o| o.qty));
