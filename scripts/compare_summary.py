@@ -18,6 +18,8 @@ import sys
 
 LATENCY = [f"{scope}_{q}_ns" for scope in ("all", "book") for q in ("mean", "p50", "p99", "p999")]
 THROUGHPUT = "throughput_msgs_per_s"
+# examples/micro.rs, compared with compare.sh -m PART.
+MICRO = ["ns_per_op_median", "ns_per_op_min"]
 MIN_PER_ORDER = 3
 
 # One-sided 99% critical values of Student's t by degrees of freedom. A df between two rows uses
@@ -65,6 +67,8 @@ def load(path):
 
 
 def stats_of(meta):
+    if meta.get("part"):
+        return MICRO
     return LATENCY + ([THROUGHPUT] if meta.get("throughput_pass") else [])
 
 
@@ -117,7 +121,7 @@ def floors(path, meta, stats):
     fmeta, fruns, fpairs = load(path)
     if fmeta.get("baseline_sha256") != fmeta.get("candidate_sha256"):
         die(f"{path} is not an A/A comparison (the same binary twice)")
-    for key in ("file", "limit", "cpu", "throughput_pass"):
+    for key in ("file", "limit", "cpu", "throughput_pass", "window", "part"):
         if fmeta.get(key) != meta.get(key):
             die(f"{path} was measured with {key} {fmeta.get(key)}, this comparison has {meta.get(key)}")
     out = {}
@@ -135,16 +139,16 @@ def median(xs):
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 
-def flagged(order):
+def flagged(order, wall):
     """Runs whose wall time or either control-loop time is over 1.5 times the comparison's median:
     the host slept or was busy. Flags never change a number."""
-    mw = median([r["latency_wall_s"] for r in order])
+    mw = median([r[wall] for r in order])
     mc = median([r[k] for r in order for k in ("control_ms_start", "control_ms_end")])
     out = []
     for r in order:
         why = []
-        if r["latency_wall_s"] > 1.5 * mw:
-            why.append(f"took {r['latency_wall_s']:.1f} s against a median of {mw:.1f} s")
+        if r[wall] > 1.5 * mw:
+            why.append(f"took {r[wall]:.1f} s against a median of {mw:.1f} s")
         c = max(r["control_ms_start"], r["control_ms_end"])
         if c > 1.5 * mc:
             why.append(f"control loop took {c:.1f} ms against a median of {mc:.1f} ms")
@@ -179,12 +183,19 @@ def main(argv=None):
     err = sys.stderr
     order = sorted((runs[p, role] for p in pairs for role in ("baseline", "candidate")),
                    key=lambda r: (r["pair"], r["position"]))
-    print(f"\n{'pair':<4} {'pos':<3} {'role':<9} {'ctl_ms_0':>10} {'ctl_ms_1':>10} {'wall_s':>9} "
-          f"{'all_p50':>10} {'book_p50':>10} {'book_p99':>10} {'book_mean':>10}", file=err)
+    if meta.get("part"):
+        sums = {r["workload_checksum"] for r in order}
+        if len(sums) != 1:
+            die(f"the runs report different workload checksums: {' '.join(sorted(sums))}")
+        wall, cols = "timed_s", ["ns_per_op_median", "ns_per_op_min", "spread_pct", "allocs_per_op"]
+    else:
+        wall, cols = "latency_wall_s", ["all_p50_ns", "book_p50_ns", "book_p99_ns", "book_mean_ns"]
+    print(f"\n{'pair':<4} {'pos':<3} {'role':<9} {'ctl_ms_0':>10} {'ctl_ms_1':>10} {'wall_s':>9}"
+          + "".join(f" {c.removesuffix('_ns'):>16}" for c in cols), file=err)
     for r in order:
         print(f"{r['pair']:<4} {r['position']:<3} {r['role']:<9} {r['control_ms_start']:>10.1f} "
-              f"{r['control_ms_end']:>10.1f} {r['latency_wall_s']:>9.1f} {r['all_p50_ns']:>10.1f} "
-              f"{r['book_p50_ns']:>10.1f} {r['book_p99_ns']:>10.1f} {r['book_mean_ns']:>10.2f}", file=err)
+              f"{r['control_ms_end']:>10.1f} {r[wall]:>9.1f}"
+              + "".join(f" {r[c]:>16.2f}" for c in cols), file=err)
 
     print("\nd = (candidate - baseline) / baseline * 100, per pair (order AB: baseline ran first)",
           file=err)
@@ -200,10 +211,10 @@ def main(argv=None):
     n2 = len(pairs) - n1
     balanced = n1 == n2 and n1 >= MIN_PER_ORDER
     aa = meta.get("baseline_sha256") == meta.get("candidate_sha256")
-    warnings = flagged(order)
+    warnings = flagged(order, wall)
     summary = {"summary": True, "aa": aa, "flagged_runs": len(warnings), "pairs": len(pairs),
                "pairs_baseline_first": n1, "pairs_candidate_first": n2}
-    for k in ("cpu", "file", "limit", "throughput_pass", "baseline", "candidate",
+    for k in ("cpu", "file", "limit", "throughput_pass", "window", "part", "baseline", "candidate",
               "baseline_sha256", "candidate_sha256"):
         summary[k] = meta.get(k)
     summary["floor_source"] = "A/A file" if fl else "none"

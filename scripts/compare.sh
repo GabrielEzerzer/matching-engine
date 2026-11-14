@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Compares two preserved benchmark binaries in alternating pairs on the same input and CPU.
 #
-#   scripts/compare.sh [-s STAT] [-n PAIRS] [-c CPU] [-l LIMIT] [-t] [-f FLOOR] BASELINE CANDIDATE [FILE]
+#   scripts/compare.sh [-s STAT] [-n PAIRS] [-c CPU] [-l LIMIT] [-t] [-w WINDOW] [-m PART] [-f FLOOR]
+#                      BASELINE CANDIDATE [FILE]
 #   scripts/compare.sh -r EARLIER [-s STAT] [-f FLOOR]
 #
 # BASELINE and CANDIDATE are bench binaries kept by scripts/bench-build.sh; their recorded build
@@ -9,7 +10,13 @@
 # candidate, pair 2 the candidate then the baseline, and so on. PAIRS must be even and at least 6
 # (3 in each order) and defaults to 6; CPU defaults to 5, FILE to $ITCH_DIR/12302019.NASDAQ_ITCH50
 # (ITCH_DIR defaults to /data/itch). LIMIT stops each run after that many messages. Each run is the
-# latency pass only; -t adds the throughput pass and compares throughput too.
+# latency pass only; -t adds the throughput pass and compares throughput too. -w WINDOW
+# (HH:MM:SS-HH:MM:SS) passes --window to bench, so only that part of the day is timed.
+#
+# -m PART compares microbenchmarks instead (examples/micro.rs; PART is side, level, orders, book or
+# parse): BASELINE and CANDIDATE are then the micro binaries scripts/bench-build.sh keeps beside
+# bench, each run is `micro PART`, and the statistics are ns_per_op_median and ns_per_op_min. All
+# runs must report the same workload_checksum.
 #
 # STAT, declared before the run, is the one statistic that gets a verdict, for example all_p50_ns.
 # Every other statistic is printed as information. Without -s there is no verdict.
@@ -47,14 +54,18 @@ tput=0
 floor=""
 rerun=""
 target=""
-usage() { sed -n '2,40p' "$0"; exit 2; }
-while getopts "s:n:c:l:tf:r:h" opt; do
+window=""
+part=""
+usage() { sed -n '2,47p' "$0"; exit 2; }
+while getopts "s:n:c:l:tw:m:f:r:h" opt; do
     case "$opt" in
         s) target="$OPTARG" ;;
         n) pairs="$OPTARG" ;;
         c) cpu="$OPTARG" ;;
         l) limit="$OPTARG" ;;
         t) tput=1 ;;
+        w) window="$OPTARG" ;;
+        m) part="$OPTARG" ;;
         f) floor="$OPTARG" ;;
         r) rerun="$OPTARG" ;;
         h | *) usage ;;
@@ -83,6 +94,9 @@ case "$pairs" in '' | *[!0-9]*) die "bad -n $pairs" ;; esac
     die "-n must be even and at least 6, so that each order has at least 3 pairs"
 for b in "$base" "$cand"; do [ -x "$b" ] || die "not an executable: $b"; done
 [ -f "$file" ] || die "no ITCH file at $file (see scripts/fetch-itch.sh)"
+if [ -n "$part" ]; then
+    [ -z "$limit$window" ] && [ "$tput" = 0 ] || die "-m takes none of -l, -w and -t"
+fi
 command -v taskset >/dev/null || die "taskset not found (util-linux)"
 
 sha_b="$(sha256sum "$base" | cut -d' ' -f1)"
@@ -112,15 +126,16 @@ label_c="$(label "$cand")"
 
 runs="$(mktemp)"
 trap 'rm -f "$runs"' EXIT
-printf '{"meta":true,"cpu":"%s","file":"%s","limit":"%s","throughput_pass":%s,"baseline":"%s","candidate":"%s","baseline_sha256":"%s","candidate_sha256":"%s"}\n' \
+printf '{"meta":true,"cpu":"%s","file":"%s","limit":"%s","throughput_pass":%s,"baseline":"%s","candidate":"%s","baseline_sha256":"%s","candidate_sha256":"%s"%s}\n' \
     "$cpu" "$(basename "$file")" "${limit:-none}" "$([ "$tput" = 1 ] && echo true || echo false)" \
-    "$label_b" "$label_c" "$sha_b" "$sha_c" > "$runs"
+    "$label_b" "$label_c" "$sha_b" "$sha_c" \
+    "${window:+,\"window\":\"$window\"}${part:+,\"part\":\"$part\"}" > "$runs"
 # Refuse a bad -s or -f now rather than after the runs.
 "${summarise[@]}" --check "$runs"
 
 echo "compare.sh: baseline $base ($label_b)" >&2
 echo "compare.sh: candidate $cand ($label_c)$([ "$aa" = true ] && echo ', identical binary: A/A run')" >&2
-echo "compare.sh: cpu $cpu, $pairs pairs, file $file${limit:+, limit $limit}$([ "$tput" = 1 ] && echo ', with throughput pass')" >&2
+echo "compare.sh: cpu $cpu, $pairs pairs, file $file${limit:+, limit $limit}${window:+, window $window}${part:+, microbenchmark $part}$([ "$tput" = 1 ] && echo ', with throughput pass')" >&2
 echo "compare.sh: declared statistic ${target:-none (no verdict)}${floor:+, floor from $floor}" >&2
 echo "compare.sh: kernel $(uname -r), load $(cut -d' ' -f1-3 /proc/loadavg)" >&2
 
@@ -132,7 +147,12 @@ for p in $(seq 1 "$pairs"); do
     for role in $order; do
         if [ "$role" = baseline ]; then bin="$base" lab="$label_b"; else bin="$cand" lab="$label_c"; fi
         echo "compare.sh: pair $p/$pairs, run $pos: $role" >&2
-        line="$(taskset -c "$cpu" "$bin" --commit "$lab" ${limit:+--limit "$limit"} $tflag "$file")" ||
+        if [ -n "$part" ]; then
+            args=("$part")
+        else
+            args=(${limit:+--limit "$limit"} ${window:+--window "$window"} $tflag)
+        fi
+        line="$(taskset -c "$cpu" "$bin" "${args[@]}" --commit "$lab" "$file")" ||
             die "pair $p run $pos ($role) failed"
         case "$line" in "{"*) ;; *) die "pair $p run $pos ($role) printed no result line" ;; esac
         printf '{"pair":%d,"position":%d,"role":"%s",%s\n' "$p" "$pos" "$role" "${line#\{}" | tee -a "$runs"
