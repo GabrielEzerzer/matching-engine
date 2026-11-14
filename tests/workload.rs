@@ -474,15 +474,15 @@ fn adapters_rebuild_the_books_state() {
 
     let (sides, _) = parts::run_sides(&w);
     assert_eq!(parts::count_sides(&sides), e.side_levels.len());
-    let (level_parts, _) = parts::run_levels(&w);
+    let (level_parts, _) = parts::run_levels(&w, &parts::push_books(&w));
     assert_eq!(
         parts::count_levels(&level_parts),
         (e.map.len(), e.side_levels.len(), shares(&e))
     );
-    let mut levels: Vec<(Vec<OrderId>, u64)> = level_parts
-        .iter()
-        .filter(|l| !l.is_empty())
-        .map(|l| (l.ids().collect(), l.total()))
+    let mut levels: Vec<(Vec<OrderId>, u64)> = (0..)
+        .zip(&level_parts.levels)
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(slot, l)| (level_parts.ids(slot).collect(), l.total()))
         .collect();
     levels.sort();
     assert_eq!(levels, e.queues);
@@ -512,7 +512,7 @@ fn share_totals_catch_skipped_updates_and_reduces() {
     w.level_ops
         .retain(|op| !matches!(op, LevelOp::Reduce { .. }));
     assert_ne!(
-        parts::count_levels(&parts::run_levels(&w).0).2,
+        parts::count_levels(&parts::run_levels(&w, &parts::push_books(&w)).0).2,
         w.final_shares
     );
 }
@@ -549,7 +549,7 @@ fn read_folds_catch_skipped_and_wrong_reads() {
     let mut v = wrong();
     v.level_ops
         .retain(|op| !matches!(op, LevelOp::Front { .. }));
-    let (levels, reads) = parts::run_levels(&v);
+    let (levels, reads) = parts::run_levels(&v, &parts::push_books(&v));
     assert_eq!(
         parts::count_levels(&levels),
         (w.final_orders, w.final_levels, w.final_shares)
@@ -565,7 +565,7 @@ fn read_folds_catch_skipped_and_wrong_reads() {
 
     // Remove still removes but folds a constant in place of the order it took out. The same loop
     // folding the real result gives the stored value, so the copy differs in that arm only.
-    let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::new()).collect();
+    let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::default()).collect();
     let (mut right, mut constant) = (0, 0);
     for &op in &w.map_ops {
         match op {
@@ -576,7 +576,13 @@ fn read_folds_catch_skipped_and_wrong_reads() {
                 price,
                 qty,
             } => {
-                maps[usize::from(book)].insert(id, RestingOrder { side, price, qty });
+                let order = RestingOrder {
+                    side,
+                    price,
+                    qty,
+                    slot: 0,
+                };
+                maps[usize::from(book)].insert(id, order);
             }
             MapOp::Get { book, id } => {
                 let got = maps[usize::from(book)].get(&id);

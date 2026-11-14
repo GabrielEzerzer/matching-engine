@@ -12,7 +12,7 @@ Stage 1 is a correct, unoptimised baseline: a library crate with a single-instru
 - Prices are `u32` ticks of $0.0001 and quantities are `u32` shares, matching ITCH 5.0. Level totals are `u64`.
 - There is no self-trade prevention: orders carry no owner.
 
-The book is split into modules that later stages measure and replace one at a time: `side` (price-level lookup, a sorted index into a slab of levels), `level` (the FIFO queue at one price, a `VecDeque`), `orders` (the id map, a `HashMap`) and `book` (matching).
+The book is split into modules that later stages measure and replace one at a time: `side` (price-level lookup, a sorted index into a slab of levels), `level` (the FIFO queue at one price, a doubly linked list in a slab of nodes per book), `orders` (the id map, a `HashMap` with a keyed integer hasher) and `book` (matching).
 
 `harness/reference.rs` is a deliberately slow reference book that keeps every order in one flat list and scans it for each match. Only the tests and the differential replay compile it.
 
@@ -140,6 +140,8 @@ The pairs within one comparison share the machine's state, such as its temperatu
 
 `inconclusive` is final for that round. Running the same comparisons again is a new round, and it is logged as one with its own result. A comparison with flagged runs counts as run, and repeating it is also a new round.
 
+A candidate that was not kept may be measured in one more round, and no more. The reason for the second round is written down before it starts, and it has to be something other than the result itself: a guardrail that ran with the wrong statistic, or runs that the control loop flagged as disturbed, which it does without looking at the result. A verdict that went against the candidate is not a reason. The second round repeats everything, the first comparison, the confirming comparison and the guardrail, with the statistic and pair count of the first. A candidate not kept after its second round is dropped. When a candidate is kept on its second round, its entry in `PERF.md` gives the reason for the rerun and the first round's results beside the second's, including the ones that went against it. Two attempts are two chances to pass, so a change kept on a second round is less certain than its intervals say: they describe that round alone and do not account for the choice between rounds.
+
 When there are several alternatives for one part, each is compared once against the baseline with the same declared statistic and pair count, and only the one with the best effect goes on to the confirming comparison. The alternatives are compared on the same microbenchmark part, because effects measured on different parts have different denominators and cannot be ranked against each other. The confirming comparison shows that the chosen alternative beats the baseline again. It does not show that it beats the other alternatives.
 
 A kept change must also pass the guardrail (see "Guardrail window"), reproduce the golden hash and pass the tests.
@@ -197,8 +199,58 @@ A change that wins on its part still has to hold up end to end. `bench --window 
 scripts/compare.sh -w 09:30:00-10:00:00 -n 10 -s book_mean_ns /root/bench-bins/BASE/bench /root/bench-bins/CAND/bench > guard.jsonl
 ```
 
-The guardrail asks a different question from a round's comparisons: not whether the change is faster, but whether it could be meaningfully slower. Its statistic and its margin are declared before it runs. The statistic is `book_mean_ns`, the mean time of the messages that reach a book, because a mean moves when rare operations get slower and a median does not. The margin is 5%: the tolerance chosen for this project, not something the pairs establish. The guardrail passes if and only if the upper end of the comparison's interval is below +5%, whatever the comparison's verdict against zero. Under the comparison's sampling assumptions (see the procedure above for how far they hold), that rules out a regression of that size at the interval's confidence. The verdict alone settles nothing: `inconclusive` with an interval from −2% to +2% passes, and `inconclusive` with an interval from −2% to +8% does not, because it still allows an 8% regression. When the upper end is at or above the margin, the guardrail is unresolved and the change is not kept; it can be measured again as a new comparison with more pairs or on a quieter machine. Ten pairs decide clear cases and leave noisy ones unresolved.
+The guardrail asks a different question from a round's comparisons: not whether the change is faster, but whether it could be meaningfully slower. Its statistic and its margin are declared before it runs. The statistic is `book_mean_ns`, the mean time of the messages that reach a book, because a mean moves when rare operations get slower and a median does not. The margin is 5%: the tolerance chosen for this project, not something the pairs establish. The guardrail passes if and only if the upper end of the comparison's interval is below +5%, whatever the comparison's verdict against zero. Under the comparison's sampling assumptions (see the procedure above for how far they hold), that rules out a regression of that size at the interval's confidence. The verdict alone settles nothing: `inconclusive` with an interval from −2% to +2% passes, and `inconclusive` with an interval from −2% to +8% does not, because it still allows an 8% regression. When the upper end is at or above the margin, the guardrail is unresolved and the change is not kept. An unresolved guardrail is a result like any other: it is not by itself a reason to measure again, and the guardrail is never repeated alone. The candidate can only get the one second round that "Procedure for optimisation rounds" allows, for one of the reasons given there, with the whole round repeated and the same pair count. Ten pairs decide clear cases and leave noisy ones unresolved.
 
 A pass covers this statistic in this window. It does not cover tail latency, or the state the books reach later in the day.
 
 The guardrail window is 09:30:00 to 10:00:00, the first half hour of regular trading. It is the densest part of the day, with 32,817,244 messages (about an eighth of the day) and the largest bursts, so it exercises the book under the heaviest load. The warm-up before it is only the 6,696,719 pre-market messages, and the input up to 10:00 is 1.24 GB, which stays in the page cache between runs. A run takes about 30 seconds on a quiet machine, so a 10-pair comparison takes about ten minutes.
+
+## Running the comparisons on Kaggle
+
+When the laptop is busy, its timings are not usable (the same binary can differ by a quarter between runs). `scripts/kaggle_bench.py` runs a fixed plan of comparisons on a Kaggle CPU session instead, as a private script kernel. It needs only the Python standard library and the `kaggle` CLI, logged in to the account that will own the run.
+
+A plan is a JSON file in `scripts/kaggle-plans/`. It names a base label, every label's branch, the CPU to pin to (`cpu`, default 3; a Kaggle CPU session has 4 vCPUs) and a stop time (`stop_after_min`, default 630, that is 10 h 30 min, and below 700; Kaggle ends a session at 12 h), then the steps in order:
+
+- `aa`: `compare.sh -m PART` of the base against itself, the method check, which should come out `inconclusive`;
+- `compare`: `compare.sh -m PART` of the base against a candidate, once per candidate and part;
+- `confirm_best`: for a group of earlier `compare` steps (the alternatives for one part), the one with the best effect among those that came out `improved` is compared again with the same statistic and pair count. If that also says `improved`, it is the group's winner: the alternative that beat the baseline twice, not one shown to be better than the other alternatives, which each met the machine at a different time. A winner is kept only if the guardrail, the golden check and the tests also pass. If no alternative improved, nothing runs. No winner is named when an earlier `aa` step of the same part did not finish with `inconclusive`, because the method is then not trustworthy on that machine;
+- `window`: `compare.sh -w WINDOW` of the base's and the group winner's `bench` binaries, the guardrail comparison. The runner records its interval; whether the guardrail passed is read from the interval's upper end against the declared margin, not from the verdict;
+- `golden`: the golden check (`replay --check`) and `cargo test --all-targets` in the group winner's checkout;
+- `bench`: `scripts/bench.sh` of one label, for a baseline table.
+
+`window` and `golden` are skipped when their group has no winner, and their note says why. Each confirmation must run as a separate block, as "Procedure for optimisation rounds" requires: the plan is refused unless at least one `aa`, `bench` or `window` step, or a `compare` of a candidate outside the group, comes between the group's last comparison and its `confirm_best`. When none of those steps finishes on the day, the confirmation is skipped and says so.
+
+On Kaggle the kernel installs Rust with rustup (stable, minimal profile) into `/kaggle/tmp`, fetches each label's branch from the bundle into its own checkout and checks it is at the bundle commit recorded when the kernel was written, fetches the ITCH day into `/kaggle/tmp/itch` with the base checkout's `scripts/fetch-itch.sh`, and builds every label with its own `scripts/bench-build.sh`. After each build it writes the branch's real commit into the build's `commit.txt`, which `compare.sh` passes to the binaries, and a `bench` step's output gets the real commit in place of the bundle commit, so the results carry the real commit ids. Only after every build has finished does it run the steps, one at a time, with the base checkout's `scripts/compare.sh`. A step is `done` only when the script exited 0 and printed its summary line. A failed step, or one whose label did not build, is recorded as `failed`, and the run goes on with the steps that do not depend on it. No command runs past 700 minutes from the kernel's start: one still running then is killed with its whole process group and its step recorded as failed. Everything it keeps is in `/kaggle/working/results`: `<step>.jsonl` (the script's stdout) and `<step>.err` for each step, `STATUS.json` and `SUMMARY.md` (one row per step), both rewritten every time a step or setup phase changes state, `host.txt` (`nproc`, `lscpu`, `lscpu -e`, the pinned CPU's frequency governor and driver where the VM exposes them, memory, kernel version and `rustc -vV`) and the setup and build logs. So that a result can be traced to what produced it, the folder also holds `plan.json` (the plan as it ran), each label's build records (`build-<label>-settings.txt` and `build-<label>-build.txt`), and, in `STATUS.json` and `SUMMARY.md`, a session id (the plan's name and the UTC start time) and the SHA-256 of the runner script as it ran. Each comparison row and each `bench` row carries a steal reading: the share of the pinned CPU's time the hypervisor gave to other guests during that step, from `/proc/stat`. It is there to explain a disturbed step afterwards and changes no verdict; a reading of 0 does not show the host was quiet, because a busy sibling hyperthread or a frequency change does not appear as steal.
+
+Check the plan, then write the dataset and kernel folders and push them (PowerShell; `kaggle datasets create` fails from Git Bash on Windows):
+
+```powershell
+python scripts/kaggle_bench.py --self-test
+python scripts/kaggle_bench.py --dry-run scripts/kaggle-plans/stage3-parse.json   # validates and prints every command
+python scripts/kaggle_bench.py --write-kernel scripts/kaggle-plans/stage3-parse.json $env:TEMP\me-bench-stage3-parse --owner KAGGLE_USER
+kaggle datasets create -p $env:TEMP\me-bench-stage3-parse\src      # later runs of the same plan: kaggle datasets version -p ... -m "new commits"
+kaggle datasets status KAGGLE_USER/me-bench-stage3-parse-src        # wait for "ready"
+kaggle kernels push -p $env:TEMP\me-bench-stage3-parse\kernel
+```
+
+`--write-kernel` writes `src/` (a git bundle with `dataset-metadata.json`) and `kernel/` (this script with the plan, each branch's real commit and its bundle commit embedded, with `kernel-metadata.json`: private, CPU only, internet on, the dataset attached). The bundle holds no history: for each branch the plan names it holds one commit of that branch's files with no parent, author and committer `bench <bench@localhost>`, a fixed date and a fixed message, under `refs/kaggle-bundle/<branch>`. The same tree always gives the same bundle commit. The temporary refs it creates in the local repository are deleted again afterwards. The owner is `--owner` or `$KAGGLE_USERNAME`. Write the kernel again after any branch moves, and version the dataset with it, or the kernel refuses the checkout.
+
+Follow and fetch the run:
+
+```powershell
+kaggle kernels status KAGGLE_USER/me-bench-stage3-parse
+kaggle kernels output KAGGLE_USER/me-bench-stage3-parse -p out\stage3-parse
+```
+
+Kaggle keeps `/kaggle/working` when the run ends; while it runs, the kernel's log shows each step and its verdict as it finishes.
+
+The results are Linux timings from a shared cloud VM, and what they show is limited in four ways.
+
+- **A verdict is evidence from one session.** Both binaries run in the same session on the same CPU, in alternating order, which cancels a stable advantage of running second. It does not cancel a disturbance that changes over time, such as a neighbour's load, a busy sibling hyperthread or a change of clock frequency.
+- **An A/A check that comes out `inconclusive` shows that no problem was seen while it ran.** It does not certify that the host stayed stable during the comparisons before or after it.
+- **A confirming comparison in the same session is a second look under much the same conditions.** The measurement between the two comparisons separates them in time but does not make them independent, so the two results are not two independent tests and their error rates do not multiply.
+- **Effects from different sessions are not ranked against each other.** Each plan runs on its own VM with its own baseline build, the hardware can differ between sessions, and different parts have different denominators. A table may show several groups' effects together only with each one's session, baseline commit, part, statistic and both comparisons' intervals, and it does not say that one group's change is worth more than another's.
+
+Every session is logged, including one whose A/A check failed or that found nothing, and running a plan again is a new round. Absolute numbers (ns per operation, latencies, throughput) belong to that machine only, and `SUMMARY.md` and `host.txt` say so; never set them beside laptop numbers.
+
+The kernel makes three kinds of request: rustup's installer from `https://sh.rustup.rs` (and the toolchain it downloads), crates.io through cargo, and the Nasdaq sample file through `scripts/fetch-itch.sh`, each with the tool's default user agent. The upload carries the plan (labels, branch names and commit ids) and the bundle, which holds the named branches' files under the neutral `bench` identity and none of their history, so no author or committer name or address. Nothing else identifying is sent beyond the Kaggle account the CLI is logged in to, and the script never reads the CLI's credentials file.

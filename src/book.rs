@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use crate::level::Nodes;
 use crate::orders::{OrderMap, RestingOrder};
 use crate::side::BookSide;
 use crate::types::{
@@ -14,6 +15,8 @@ pub struct OrderBook {
     bids: BookSide,
     asks: BookSide,
     orders: OrderMap,
+    /// The queue nodes of every level on both sides.
+    nodes: Nodes,
 }
 
 impl Default for OrderBook {
@@ -27,7 +30,8 @@ impl OrderBook {
         Self {
             bids: BookSide::new(Side::Buy),
             asks: BookSide::new(Side::Sell),
-            orders: OrderMap::new(),
+            orders: OrderMap::default(),
+            nodes: Nodes::default(),
         }
     }
 
@@ -65,6 +69,7 @@ impl OrderBook {
                     reason: RejectReason::UnknownOrder,
                 }),
                 Some(order) => {
+                    self.nodes.unlink(order.slot);
                     self.side_mut(order.side)
                         .remove_order(order.price, id, order.qty);
                     out.push(Event::Cancelled {
@@ -95,6 +100,7 @@ impl OrderBook {
                 let remaining = order.qty - by;
                 if remaining == 0 {
                     self.orders.remove(&id);
+                    self.nodes.unlink(order.slot);
                     self.side_mut(order.side).remove_order(order.price, id, by);
                 } else {
                     self.orders.get_mut(&id).expect("checked above").qty = remaining;
@@ -130,6 +136,7 @@ impl OrderBook {
                     return;
                 }
                 self.orders.remove(&id);
+                self.nodes.unlink(old.slot);
                 self.side_mut(old.side).remove_order(old.price, id, old.qty);
                 out.push(Event::Replaced { old_id: id, new_id });
                 self.submit(new_id, old.side, Some(price), qty, out);
@@ -159,7 +166,7 @@ impl OrderBook {
     pub fn front_order(&self, side: Side) -> Option<OrderId> {
         let side = self.side(side);
         let price = side.best_price()?;
-        side.level(price)?.front()
+        side.level(price)?.front(&self.nodes)
     }
 
     /// Levels of one side, best price first.
@@ -181,7 +188,10 @@ impl OrderBook {
                 .levels_best_first()
                 .map(|(price, level)| LevelSnapshot {
                     price,
-                    orders: level.ids().map(|id| (id, self.orders[&id].qty)).collect(),
+                    orders: level
+                        .ids(&self.nodes)
+                        .map(|id| (id, self.orders[&id].qty))
+                        .collect(),
                 })
                 .collect()
         };
@@ -192,8 +202,10 @@ impl OrderBook {
     }
 
     /// Checks the book's internal consistency: it is not crossed, no level is empty, each
-    /// level's total equals the sum of its orders, and the levels and the id map hold exactly
-    /// the same orders at the same side and price, each with quantity left.
+    /// level's total equals the sum of its orders, the levels and the id map hold exactly the
+    /// same orders at the same side, price and queue node, each with quantity left, each level's
+    /// queue links are consistent, and the queue slab has no node in use that no order or level
+    /// owns.
     pub fn check_invariants(&self) -> Result<(), String> {
         if let (Some(bid), Some(ask)) = (self.best_bid(), self.best_ask())
             && bid >= ask
@@ -201,13 +213,16 @@ impl OrderBook {
             return Err(format!("book is crossed: best bid {bid} >= best ask {ask}"));
         }
         let mut seen = HashSet::new();
+        let mut levels = 0;
         for side in [Side::Buy, Side::Sell] {
             for (price, level) in self.side(side).levels_best_first() {
                 if level.is_empty() {
                     return Err(format!("{side:?} level {price} is empty"));
                 }
+                level.check(&self.nodes)?;
+                levels += 1;
                 let mut sum = 0u64;
-                for id in level.ids() {
+                for (slot, id) in level.slots(&self.nodes) {
                     if !seen.insert(id) {
                         return Err(format!("order {id} is queued twice"));
                     }
@@ -218,6 +233,12 @@ impl OrderBook {
                         return Err(format!(
                             "order {id} is queued at {side:?} {price} but mapped to {:?} {}",
                             order.side, order.price
+                        ));
+                    }
+                    if order.slot != slot {
+                        return Err(format!(
+                            "order {id} is queued in node {slot} but mapped to node {}",
+                            order.slot
                         ));
                     }
                     if order.qty == 0 {
@@ -238,6 +259,13 @@ impl OrderBook {
                 "{} orders queued but {} in the id map",
                 seen.len(),
                 self.orders.len()
+            ));
+        }
+        let in_use = self.nodes.in_use()?;
+        if in_use != seen.len() + levels {
+            return Err(format!(
+                "{in_use} queue nodes in use for {} orders on {levels} levels",
+                seen.len()
             ));
         }
         Ok(())
@@ -281,15 +309,20 @@ impl OrderBook {
         if remaining == 0 {
             out.push(Event::Filled { id });
         } else if let Some(price) = limit {
-            self.side_mut(side)
+            let book_side = match side {
+                Side::Buy => &mut self.bids,
+                Side::Sell => &mut self.asks,
+            };
+            let slot = book_side
                 .level_or_insert(price)
-                .push_back(id, remaining);
+                .push_back(&mut self.nodes, id, remaining);
             self.orders.insert(
                 id,
                 RestingOrder {
                     side,
                     price,
                     qty: remaining,
+                    slot,
                 },
             );
         }
@@ -306,9 +339,9 @@ impl OrderBook {
         mut qty: Qty,
         out: &mut Vec<Event>,
     ) -> Qty {
-        let (opposite, orders) = match side {
-            Side::Buy => (&mut self.asks, &mut self.orders),
-            Side::Sell => (&mut self.bids, &mut self.orders),
+        let (opposite, orders, nodes) = match side {
+            Side::Buy => (&mut self.asks, &mut self.orders, &mut self.nodes),
+            Side::Sell => (&mut self.bids, &mut self.orders, &mut self.nodes),
         };
         while qty > 0 {
             let Some(price) = opposite.best_price() else {
@@ -321,7 +354,7 @@ impl OrderBook {
             }
             let level = opposite.level_mut(price).expect("best level exists");
             while qty > 0
-                && let Some(maker_id) = level.front()
+                && let Some(maker_id) = level.front(nodes)
             {
                 let maker = orders
                     .get_mut(&maker_id)
@@ -337,7 +370,7 @@ impl OrderBook {
                     qty: fill,
                 });
                 if maker.qty == 0 {
-                    level.pop_front();
+                    level.pop_front(nodes);
                     orders.remove(&maker_id);
                     out.push(Event::Filled { id: maker_id });
                 }

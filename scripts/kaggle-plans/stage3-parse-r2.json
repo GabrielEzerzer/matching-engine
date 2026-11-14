@@ -1,0 +1,18 @@
+{
+  "name": "stage3-parse-r2",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "m-base",
+    "m-parse-a": "m-parse-a"
+  },
+  "steps": [
+    {"id": "aa-parse", "kind": "aa", "part": "parse", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-m-parse-a", "kind": "compare", "part": "parse", "cand": "m-parse-a", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "aa-parse-2", "kind": "aa", "part": "parse", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-parse", "kind": "confirm_best", "group": "parse", "steps": ["cmp-m-parse-a"]},
+    {"id": "window-parse", "kind": "window", "group": "parse", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-parse", "kind": "golden", "group": "parse"}
+  ]
+}

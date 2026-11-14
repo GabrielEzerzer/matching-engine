@@ -137,6 +137,8 @@ proptest! {
             prop_assert_eq!(book.best_ask(), snapshot.asks.first().map(|l| l.price));
             prop_assert_eq!(book.depth(Side::Buy), depth_from(&snapshot, Side::Buy));
             prop_assert_eq!(book.depth(Side::Sell), depth_from(&snapshot, Side::Sell));
+            prop_assert_eq!(book.front_order(Side::Buy), snapshot.bids.first().map(|l| l.orders[0].0));
+            prop_assert_eq!(book.front_order(Side::Sell), snapshot.asks.first().map(|l| l.orders[0].0));
         }
     }
 }
