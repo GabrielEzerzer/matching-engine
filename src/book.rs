@@ -27,7 +27,7 @@ impl OrderBook {
         Self {
             bids: BookSide::new(Side::Buy),
             asks: BookSide::new(Side::Sell),
-            orders: OrderMap::new(),
+            orders: OrderMap::default(),
         }
     }
 
