@@ -27,7 +27,8 @@ pub type OrderMap = IdMap<RestingOrder>;
 /// adds and deletes (a trading day) never degrades the table.
 ///
 /// It has only the operations the book uses, with the standard map's signatures, and no
-/// iteration, so nothing can depend on slot order. It never shrinks, like the standard map.
+/// iteration outside the microbenchmarks' `internals` feature, so the book cannot depend on slot
+/// order. It never shrinks, like the standard map.
 /// shortcut: the load limit is one half, which costs about twice the slots of the standard map's
 /// seven eighths; if memory per book matters more than probe length, raise it with Robin Hood
 /// ordering so misses stay short.
@@ -112,6 +113,13 @@ impl<V> IdMap<V> {
             j = (j + 1) & mask;
         }
         Some(value)
+    }
+
+    /// The values in slot order, with the standard map's signature, only for the microbenchmark's
+    /// check of the resting shares after a pass (`internals`); the book never iterates the map.
+    #[cfg(feature = "internals")]
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.slots.iter().flatten().map(|(_, value)| value)
     }
 
     /// The slot holding `id`. Terminates because at least half the slots are empty.
