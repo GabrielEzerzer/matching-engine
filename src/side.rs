@@ -28,6 +28,10 @@ impl BookSide {
         .map(|(&price, _)| price)
     }
 
+    pub(crate) fn level(&self, price: Price) -> Option<&Level> {
+        self.levels.get(&price)
+    }
+
     pub(crate) fn level_mut(&mut self, price: Price) -> Option<&mut Level> {
         self.levels.get_mut(&price)
     }
