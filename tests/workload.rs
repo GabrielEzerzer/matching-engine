@@ -380,15 +380,14 @@ fn adapters_rebuild_the_books_state() {
     assert_eq!(levels, e.queues);
     let maps = parts::run_maps(&w);
     assert_eq!(parts::count_maps(&maps), (e.map.len(), shares(&e)));
-    let got: HashMap<(BookIdx, OrderId), (Side, Price, Qty)> = maps
-        .iter()
-        .enumerate()
-        .flat_map(|(b, m)| {
-            m.iter()
-                .map(move |(&id, o)| ((b as BookIdx, id), (o.side, o.price, o.qty)))
-        })
-        .collect();
-    assert_eq!(got, e.map);
+    // The map gives no ids back; with the counts equal, finding every expected order means the
+    // maps hold exactly the expected ones.
+    for (&(b, id), &want) in &e.map {
+        let o = maps[usize::from(b)]
+            .get(&id)
+            .expect("expected order is in the map");
+        assert_eq!((o.side, o.price, o.qty), want, "order {id} of book {b}");
+    }
 }
 
 /// The benchmark's check after each pass compares these share totals with the workload's, so an
