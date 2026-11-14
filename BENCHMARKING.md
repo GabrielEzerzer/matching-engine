@@ -2,7 +2,7 @@
 
 How builds are compared, how an optimisation round decides whether a change is kept, and how the comparisons run on a Kaggle CPU session. The README covers running the benchmark itself ("Benchmark"); `PERF.md` records every round and its numbers.
 
-All commands here are Linux commands run from the repository root. `ITCH_DIR` is the folder `scripts/fetch-itch.sh` downloads into (default `${XDG_DATA_HOME:-$HOME/.local/share}/itch`).
+All commands here are Linux commands run from the repository root, except the Kaggle upload steps, which are PowerShell. `ITCH_DIR` is the folder `scripts/fetch-itch.sh` downloads into (default `${XDG_DATA_HOME:-$HOME/.local/share}/itch`).
 
 ## Comparing two builds
 

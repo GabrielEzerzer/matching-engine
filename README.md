@@ -10,7 +10,7 @@ The work ran in three stages, all finished. Stage 1 built a correct, unoptimised
 
 - **Differential testing against a reference model.** `harness/reference.rs` keeps every order in one flat list and scans it for each match. Property tests send random command streams to both books and require identical events, and identical snapshots of every resting order, after every command. A deterministic deep-book test does the same over 8,684 commands on 300 price levels per side, and `examples/diff_slice` replays 5,000,000 commands of six busy symbols from the real day through both books and compares every event.
 - **Aggressor replay against Nasdaq's own executions.** When an ITCH execution names the order at the front of the best level, the replay sends it as the incoming order it really was, and the book's own matching has to trade against exactly that order or the replay stops. On the sample day 98.4% of executions replay this way, and 99.8% of plain E executions name the order this book has at the front, which checks the book's price-time priority against Nasdaq's.
-- **A golden hash of the whole day.** SHA-256 over every event of every book and periodic snapshots of every book's full state, for all 268,744,780 messages of 30 December 2019. Every change has to reproduce it.
+- **A golden hash of the whole day.** SHA-256 over every event of every book and periodic snapshots of every book's full state, for all 268,744,780 messages of 30 December 2019. Every kept optimisation reproduced it.
 
 ### Results
 
@@ -22,15 +22,15 @@ Median of three whole-day runs of the final build (`2c792ab`) on one pinned vCPU
 | Latency per message, p99 | 2.0 µs |
 | Latency per message, p99.9 | 7.9 µs |
 | Throughput, one vCPU | 1.78 million messages per second |
-| Book command, final build against the unoptimised stage 2 build | 38.4% less time (99% interval 38.1% to 38.8%) |
+| Book command, final build against the unoptimised stage 2 build | 38.4% less time (98% interval 38.1% to 38.8%) |
 
 What is timed: each message on its own, from splitting its frame off an in-memory buffer through decoding it and applying it to its book, matching included. Messages run back to back; the file is read in 64 MiB chunks outside the timed regions. The timer's own cost, about 20 ns on that machine, is included in every latency. Throughput comes from a separate pass with no per-message timer. The last row compares the final build with the unoptimised stage 2 code (`f84e022`) on 2,922,290 pre-decoded commands of six busy symbols, in 10 alternating pairs; a second comparison in the same session confirmed it at 34.8%. `PERF.md` has the ranges of the runs, the other statistics and each round.
 
-These numbers are not comparable with the messages-per-second figures that ITCH book-building replays publish. Those replays rebuild the book from Nasdaq's executions without matching and divide wall time by the message count; here matching runs throughout and each message is timed separately, on a shared cloud VM. Several published engines report higher throughput than this one.
+These numbers are not directly comparable with the messages-per-second figures that ITCH book-building replays publish. Those replays rebuild the book from Nasdaq's executions without matching and divide wall time by the message count. Here matching runs throughout, the latency rows time each message separately, and the throughput pass times only parsing and applying from memory, leaving file reads out. Several published engines report higher throughput than this one.
 
 ### How this was built
 
-Built with AI coding agents under the author's direction. Every code change was reviewed by a second model before it merged, and the pull requests record those reviews; documentation-only changes were merged without review.
+Built with AI coding agents under the author's direction. Every pull request that changed code was reviewed before it merged by a separate review agent with a fresh context, and most also by a second model (GPT); each pull request's description records its reviews. Documentation-only changes were merged without review.
 
 ## What exists
 
@@ -64,7 +64,7 @@ cargo test --all-targets
 - `tests/prop.rs` sends random command streams to both books and requires identical events and identical snapshots after every command, along with the book's internal invariants. It runs 2,000 streams by default; set `PROPTEST_CASES` to run more, for example `PROPTEST_CASES=50000 cargo test --release --test prop`. It also checks that the generators reach the cases they are meant to cover.
 - `tests/deep.rs` is a deterministic deep-book differential test. It builds 300 price levels per side with queues of up to 252 orders, then cancels, reduces, replaces, sweeps, drains and repopulates, comparing events, snapshots and invariants with the reference after each of its 8,684 commands.
 - `tests/replay.rs` covers the ITCH-to-command mapping and the counters; `tests/golden.rs` pins the hash encoding with digests computed independently from the documented byte layout; the parser's tests are in `src/itch.rs`.
-- `tests/workload.rs` checks the microbenchmark workloads (see "Microbenchmarks") on a hand-made command stream: the derived operations rebuild each book's orders, levels and resting shares, each order-map operation matches a lookup the book makes, and the encoding round-trips. It also checks that the `level` operations contain exactly the looks at the front of a queue that the book makes. Its tests of the adapters that drive the real parts, of the share totals that catch an adapter skipping quantity changes, and of the read check that catches an adapter skipping a lookup or returning the wrong result, need the `internals` feature, so run the suite a second time with it:
+- `tests/workload.rs` checks the microbenchmark workloads (see "Microbenchmarks" in [BENCHMARKING.md](BENCHMARKING.md)) on a hand-made command stream: the derived operations rebuild each book's orders, levels and resting shares, each order-map operation matches a lookup the book makes, and the encoding round-trips. It also checks that the `level` operations contain exactly the looks at the front of a queue that the book makes. Its tests of the adapters that drive the real parts, of the share totals that catch an adapter skipping quantity changes, and of the read check that catches an adapter skipping a lookup or returning the wrong result, need the `internals` feature, so run the suite a second time with it:
 
 ```sh
 cargo test --all-targets --features internals
