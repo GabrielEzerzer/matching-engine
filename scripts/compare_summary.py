@@ -87,7 +87,11 @@ def baseline_first(runs, p):
 
 
 def d(runs, p, stat):
-    return 100 * math.log(runs[p, "candidate"][stat] / runs[p, "baseline"][stat])
+    b, c = runs[p, "baseline"][stat], runs[p, "candidate"][stat]
+    for role, v in (("baseline", b), ("candidate", c)):
+        if not v > 0:
+            die(f"pair {p} {role} has {stat} = {v}; a log ratio needs positive values")
+    return 100 * math.log(c / b)
 
 
 def diffs(runs, pairs, stat):
@@ -148,13 +152,21 @@ def floors(path, meta, stats):
     return out
 
 
-def report(e, floor):
-    """The numbers of one statistic for the summary line: percent changes and the log scale."""
+def report(e, floor, higher_is_better):
+    """The numbers of one statistic for the summary line: percent changes and the log scale.
+    order_effect_pct is how much faster the second run was. floor_pct is the bar the interval's
+    better end must clear for improved (latency: high_pct below it; throughput: low_pct above it),
+    and floor_regressed_pct the bar its worse end must clear for regressed."""
     lo = hi = None
     if e["bound"] is not None:
         lo, hi = e["effect"] - e["bound"], e["effect"] + e["bound"]
+    sign = 1 if higher_is_better else -1
+    order = None if e["order"] is None else (pct(e["order"]) if higher_is_better else -pct(-e["order"]))
     return {"effect_pct": pct(e["effect"]), "low_pct": pct(lo), "high_pct": pct(hi),
-            "order_effect_pct": pct(e["order"]), "floor_pct": pct(floor), "df": e["df"], "t": e["t"],
+            "order_effect_pct": order,
+            "floor_pct": None if floor is None else pct(sign * floor),
+            "floor_regressed_pct": None if floor is None else pct(-sign * floor),
+            "df": e["df"], "t": e["t"],
             "effect_ln_x100": e["effect"], "se_ln_x100": e["se"], "bound_ln_x100": e["bound"],
             "order_effect_ln_x100": e["order"], "floor_ln_x100": floor}
 
@@ -241,7 +253,7 @@ def main(argv=None):
     by_rule = None
 
     print(f"\n{'statistic':<22} {'effect%':>9} {'low%':>9} {'high%':>9} {'df':>3} {'order%':>13} "
-          f"{'floor%':>8}  verdict", file=err)
+          f"{'imp_bar%':>9} {'reg_bar%':>9}  verdict", file=err)
     for s in stats:
         hib = s == THROUGHPUT
         e = estimate(*diffs(runs, pairs, s), hib)
@@ -252,11 +264,11 @@ def main(argv=None):
             if not balanced:
                 summary["rule_verdict"] = by_rule
             shown = summary["verdict"]
-        r = report(e, fl.get(s))
+        r = report(e, fl.get(s), hib)
         summary[s] = {k: round(x, 3) if isinstance(x, float) else x for k, x in r.items()}
         print(f"{s:<22} {num(r['effect_pct']):>9} {num(r['low_pct']):>9} {num(r['high_pct']):>9} "
               f"{'-' if e['df'] is None else e['df']:>3} {num(r['order_effect_pct'], 'not measured'):>13} "
-              f"{num(r['floor_pct']):>8}  {shown}", file=err)
+              f"{num(r['floor_pct']):>9} {num(r['floor_regressed_pct']):>9}  {shown}", file=err)
     print(json.dumps(summary, separators=(",", ":")))
 
     print(f"""
@@ -265,9 +277,13 @@ d is 100 * ln(candidate / baseline). With m1, v1, n1 the mean, sample variance a
 AB pairs and m2, v2, n2 over BA pairs: effect = (m1 + m2) / 2, se = sqrt(v1/n1 + v2/n2) / 2, and
 bound = t * se, with t the one-sided 99% Student-t value for the Welch-Satterthwaite degrees of
 freedom (df, rounded down). low and high are effect - bound and effect + bound.
-order: how much running second in a pair helped (half the gap between the two orders' means).
-floor: with -f, the A/A comparison's absolute effect plus its own bound.
-Effects, interval ends, order and floor are shown as percent changes.
+order: how much faster the second run of a pair was (from half the gap between the two orders'
+means); negative when the first run was faster.
+floor: with -f, the A/A comparison's absolute effect plus its own bound, on the log scale.
+imp_bar and reg_bar are the floor as the percent change each end of the interval must clear:
+for latency, improved needs high below imp_bar and regressed needs low above reg_bar; for
+throughput, improved needs low above imp_bar and regressed needs high below reg_bar.
+Effects, interval ends and order are shown as percent changes.
 Rule for the declared statistic: improved when the interval lies wholly on the better side of
 zero (lower latency, higher throughput) and, with -f, beyond the floor; regressed in the mirror
 case; otherwise inconclusive.""", file=err)
