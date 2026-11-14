@@ -437,7 +437,7 @@ pub mod parts {
     }
 
     pub fn run_maps(w: &Workload) -> Vec<OrderMap> {
-        let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::new()).collect();
+        let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::default()).collect();
         for &op in &w.map_ops {
             match op {
                 MapOp::Insert {
