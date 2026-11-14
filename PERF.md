@@ -203,7 +203,7 @@ No run of these four steps was flagged. The final build was faster in all twenty
 
 Guardrail: `book_mean_ns` −21.23%, interval −25.69% to −16.50%. The upper end is below +5%, so it passes, and the interval lies wholly below zero: the three changes together are visible end to end. One candidate run was flagged (pair 2, at −10.1%, the smallest gain); the other nine pairs lay between −18.5% and −24.1%. In the window the mean time of a book message was 655.3 ns for the baseline and 507.9 ns for the final build, and its median 499.6 ns and 362.5 ns (medians over the ten runs of each build). The golden replay hash of the final build was `58ff0163…f647`, unchanged, and its tests passed in the session.
 
-**Start against final: a book command is 38.4% faster (interval 38.1% to 38.8%), confirmed at 34.8% (31.9% to 37.5%), and a book message in the 09:30 to 10:00 window is 21.2% faster in the mean (16.5% to 25.7%).** The whole gain comes from the three kept changes; the array decoder, which was not kept, is not in the final build.
+**Start against final: a book command takes 38.4% less time (interval 38.1% to 38.8%), confirmed at 34.8% (31.9% to 37.5%), and a book message in the 09:30 to 10:00 window takes 21.2% less time in the mean (16.5% to 25.7%).** The whole gain comes from the three kept changes; the array decoder, which was not kept, is not in the final build.
 
 The whole-day benchmark ran three times for each build, the baseline's three runs first and then the final build's. The runs are not paired, so a drift of the machine between the two blocks is not controlled, and the baseline's three runs spread widely; the control loop's median was 228 ms in both blocks. These numbers are for information.
 
