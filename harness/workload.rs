@@ -442,8 +442,8 @@ pub mod parts {
         }
     }
 
-    /// The read folds of these adapters (the baseline's) over the whole workload, which the
-    /// derivation stores as [`Workload::final_reads`].
+    /// The read folds of these adapters over the whole workload, which the derivation stores as
+    /// [`Workload::final_reads`]. The adapters drive the parts this build contains.
     pub fn final_reads(w: &Workload) -> Reads {
         Reads {
             side: run_sides(w).1,

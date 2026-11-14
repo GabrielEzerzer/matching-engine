@@ -1,5 +1,8 @@
 //! Property tests for the ITCH 5.0 decoder: `decode` and `Frames` must return a result, never
-//! panic, on any bytes, and every result must agree with an independent reading of the spec.
+//! panic, on any bytes, and every result must agree with an oracle for the wire layout that is
+//! written apart from the decoder. For validation the oracle follows the parser's own contract:
+//! only the two constrained fields are checked, so any other field value is accepted and must
+//! round-trip.
 //!
 //! The oracle is two pieces written apart from `src/itch.rs`: `expected_error`, which says which
 //! error (if any) a message body must produce, from the spec's length table and its two
