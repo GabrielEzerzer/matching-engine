@@ -24,7 +24,8 @@ fn lim(id: OrderId, side: Side, price: Price, qty: Qty) -> Command {
 }
 
 /// Commands for two books covering resting, multi-level sweeps, partial and full fills, market
-/// orders, partial and full reduces, replaces (new id, same id, crossing) and every rejection.
+/// orders, partial and full reduces, replaces (new id, same id, crossing) and every rejection,
+/// ending with a partial fill and a partial reduce of orders that still rest.
 fn commands() -> Vec<(BookIdx, Command)> {
     vec![
         (0, lim(1, Buy, 10, 100)),
@@ -112,6 +113,8 @@ fn commands() -> Vec<(BookIdx, Command)> {
             },
         ),
         (1, Cancel { id: 3 }),
+        (1, lim(5, Buy, 498, 15)), // 25 of 4 left
+        (0, Reduce { id: 12, by: 4 }),
     ]
 }
 
@@ -171,6 +174,7 @@ fn derived_operations_rebuild_the_books_state() {
     let e = expected(&books);
     assert_eq!(w.final_orders, e.map.len());
     assert_eq!(w.final_levels, e.side_levels.len());
+    assert_eq!(w.final_shares, shares(&e));
     let created = w.final_levels
         + w.level_ops
             .iter()
@@ -256,7 +260,61 @@ fn derived_operations_rebuild_the_books_state() {
     }
     assert_eq!(
         workload::count_books(&replayed),
-        (w.final_orders, w.final_levels)
+        (w.final_orders, w.final_levels, w.final_shares)
+    );
+}
+
+fn shares(e: &Expected) -> u64 {
+    e.map.values().map(|&(_, _, qty)| u64::from(qty)).sum()
+}
+
+/// One map operation for each lookup `OrderBook::apply` makes in its order map.
+#[test]
+fn map_operations_follow_the_books_lookups() {
+    let cmds = [
+        (0, lim(1, Buy, 10, 5)), // duplicate check, insert
+        (0, lim(2, Buy, 10, 0)), // rejected for zero quantity before any lookup
+        (
+            0,
+            Market {
+                id: 3,
+                side: Sell,
+                qty: 0,
+            },
+        ), // likewise
+        (0, lim(4, Sell, 10, 7)), // duplicate check, fills maker 1 (get, remove), rests 2
+        (0, lim(5, Buy, 10, 1)), // duplicate check, partly fills maker 4 (get and update)
+    ];
+    let (w, _) = derive(&cmds);
+    use MapOp::{Get, Insert, Remove, Update};
+    assert_eq!(
+        w.map_ops,
+        [
+            Get { book: 0, id: 1 },
+            Insert {
+                book: 0,
+                id: 1,
+                side: Buy,
+                price: 10,
+                qty: 5
+            },
+            Get { book: 0, id: 4 },
+            Get { book: 0, id: 1 },
+            Remove { book: 0, id: 1 },
+            Insert {
+                book: 0,
+                id: 4,
+                side: Sell,
+                price: 10,
+                qty: 2
+            },
+            Get { book: 0, id: 5 },
+            Update {
+                book: 0,
+                id: 4,
+                qty: 1
+            },
+        ]
     );
 }
 
@@ -311,7 +369,7 @@ fn adapters_rebuild_the_books_state() {
     let level_parts = parts::run_levels(&w);
     assert_eq!(
         parts::count_levels(&level_parts),
-        (e.map.len(), e.side_levels.len())
+        (e.map.len(), e.side_levels.len(), shares(&e))
     );
     let mut levels: Vec<(Vec<OrderId>, u64)> = level_parts
         .iter()
@@ -321,7 +379,7 @@ fn adapters_rebuild_the_books_state() {
     levels.sort();
     assert_eq!(levels, e.queues);
     let maps = parts::run_maps(&w);
-    assert_eq!(parts::count_maps(&maps), e.map.len());
+    assert_eq!(parts::count_maps(&maps), (e.map.len(), shares(&e)));
     let got: HashMap<(BookIdx, OrderId), (Side, Price, Qty)> = maps
         .iter()
         .enumerate()
@@ -331,4 +389,22 @@ fn adapters_rebuild_the_books_state() {
         })
         .collect();
     assert_eq!(got, e.map);
+}
+
+/// The benchmark's check after each pass compares these share totals with the workload's, so an
+/// adapter that skipped quantity changes fails it.
+#[cfg(feature = "internals")]
+#[test]
+fn share_totals_catch_skipped_updates_and_reduces() {
+    use workload::parts;
+
+    let (mut w, _) = derive(&commands());
+    w.map_ops.retain(|op| !matches!(op, MapOp::Update { .. }));
+    assert_ne!(parts::count_maps(&parts::run_maps(&w)).1, w.final_shares);
+    w.level_ops
+        .retain(|op| !matches!(op, LevelOp::Reduce { .. }));
+    assert_ne!(
+        parts::count_levels(&parts::run_levels(&w)).2,
+        w.final_shares
+    );
 }

@@ -214,9 +214,12 @@ def main(argv=None):
     order = sorted((runs[p, role] for p in pairs for role in ("baseline", "candidate")),
                    key=lambda r: (r["pair"], r["position"]))
     if meta.get("part"):
-        sums = {r["workload_checksum"] for r in order}
-        if len(sums) != 1:
-            die(f"the runs report different workload checksums: {' '.join(sorted(sums))}")
+        # Runs that differ in any of these did not time the same work.
+        for key, what in (("workload_checksum", "workload checksums"), ("passes", "pass counts"),
+                          ("ops", "operation counts")):
+            values = {str(r[key]) for r in order}
+            if len(values) != 1:
+                die(f"the runs report different {what}: {' '.join(sorted(values))}")
         wall, cols = "timed_s", ["ns_per_op_median", "ns_per_op_min", "spread_pct", "allocs_per_op"]
     else:
         wall, cols = "latency_wall_s", ["all_p50_ns", "book_p50_ns", "book_p99_ns", "book_mean_ns"]

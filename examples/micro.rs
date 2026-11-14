@@ -17,18 +17,21 @@
 //! derived by replaying those commands through the real book and watching it from outside
 //! (`harness/workload.rs`), so the same workload can drive a rewritten part through its adapter.
 //! The first run derives the workload from FILE and caches it in `micro-cache/` beside FILE,
-//! keyed by its inputs; later runs load the cache. Preparation is never timed.
+//! keyed by its inputs; later runs load the cache and refuse it unless it encodes back to the
+//! same bytes. Preparation is never timed.
 //!
 //! The timed region is one pass over the part's whole workload from empty state. One untimed
 //! pass runs first, then `--passes` timed ones (a default per part keeps a run near fifteen
-//! seconds in all). The JSON line on stdout reports ns per operation as the median over the
-//! passes, the min, the max and the spread ((max - min) / median), the operation counts, the
-//! allocations per pass from a counting global allocator (the median over the passes, with the
-//! min and max: the order map's default hasher is seeded randomly per map, which moves where
+//! seconds in all), then two more untimed ones. The JSON line on stdout reports ns per
+//! operation as the median over the timed passes, the min, the max and the spread
+//! ((max - min) / median), the operation counts, the allocations per pass from a counting
+//! global allocator, and `workload_checksum`, a SHA-256 prefix of the part's workload: two runs
+//! with the same checksum ran the same operations. Allocations are counted in the three untimed
+//! passes only, so the timed passes pay nothing for the counting; the line gives their median,
+//! min and max (the order map's default hasher is seeded randomly per map, which moves where
 //! hashbrown rehashes in place instead of growing, so the count can differ by a few between
-//! passes), and `workload_checksum`, a SHA-256 prefix of the part's workload: two runs with the
-//! same checksum ran the same operations. After each pass the part's final state is checked
-//! against the counts the derivation recorded.
+//! passes). After each pass the part's final state is checked against the orders, levels and
+//! resting shares the derivation recorded.
 
 #[path = "../harness/host.rs"]
 mod host;
@@ -43,7 +46,7 @@ use std::hint::black_box;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use matching_engine::Command;
@@ -64,7 +67,7 @@ const PARSE_START: u64 = hms(9, 30, 0);
 /// Whole frames up to this many bytes, far more than the caches hold, as in the full replay.
 const PARSE_BYTES: u64 = 256 << 20;
 /// Bump when the derivation or the encoding changes, so old caches are not reused.
-const WORKLOAD_VERSION: u32 = 1;
+const WORKLOAD_VERSION: u32 = 2;
 
 const fn hms(h: u64, m: u64, s: u64) -> u64 {
     ((h * 60 + m) * 60 + s) * 1_000_000_000
@@ -78,25 +81,32 @@ const PARTS: [(&str, usize); 5] = [
     ("parse", 30),
 ];
 
-/// Counts every allocation and reallocation and the bytes they request, so the benchmark can
-/// report allocations per operation exactly.
+/// Counts every allocation and reallocation and the bytes they request while [`COUNTING`] is
+/// set, so the benchmark can report allocations per operation exactly. Counting is off during
+/// the timed passes, which then pay one relaxed load per allocation and nothing more.
 struct Counting;
 
+static COUNTING: AtomicBool = AtomicBool::new(false);
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn count(bytes: usize) {
+    if COUNTING.load(Relaxed) {
+        ALLOCS.fetch_add(1, Relaxed);
+        ALLOC_BYTES.fetch_add(bytes as u64, Relaxed);
+    }
+}
 
 // SAFETY: every method forwards to the system allocator with the caller's arguments unchanged;
 // the counters are plain atomics.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size() as u64, Relaxed);
+        count(layout.size());
         // SAFETY: forwarded unchanged; the caller upholds `alloc`'s contract.
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size() as u64, Relaxed);
+        count(layout.size());
         // SAFETY: forwarded unchanged.
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -105,8 +115,7 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        ALLOC_BYTES.fetch_add(new_size.saturating_sub(layout.size()) as u64, Relaxed);
+        count(new_size.saturating_sub(layout.size()));
         // SAFETY: forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -235,6 +244,7 @@ fn run(args: &Args) -> Result<String, String> {
                 args.passes,
                 w.side_ops.len(),
                 || parts::run_sides(w),
+                // Side operations carry no quantities: the levels a side holds stay empty.
                 |sides| expect("levels", parts::count_sides(sides), w.final_levels),
             )?;
             (digest(&[&s[0], &s[2]]), t, w.side_ops.len())
@@ -247,9 +257,10 @@ fn run(args: &Args) -> Result<String, String> {
                 w.level_ops.len(),
                 || parts::run_levels(w),
                 |levels| {
-                    let (orders, live) = parts::count_levels(levels);
+                    let (orders, live, shares) = parts::count_levels(levels);
                     expect("orders", orders, w.final_orders)?;
-                    expect("levels", live, w.final_levels)
+                    expect("levels", live, w.final_levels)?;
+                    expect("shares", shares, w.final_shares)
                 },
             )?;
             (digest(&[&s[0], &s[3]]), t, w.level_ops.len())
@@ -260,7 +271,11 @@ fn run(args: &Args) -> Result<String, String> {
                 args.passes,
                 w.map_ops.len(),
                 || parts::run_maps(w),
-                |maps| expect("orders", parts::count_maps(maps), w.final_orders),
+                |maps| {
+                    let (orders, shares) = parts::count_maps(maps);
+                    expect("orders", orders, w.final_orders)?;
+                    expect("shares", shares, w.final_shares)
+                },
             )?;
             (digest(&[&s[0], &s[4]]), t, w.map_ops.len())
         }
@@ -271,9 +286,10 @@ fn run(args: &Args) -> Result<String, String> {
                 w.commands.len(),
                 || workload::run_books(w),
                 |books| {
-                    let (orders, levels) = workload::count_books(books);
+                    let (orders, levels, shares) = workload::count_books(books);
                     expect("orders", orders, w.final_orders)?;
-                    expect("levels", levels, w.final_levels)
+                    expect("levels", levels, w.final_levels)?;
+                    expect("shares", shares, w.final_shares)
                 },
             )?;
             (digest(&[&s[0], &s[1]]), t, w.commands.len())
@@ -342,7 +358,7 @@ fn run(args: &Args) -> Result<String, String> {
     Ok(out.render())
 }
 
-fn expect(what: &str, got: usize, want: usize) -> Result<(), String> {
+fn expect<T: PartialEq + std::fmt::Display>(what: &str, got: T, want: T) -> Result<(), String> {
     if got == want {
         Ok(())
     } else {
@@ -359,11 +375,15 @@ struct Timing {
     control_ms_start: f64,
     ns_per_op: Vec<f64>,
     timed: Duration,
-    /// Allocations and allocated bytes of each timed pass.
+    /// Allocations and allocated bytes of each counted pass (the untimed ones).
     allocs: Vec<(u64, u64)>,
 }
 
-/// One untimed pass, then `passes` timed ones. Each pass starts from empty state; the state it
+/// Untimed passes that count allocations: the warm pass before the timed ones and the rest after.
+const COUNTED_PASSES: usize = 3;
+
+/// One untimed pass, then `passes` timed ones, then [`COUNTED_PASSES`] - 1 more untimed ones.
+/// Only the untimed passes count allocations. Each pass starts from empty state; the state it
 /// returns is checked and dropped outside the timed region.
 fn time_passes<S>(
     passes: usize,
@@ -374,23 +394,27 @@ fn time_passes<S>(
     let started = Instant::now();
     let loadavg_start = loadavg();
     let control_ms_start = control_ms();
-    let warm = pass();
+    let mut allocs = Vec::with_capacity(COUNTED_PASSES);
+    let (warm, a) = counted(&mut pass);
     check(&warm)?;
     drop(warm);
+    allocs.push(a);
     let mut ns_per_op = Vec::with_capacity(passes);
     let mut timed = Duration::ZERO;
-    let mut allocs = Vec::with_capacity(passes);
     for _ in 0..passes {
-        let (a0, b0) = (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed));
         let t0 = Instant::now();
         let state = pass();
         let dt = t0.elapsed();
-        let (a1, b1) = (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed));
         check(&state)?;
         drop(state);
         timed += dt;
         ns_per_op.push(dt.as_nanos() as f64 / ops.max(1) as f64);
-        allocs.push((a1 - a0, b1 - b0));
+    }
+    for _ in 1..COUNTED_PASSES {
+        let (state, a) = counted(&mut pass);
+        check(&state)?;
+        drop(state);
+        allocs.push(a);
     }
     Ok(Timing {
         started,
@@ -400,6 +424,17 @@ fn time_passes<S>(
         timed,
         allocs,
     })
+}
+
+/// Runs one pass with allocation counting on; returns its state and the allocations and bytes
+/// it made.
+fn counted<S>(pass: &mut impl FnMut() -> S) -> (S, (u64, u64)) {
+    let (a0, b0) = (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed));
+    COUNTING.store(true, Relaxed);
+    let state = pass();
+    COUNTING.store(false, Relaxed);
+    let (a1, b1) = (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed));
+    (state, (a1 - a0, b1 - b0))
 }
 
 fn run_parse(bytes: &[u8]) -> Result<usize, String> {
@@ -536,6 +571,14 @@ fn load_or_derive(file: &Path) -> Result<Cached, String> {
         let (sections, parse) =
             read_cache(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         let workload = codec::decode(&sections)?;
+        // A changed codec could otherwise decode other operations under the same checksum.
+        if codec::encode(&workload) != sections {
+            return Err(format!(
+                "{}: the cached workload does not encode back to the same bytes; \
+                 delete it or bump WORKLOAD_VERSION",
+                path.display()
+            ));
+        }
         return Ok(Cached {
             key,
             source: "loaded",

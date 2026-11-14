@@ -84,9 +84,10 @@ pub struct Workload {
     pub level_ops: Vec<LevelOp>,
     pub level_slots: usize,
     pub map_ops: Vec<MapOp>,
-    /// Orders and levels resting in all books after the last command; a replay of the
-    /// operations must end with the same counts.
+    /// Orders, shares and levels resting in all books after the last command; a replay of the
+    /// operations must end with the same totals.
     pub final_orders: usize,
+    pub final_shares: u64,
     pub final_levels: usize,
 }
 
@@ -124,6 +125,12 @@ impl Recorder {
     pub fn finish(mut self) -> Workload {
         self.w.final_levels = self.levels.len();
         self.w.final_orders = self.levels.values().map(|&(_, n)| n as usize).sum();
+        // Every share that rests is pushed onto a level and leaves it by a reduce or a removal.
+        self.w.final_shares = self.w.level_ops.iter().fold(0, |t, op| match *op {
+            LevelOp::Push { qty, .. } => t + u64::from(qty),
+            LevelOp::Reduce { qty, .. } | LevelOp::Remove { qty, .. } => t - u64::from(qty),
+            _ => t,
+        });
         self.w
     }
 
@@ -142,15 +149,23 @@ impl Recorder {
         let rejected = matches!(events.first(), Some(Event::Rejected { .. }));
         match cmd {
             Command::Limit {
-                id, side, price, ..
+                id,
+                side,
+                price,
+                qty,
             } => {
-                self.w.map_ops.push(MapOp::Get { book: b, id });
+                // The duplicate-id lookup; a zero quantity is rejected before it.
+                if qty != 0 {
+                    self.w.map_ops.push(MapOp::Get { book: b, id });
+                }
                 if !rejected {
                     self.submit(b, id, side, Some(price), events, book);
                 }
             }
-            Command::Market { id, side, .. } => {
-                self.w.map_ops.push(MapOp::Get { book: b, id });
+            Command::Market { id, side, qty } => {
+                if qty != 0 {
+                    self.w.map_ops.push(MapOp::Get { book: b, id });
+                }
                 if !rejected {
                     self.submit(b, id, side, None, events, book);
                 }
@@ -271,6 +286,11 @@ impl Recorder {
                     self.w.level_ops.push(LevelOp::Reduce { slot, qty });
                     if events.get(i + 1) == Some(&Event::Filled { id: maker_id }) {
                         self.w.level_ops.push(LevelOp::PopFront { slot });
+                        // The book looks the maker up to fill it, then removes it.
+                        self.w.map_ops.push(MapOp::Get {
+                            book: b,
+                            id: maker_id,
+                        });
                         self.w.map_ops.push(MapOp::Remove {
                             book: b,
                             id: maker_id,
@@ -340,18 +360,18 @@ pub fn run_books(w: &Workload) -> Vec<OrderBook> {
     books
 }
 
-/// Resting orders and levels over all books, for checking a replay against the workload.
-pub fn count_books(books: &[OrderBook]) -> (usize, usize) {
-    let mut orders = 0;
-    let mut levels = 0;
+/// Resting orders, levels and shares over all books, for checking a replay against the workload.
+pub fn count_books(books: &[OrderBook]) -> (usize, usize, u64) {
+    let (mut orders, mut levels, mut shares) = (0, 0, 0);
     for book in books {
         for side in [Side::Buy, Side::Sell] {
             let depth = book.depth(side);
             levels += depth.len();
             orders += depth.iter().map(|l| l.order_count).sum::<usize>();
+            shares += depth.iter().map(|l| l.total_qty).sum::<u64>();
         }
     }
-    (orders, levels)
+    (orders, levels, shares)
 }
 
 /// Adapters that drive the current parts with the logical operations. A round that changes a
@@ -408,11 +428,12 @@ pub mod parts {
         levels
     }
 
-    /// Orders queued in the levels, and levels that are not empty.
-    pub fn count_levels(levels: &[Level]) -> (usize, usize) {
+    /// Orders queued in the levels, levels that are not empty, and the sum of the level totals.
+    pub fn count_levels(levels: &[Level]) -> (usize, usize, u64) {
         let orders = levels.iter().map(Level::len).sum();
         let live = levels.iter().filter(|l| !l.is_empty()).count();
-        (orders, live)
+        let shares = levels.iter().map(Level::total).sum();
+        (orders, live, shares)
     }
 
     pub fn run_maps(w: &Workload) -> Vec<OrderMap> {
@@ -445,8 +466,15 @@ pub mod parts {
         maps
     }
 
-    pub fn count_maps(maps: &[OrderMap]) -> usize {
-        maps.iter().map(|m| m.len()).sum()
+    /// Orders in the maps and the sum of their quantities.
+    pub fn count_maps(maps: &[OrderMap]) -> (usize, u64) {
+        let orders = maps.iter().map(|m| m.len()).sum();
+        let shares = maps
+            .iter()
+            .flat_map(|m| m.values())
+            .map(|o| u64::from(o.qty))
+            .sum();
+        (orders, shares)
     }
 }
 
@@ -526,9 +554,11 @@ pub mod codec {
     /// The sections in a fixed order: header, book commands, side, level, map.
     pub fn encode(w: &Workload) -> [Vec<u8>; 5] {
         let mut h = W::default();
-        for v in [w.books, w.level_slots, w.final_orders, w.final_levels] {
+        for v in [w.books, w.level_slots, w.final_orders] {
             h.u64(v as u64);
         }
+        h.u64(w.final_shares);
+        h.u64(w.final_levels as u64);
 
         let mut c = W::default();
         c.u64(w.commands.len() as u64);
@@ -656,6 +686,7 @@ pub mod codec {
             books: h.len()?,
             level_slots: h.len()?,
             final_orders: h.len()?,
+            final_shares: h.u64()?,
             final_levels: h.len()?,
             ..Workload::default()
         };

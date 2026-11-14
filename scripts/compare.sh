@@ -16,7 +16,9 @@
 # -m PART compares microbenchmarks instead (examples/micro.rs; PART is side, level, orders, book or
 # parse): BASELINE and CANDIDATE are then the micro binaries scripts/bench-build.sh keeps beside
 # bench, each run is `micro PART`, and the statistics are ns_per_op_median and ns_per_op_min. All
-# runs must report the same workload_checksum.
+# runs must report the same workload_checksum, passes and ops. Before the pairs the baseline runs
+# once with one timed pass and its output discarded, so that a workload derived on first use is
+# derived and cached there, outside every recorded run.
 #
 # STAT, declared before the run, is the one statistic that gets a verdict, for example all_p50_ns.
 # Every other statistic is printed as information. Without -s there is no verdict.
@@ -58,7 +60,7 @@ rerun=""
 target=""
 window=""
 part=""
-usage() { sed -n '2,49p' "$0"; exit 2; }
+usage() { sed -n '2,51p' "$0"; exit 2; }
 while getopts "s:n:c:l:tw:m:f:r:h" opt; do
     case "$opt" in
         s) target="$OPTARG" ;;
@@ -141,6 +143,12 @@ echo "compare.sh: candidate $cand ($label_c)$([ "$aa" = true ] && echo ', identi
 echo "compare.sh: cpu $cpu, $pairs pairs, file $file${limit:+, limit $limit}${window:+, window $window}${part:+, microbenchmark $part}$([ "$tput" = 1 ] && echo ', with throughput pass')" >&2
 echo "compare.sh: declared statistic ${target:-none (no verdict)}${floor:+, floor from $floor}" >&2
 echo "compare.sh: kernel $(uname -r), load $(cut -d' ' -f1-3 /proc/loadavg)" >&2
+
+if [ -n "$part" ]; then
+    echo "compare.sh: one untimed baseline run first, so that every recorded run loads the cached workload" >&2
+    taskset -c "$cpu" "$base" "$part" --passes 1 --commit "$label_b" "$file" >/dev/null ||
+        die "the untimed baseline run failed"
+fi
 
 tflag="--no-throughput"
 [ "$tput" = 1 ] && tflag=""
