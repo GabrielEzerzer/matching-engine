@@ -224,33 +224,7 @@ pub fn decode(msg: &[u8]) -> Result<Message, ItchError> {
         timestamp: be48(msg, 5),
     };
     Ok(match kind {
-        b'S' => Message::SystemEvent {
-            header,
-            event: msg[11],
-        },
-        b'R' => Message::StockDirectory {
-            header,
-            stock: arr8(msg, 11),
-            market_category: msg[19],
-            financial_status: msg[20],
-            round_lot_size: be32(msg, 21),
-            round_lots_only: msg[25],
-            issue_classification: msg[26],
-            issue_subtype: [msg[27], msg[28]],
-            authenticity: msg[29],
-            short_sale_threshold: msg[30],
-            ipo_flag: msg[31],
-            luld_reference_price_tier: msg[32],
-            etp_flag: msg[33],
-            etp_leverage_factor: be32(msg, 34),
-            inverse_indicator: msg[38],
-        },
-        b'H' => Message::StockTradingAction {
-            header,
-            stock: arr8(msg, 11),
-            state: msg[19],
-            reason: [msg[21], msg[22], msg[23], msg[24]],
-        },
+        b'S' | b'R' | b'H' => decode_reference_data(kind, msg, header),
         b'A' | b'F' => Message::AddOrder {
             header,
             reference: be64(msg, 11),
@@ -302,6 +276,46 @@ pub fn decode(msg: &[u8]) -> Result<Message, ItchError> {
         },
         _ => Message::Other { kind, header },
     })
+}
+
+/// Decodes the system event, stock directory and stock trading action messages, which arrive
+/// about once per stock per day against hundreds of millions of order messages. They are kept
+/// out of line because their many one-byte fields, built in the same function as the order
+/// messages, make the compiler assemble every decoded message byte by byte. `msg` has been
+/// length-checked against `kind`.
+#[cold]
+#[inline(never)]
+fn decode_reference_data(kind: u8, msg: &[u8], header: Header) -> Message {
+    match kind {
+        b'S' => Message::SystemEvent {
+            header,
+            event: msg[11],
+        },
+        b'R' => Message::StockDirectory {
+            header,
+            stock: arr8(msg, 11),
+            market_category: msg[19],
+            financial_status: msg[20],
+            round_lot_size: be32(msg, 21),
+            round_lots_only: msg[25],
+            issue_classification: msg[26],
+            issue_subtype: [msg[27], msg[28]],
+            authenticity: msg[29],
+            short_sale_threshold: msg[30],
+            ipo_flag: msg[31],
+            luld_reference_price_tier: msg[32],
+            etp_flag: msg[33],
+            etp_leverage_factor: be32(msg, 34),
+            inverse_indicator: msg[38],
+        },
+        b'H' => Message::StockTradingAction {
+            header,
+            stock: arr8(msg, 11),
+            state: msg[19],
+            reason: [msg[21], msg[22], msg[23], msg[24]],
+        },
+        _ => unreachable!("only S, R and H are reference data"),
+    }
 }
 
 /// Splits the first frame off `buf`. Returns the message body and the number of bytes the frame
