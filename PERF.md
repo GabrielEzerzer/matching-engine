@@ -86,7 +86,7 @@ Session `stage3-book`, started 14 November 2026 at 04:56 UTC. Baseline `209e9e2`
 | Same binary twice | none | +0.23% | −0.75% to +1.23% | +0.64% | inconclusive, as it should be |
 | Confirming comparison | linked ring | −6.80% | −16.76% to +4.37% | −5.92% | inconclusive (2 flagged runs) |
 
-Not kept in this round: lazy removal (inconclusive) and the linked ring (confirmation inconclusive). The host was busy during the last two pairs of the confirmation; the other eight pairs lay between −9.3% and −11.1%. An inconclusive result is final for its round whatever the cause, so the guardrail and the golden check did not run. Measuring the linked ring again is a new round.
+Not kept in this round: lazy removal (inconclusive) and the linked ring (confirmation inconclusive). The host was busy during the last two pairs of the confirmation; the other eight pairs lay between −9.3% and −11.1%. An inconclusive result is final for its round whatever the cause, so the guardrail and the golden check did not run. The linked ring is being measured once more as round 2. The reason, written down before that round started, is that the control loop flagged two runs of the confirming comparison; the flag comes from the loop's own timing and not from the result.
 
 ### Instruction counts
 
