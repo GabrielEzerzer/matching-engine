@@ -70,7 +70,7 @@ cargo test --all-targets
 cargo test --all-targets --features internals
 ```
 
-CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` on every push to a branch other than `main`, without the `internals` feature. CI never sees the ITCH file. The golden check, the differential slice and the benchmark are local runs under Linux.
+CI runs `cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` both without and with `--features internals`, on every push to a branch other than `main`. CI never sees the ITCH file. The golden check, the differential slice and the benchmark are local runs under Linux.
 
 ## The ITCH data
 

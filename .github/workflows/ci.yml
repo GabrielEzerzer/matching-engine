@@ -1,7 +1,5 @@
-# CI for this repo, copied in by D:/code/setup/new-project.py. Rules: D:/code/CLAUDE.md, "Test suites".
-# It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
+# Runs on pushes to branches other than main and on manual dispatch, so each push starts one run
 # and a branch has results before its PR exists.
-# Never give this workflow production URLs, real secrets, .env.local or a service_role key.
 name: ci
 
 on:
@@ -30,6 +28,11 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
-      # Debug build on purpose: it keeps integer overflow checks on, and the suite runs in seconds.
+      - name: Clippy (internals)
+        run: cargo clippy --all-targets --features internals -- -D warnings
+      # Debug build on purpose: it keeps integer overflow checks on.
       - name: Test
         run: cargo test --all-targets
+      # The microbenchmark adapters and their tests need the internals feature.
+      - name: Test (internals)
+        run: cargo test --all-targets --features internals
