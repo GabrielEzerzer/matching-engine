@@ -30,7 +30,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (internals)
         run: cargo clippy --all-targets --features internals -- -D warnings
-      # Debug build on purpose: it keeps integer overflow checks on, and the suite runs in seconds.
+      # Debug build on purpose: it keeps integer overflow checks on.
       - name: Test
         run: cargo test --all-targets
       # The microbenchmark adapters and their tests need the internals feature.
