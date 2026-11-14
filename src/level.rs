@@ -217,10 +217,18 @@ impl Level {
             ));
         }
         let mut slot = self.sentinel;
-        for _ in 0..=self.len {
+        for step in 0..=self.len {
             let next = nodes.nodes[slot as usize].next;
             if !in_slab(next) || nodes.nodes[next as usize].prev != slot {
                 return Err(format!("queue links disagree after node {slot}"));
+            }
+            // Steps 0 to len - 1 reach the orders; only the last step may reach the sentinel.
+            // Without this a ring shorter than `len` could wrap round and still end on it.
+            if next == self.sentinel && step < self.len {
+                return Err(format!(
+                    "level's queue ring closes after {step} of its {} orders",
+                    self.len
+                ));
             }
             slot = next;
         }
@@ -389,5 +397,19 @@ mod tests {
         other.remove(11, 11);
         assert!(other.is_empty());
         f.assert_state(&[1, 3]);
+    }
+
+    #[test]
+    fn check_reports_a_ring_shorter_than_the_count() {
+        // Unlinking two of three nodes without telling the level leaves a ring of one order
+        // under a count of three. A walk of count + 1 steps round that ring of two nodes ends
+        // back on the sentinel, so only the early sentinel shows the missing orders.
+        let mut f = filled(1..=3);
+        for id in [2, 3] {
+            f.nodes.unlink(f.orders[&id].0);
+        }
+        assert_eq!(f.level.len(), 3);
+        let err = f.level.check(&f.nodes).unwrap_err();
+        assert!(err.contains("closes after 1 of its 3 orders"), "{err}");
     }
 }
