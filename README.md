@@ -140,3 +140,46 @@ When there are several alternatives for one part, each is compared once against 
 Over many rounds some kept changes will still be chance, and the effects reported for kept rounds are biased upward, because only the comparisons that came out well were kept. The unbiased figure for the whole exercise is one comparison of the starting commit against the final commit at the end.
 
 Why this procedure: an earlier version accepted a change when every pair agreed and the effect was larger than one A/A comparison's effect. That floor could be near zero by luck, agreement in five pairs happens by chance one time in 32 per statistic, eight statistics gave eight chances, and a round could be rerun until it agreed. The order advantage also made a real gain look worse in baseline-first pairs and better in candidate-first pairs, so it could never pass. The interval now comes from the repeated pairs themselves, the target is named in advance, a gain has to show up twice in separate blocks, and rerunning is counted.
+
+## Running the comparisons on Kaggle
+
+When the laptop is busy, its timings are not usable (the same binary can differ by a quarter between runs). `scripts/kaggle_bench.py` runs a fixed plan of comparisons on a Kaggle CPU session instead, as a private script kernel. It needs only the Python standard library and the `kaggle` CLI, logged in to the account that will own the run.
+
+A plan is a JSON file in `scripts/kaggle-plans/`. It names a base label, every label's branch, the CPU to pin to (`cpu`, default 3; a Kaggle CPU session has 4 vCPUs) and a stop time (`stop_after_min`, default 630, that is 10 h 30 min; Kaggle ends a session at 12 h), then the steps in order:
+
+- `aa`: `compare.sh -m PART` of the base against itself, the method check, which should come out `inconclusive`;
+- `compare`: `compare.sh -m PART` of the base against a candidate;
+- `confirm_best`: for a group of earlier `compare` steps (the alternatives for one part), the one with the best effect among those that came out `improved` is compared again with the same statistic and pair count. If that also says `improved`, it is the group's winner. If no alternative improved, nothing runs;
+- `window`: `compare.sh -w WINDOW` of the base's and the group winner's `bench` binaries;
+- `golden`: the golden check (`replay --check`) and `cargo test --all-targets` in the group winner's checkout;
+- `bench`: `scripts/bench.sh` of one label, for a baseline table.
+
+`window` and `golden` are skipped when their group has no winner. The plan puts the `confirm_best` steps after all the other comparisons, so each confirmation runs as a separate block, as "Procedure for optimisation rounds" requires.
+
+On Kaggle the kernel installs Rust with rustup (stable, minimal profile) into `/kaggle/tmp`, clones each label's branch from the bundle and checks it is at the commit recorded when the kernel was written, fetches the ITCH day into `/kaggle/tmp/itch` with the base checkout's `scripts/fetch-itch.sh`, and builds every label with its own `scripts/bench-build.sh`. Only after every build has finished does it run the steps, one at a time, with the base checkout's `scripts/compare.sh`. A failed step is recorded and the run goes on with the steps that do not depend on it. Everything it keeps is in `/kaggle/working/results`: `<step>.jsonl` (the script's stdout) and `<step>.err` for each step, `STATUS.json` (rewritten after every step), `SUMMARY.md` (one row per step), `host.txt` (`nproc`, `lscpu`, memory, kernel version and `rustc -vV`) and the setup and build logs.
+
+Check the plan, then write the dataset and kernel folders and push them (PowerShell; `kaggle datasets create` fails from Git Bash on Windows):
+
+```powershell
+python scripts/kaggle_bench.py --self-test
+python scripts/kaggle_bench.py --dry-run scripts/kaggle-plans/stage3.json   # validates and prints every command
+python scripts/kaggle_bench.py --write-kernel scripts/kaggle-plans/stage3.json $env:TEMP\me-bench-stage3 --owner KAGGLE_USER
+kaggle datasets create -p $env:TEMP\me-bench-stage3\src      # later runs of the same plan: kaggle datasets version -p ... -m "new commits"
+kaggle datasets status KAGGLE_USER/me-bench-stage3-src        # wait for "ready"
+kaggle kernels push -p $env:TEMP\me-bench-stage3\kernel
+```
+
+`--write-kernel` writes `src/` (a git bundle of exactly the branches the plan names, with `dataset-metadata.json`) and `kernel/` (this script with the plan and each branch's commit embedded, with `kernel-metadata.json`: private, CPU only, internet on, the dataset attached). The owner is `--owner` or `$KAGGLE_USERNAME`. Write the kernel again after any branch moves, and version the dataset with it, or the kernel refuses the checkout.
+
+Follow and fetch the run:
+
+```powershell
+kaggle kernels status KAGGLE_USER/me-bench-stage3
+kaggle kernels output KAGGLE_USER/me-bench-stage3 -p out\stage3
+```
+
+Kaggle keeps `/kaggle/working` when the run ends; while it runs, the kernel's log shows each step and its verdict as it finishes.
+
+The results are Linux timings from a shared cloud VM. The comparisons are relative, both binaries run in the same session on the same CPU, so their verdicts hold on that machine. Absolute numbers (ns per operation, latencies, throughput) belong to that machine only, and `SUMMARY.md` and `host.txt` say so; never set them beside laptop numbers.
+
+The kernel makes three kinds of request: rustup's installer from `https://sh.rustup.rs` (and the toolchain it downloads), crates.io through cargo, and the Nasdaq sample file through `scripts/fetch-itch.sh`, each with the tool's default user agent. The upload carries the plan and the bundle, which holds the named branches' history as git recorded it. Nothing else identifying is sent beyond the Kaggle account the CLI is logged in to, and the script never reads the CLI's credentials file.
