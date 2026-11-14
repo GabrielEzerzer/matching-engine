@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use crate::types::{OrderId, Price, Qty, Side};
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RestingOrder {
-    pub(crate) side: Side,
-    pub(crate) price: Price,
-    pub(crate) qty: Qty,
+pub struct RestingOrder {
+    pub side: Side,
+    pub price: Price,
+    pub qty: Qty,
 }
 
 /// Iteration order of this map never reaches the output: every query walks the levels instead.
-pub(crate) type OrderMap = HashMap<OrderId, RestingOrder>;
+pub type OrderMap = HashMap<OrderId, RestingOrder>;

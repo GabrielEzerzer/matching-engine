@@ -22,6 +22,15 @@ pub mod replay;
 mod side;
 mod types;
 
+/// The book's parts, exposed only with the `internals` feature so that `examples/micro.rs` can
+/// time each one on its own. Not part of the stable API: these types change between rounds.
+#[cfg(feature = "internals")]
+pub mod internals {
+    pub use crate::level::Level;
+    pub use crate::orders::{OrderMap, RestingOrder};
+    pub use crate::side::BookSide;
+}
+
 pub use book::OrderBook;
 pub use types::{
     Command, Event, LevelDepth, LevelSnapshot, OrderId, OrderInfo, Price, Qty, RejectReason, Side,
