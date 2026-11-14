@@ -412,4 +412,30 @@ mod tests {
         let err = f.level.check(&f.nodes).unwrap_err();
         assert!(err.contains("closes after 1 of its 3 orders"), "{err}");
     }
+
+    #[test]
+    fn check_reports_a_ring_longer_than_the_count() {
+        // Removing an order from the level's count without unlinking its node leaves a ring of
+        // three orders under a count of two. A walk of count + 1 steps stops on the third order,
+        // short of the sentinel.
+        let mut f = filled(1..=3);
+        f.level.remove(3, 3);
+        assert_eq!(f.level.len(), 2);
+        let err = f.level.check(&f.nodes).unwrap_err();
+        assert!(err.contains("does not close after 2 orders"), "{err}");
+    }
+
+    #[test]
+    fn check_reports_a_back_link_that_disagrees() {
+        // Pointing the third order's back link at the first order breaks the ring in one
+        // direction only. The forward walk is intact, so only the back link check sees it.
+        let mut f = filled(1..=3);
+        let (first, second, third) = (f.orders[&1].0, f.orders[&2].0, f.orders[&3].0);
+        f.nodes.nodes[third as usize].prev = first;
+        let err = f.level.check(&f.nodes).unwrap_err();
+        assert!(
+            err.contains(&format!("queue links disagree after node {second}")),
+            "{err}"
+        );
+    }
 }

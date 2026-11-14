@@ -602,6 +602,38 @@ fn frames_end_on_bad_prefixes_without_looping() {
     assert_eq!(Frames::new(&[]).next(), None);
 }
 
+#[test]
+fn frames_report_a_full_65535_byte_body_as_a_length_error() {
+    // The generators never build a body this long, and the `0xffff` prefix above is always
+    // truncated. Here the whole body is present, so the frame splits and the decoder reports
+    // the length, alone and after a whole frame.
+    let good = frame(&[b'S', 0, 1, 0, 2, 0, 0, 0, 0, 0, 3, b'O']);
+    let first = Frames::new(&good).next().unwrap().unwrap();
+    let mut body = vec![0u8; 0xffff];
+    body[0] = b'S';
+    let tail = frame(&body);
+    assert_eq!(&tail[..2], [0xff, 0xff]);
+    let bad = ItchError::BadLength {
+        kind: b'S',
+        expected: 12,
+        actual: 65_535,
+    };
+
+    let mut frames = Frames::new(&tail);
+    assert_eq!(frames.next(), Some(Err(bad)));
+    assert_eq!(frames.next(), None);
+    assert_eq!(frames.offset(), 0);
+    check_frames(&tail);
+
+    let stream = [&good[..], &tail].concat();
+    let mut frames = Frames::new(&stream);
+    assert_eq!(frames.next(), Some(Ok(first)));
+    assert_eq!(frames.next(), Some(Err(bad)));
+    assert_eq!(frames.next(), None);
+    assert_eq!(frames.offset(), good.len());
+    check_frames(&stream);
+}
+
 /// Proves the generators reach every outcome the properties are meant to cover.
 #[test]
 fn generators_hit_every_outcome() {
