@@ -4,7 +4,7 @@ A price-time priority order-matching engine in Rust. A deliberately slow referen
 
 ## Current state
 
-The work ran in three stages, all finished. Stage 1 built a correct, unoptimised order book and the reference book that checks it. Stage 2 built the rig that makes measurements trustworthy: an ITCH 5.0 parser, a replay driver, a golden hash of the whole day's output, differential checks and a latency benchmark. Stage 3 tried optimisations one part at a time under a rule fixed before any numbers were seen, and kept three of them. `PERF.md` records every round, kept or not.
+The work ran in three stages, all finished. Stage 1 built a correct, unoptimised order book and the reference book that checks it. Stage 2 built the rig that makes measurements trustworthy: an ITCH 5.0 parser, a replay driver, a golden hash of the whole day's output, differential checks and a latency benchmark. Stage 3 tried optimisations one part at a time under a rule fixed before any numbers were seen, and kept three of them.
 
 ### How correctness is checked
 
@@ -24,7 +24,7 @@ Median of three whole-day runs of the final build (`2c792ab`) on one pinned vCPU
 | Throughput, one vCPU | 1.78 million messages per second |
 | Book command, final build against the unoptimised stage 2 build | 38.4% less time (98% interval 38.1% to 38.8%) |
 
-What is timed: each message on its own, from splitting its frame off an in-memory buffer through decoding it and applying it to its book, matching included. Messages run back to back; the file is read in 64 MiB chunks outside the timed regions. The timer's own cost, about 20 ns on that machine, is included in every latency. Throughput comes from a separate pass with no per-message timer. The last row compares the final build with the unoptimised stage 2 code (`f84e022`) on 2,922,290 pre-decoded commands of six busy symbols, in 10 alternating pairs; a second comparison in the same session confirmed it at 34.8%. `PERF.md` has the ranges of the runs, the other statistics and each round.
+What is timed: each message on its own, from splitting its frame off an in-memory buffer through decoding it and applying it to its book, matching included. Messages run back to back; the file is read in 64 MiB chunks outside the timed regions. The timer's own cost, about 20 ns on that machine, is included in every latency. Throughput comes from a separate pass with no per-message timer. The last row compares the final build with the unoptimised stage 2 code (`f84e022`) on 2,922,290 pre-decoded commands of six busy symbols, in 10 alternating pairs; a second comparison in the same session confirmed it at 34.8%.
 
 These numbers are not directly comparable with the messages-per-second figures that ITCH book-building replays publish. Those replays rebuild the book from Nasdaq's executions without matching and divide wall time by the message count. Here matching runs throughout, the latency rows time each message separately, and the throughput pass times only parsing and applying from memory, leaving file reads out. Several published engines report higher throughput than this one.
 
