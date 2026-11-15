@@ -51,6 +51,7 @@ class Layers(unittest.TestCase):
     def test_itch_standalone(self):
         self.check("layers-itch-standalone", [
             ("src/itch.rs", "use crate::types::Side;\n"),
+            ("src/itch.rs", "mod helpers {\n    use crate::types::Side;\n}\n"),
         ], [
             ("src/itch.rs", "use std::fmt;\npub(crate) fn f() {}\nmod tests {\n    use super::*;\n}\n"),
         ])

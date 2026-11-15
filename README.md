@@ -79,6 +79,7 @@ The ITCH parser (`itch`):
 
 - A stream is a sequence of frames, each a 2-byte big-endian length followed by that many bytes of message. Nothing allocates; decoded fields are integers and byte arrays copied out of the input.
 - `decode` takes the bytes after the length prefix and checks errors in this order: an empty body is `Empty`, an unknown type byte is `UnknownType` whatever the length, a length that does not match the type is `BadLength`, and only a message of the right length can be `BadField`.
+- `decode` never panics. It reads a message's fields only after checking the body's length against its type, so every field read is in bounds.
 - `message_length` counts the type byte and not the length prefix.
 - `split_frame` returns `Ok(None)` for an empty buffer and `Truncated` when the buffer ends inside a frame.
 - `Frames` yields one `Truncated` error for a trailing partial frame and ends; any other error also ends it. `Frames::offset` counts the bytes of the frames returned so far, so a chunked reader can carry a partial frame over.
@@ -92,7 +93,7 @@ The replay driver (`replay`):
 - A `C` execution's price is ignored: the aggressor trades at the resting order's price, and `c_price_differs` counts how often the two differ.
 - `R` records a locate's symbol and `H` its trading state; no other non-order message changes a book.
 - An execution falls back to `Reduce`, counted in `exec_fallback_*`, when the named order rests at a price worse than its side's best (`not_best_price`), at the best price behind an older order (`behind_at_best`), is not in the book (`unknown`), has fewer shares left than the execution (`too_large`), or the execution is for zero shares (`zero_shares`).
-- A security counts as trading when its last `H` state was `T` or no `H` has arrived for it yet.
+- Only an explicit halted (`H`), paused (`P`) or quotation-only (`Q`) state counts as not trading. A security whose last `H` state was `T` or any other byte, or that has had no `H` yet, counts as trading.
 - `rejections` is indexed by command kind (`CommandKind::ALL`) and reason (zero quantity, duplicate order id, unknown order, reduce too large); read it with `Stats::rejections_for`.
 - `books` returns every book up to the highest locate that has received a command, by ascending locate; locates that never received one have empty books.
 
@@ -114,7 +115,7 @@ cargo test --all-targets
 cargo test --all-targets --features internals
 ```
 
-CI runs the comment-ban lint (`python3 setup/lint/ratchet`, see `setup/lint/README.md`, with the layer rules in `setup/lint/rules/matching-engine-layers.yml`), the lint pack's tests (`python3 -m unittest discover -s setup/lint/tests`) and `python3 scripts/test_compare_summary.py`, then `cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` both without and with `--features internals`, on every push to a branch other than `main`. CI never sees the ITCH file. The golden check, the differential slice and the benchmark are local runs under Linux.
+CI runs the comment-ban lint (`python3 setup/lint/ratchet`, see `setup/lint/README.md`, with the layer rules in `setup/lint/rules/matching-engine-layers.yml`), the lint pack's tests (`python3 -m unittest discover -s setup/lint/tests`), `python3 scripts/test_compare_summary.py` and `python3 scripts/kaggle_bench.py --self-test`, then `cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` both without and with `--features internals`, on every push to a branch other than `main`. CI never sees the ITCH file. The golden check, the differential slice and the benchmark are local runs under Linux.
 
 ## The ITCH data
 

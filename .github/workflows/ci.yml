@@ -33,7 +33,9 @@ jobs:
       - name: Lint pack tests
         run: PATH="$RUNNER_TEMP/lint/bin:$PATH" python3 -m unittest discover -s setup/lint/tests
       - name: Script tests
-        run: python3 scripts/test_compare_summary.py
+        run: |
+          python3 scripts/test_compare_summary.py
+          python3 scripts/kaggle_bench.py --self-test
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

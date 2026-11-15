@@ -92,7 +92,8 @@ mod tests {
             let buckets: HashSet<u64> = hashes.iter().map(|h| h & 1023).collect();
             assert!(
                 buckets.len() > 560,
-                "seed {seed:#x}: {} of 1024 buckets used",
+                "seed {seed:#x}: {} of 1024 buckets used, want over 560: 1024 random keys fill about \
+                 1 - 1/e = 63% of 1024 buckets",
                 buckets.len()
             );
             let tags: HashSet<u64> = hashes.iter().map(|h| h >> 57).collect();

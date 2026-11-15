@@ -1,5 +1,6 @@
 //! The golden replay hash: SHA-256 over every event and periodic full-state checkpoints of every book.
 //! The byte encoding is specified in README.md under "Checking the golden hash".
+//! `with_period` lets tests reach the periodic checkpoints in a few messages; the golden value always uses `PERIOD`.
 
 use matching_engine::itch::{Locate, Message};
 use matching_engine::replay::Replay;

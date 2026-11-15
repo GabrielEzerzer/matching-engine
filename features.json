@@ -52,7 +52,8 @@
       "entry_point": "examples/replay.rs",
       "inputs": "An ITCH 5.0 file, optionally a golden file",
       "outputs": "Summary lines and the replay hash on stdout; with --check, exit status 1 and the differing lines on any difference",
-      "test": "tests/golden.rs"
+      "test": "none",
+      "debt_issue": 36
     },
     {
       "name": "Differential replay against the reference book",
@@ -91,7 +92,8 @@
       "entry_point": "examples/micro.rs",
       "inputs": "A part name and an ITCH 5.0 file; a workload cache in micro-cache/ beside the file",
       "outputs": "One JSON line with ns per operation, operation and allocation counts and the workload checksum",
-      "test": "tests/workload.rs"
+      "test": "none",
+      "debt_issue": 36
     },
     {
       "name": "Keep benchmark binaries",

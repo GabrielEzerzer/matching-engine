@@ -11,3 +11,6 @@
 *.NASDAQ_ITCH50.gz
 *.NASDAQ_ITCH50.tmp
 /data
+
+# Python bytecode the lint-pack and script tests write
+__pycache__/

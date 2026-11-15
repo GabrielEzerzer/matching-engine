@@ -386,6 +386,15 @@ fn length_table_matches_the_spec() {
     }
 }
 
+fn named<const N: usize>(names: [&str; N], counts: [u32; N]) -> String {
+    let parts: Vec<String> = names
+        .iter()
+        .zip(counts)
+        .map(|(name, n)| format!("{name} {n}"))
+        .collect();
+    parts.join(", ")
+}
+
 fn templates() -> Vec<Vec<u8>> {
     let mut runner = TestRunner::deterministic();
     SPEC.iter()
@@ -466,7 +475,19 @@ fn every_single_byte_change_of_a_valid_message_is_decoded_consistently() {
             m[at] = original;
         }
     }
-    assert!(type_changes.iter().all(|&n| n > 0), "{type_changes:?}");
+    assert!(
+        type_changes.iter().all(|&n| n > 0),
+        "a changed type byte must reach every outcome: {}",
+        named(
+            [
+                "unknown type",
+                "bad length",
+                "decoded at the same length",
+                "bad field"
+            ],
+            type_changes
+        )
+    );
 }
 
 #[test]
@@ -615,7 +636,25 @@ fn generators_hit_every_outcome() {
             Some(ItchError::BadField { .. }) => 5,
         }] += 1;
     }
-    println!("decode outcomes {decoded:?}, stream ends {ends:?}");
-    assert!(decoded.iter().all(|&n| n >= 1), "decode: {decoded:?}");
-    assert!(ends.iter().all(|&n| n >= 1), "streams: {ends:?}");
+    let decoded_text = named(
+        ["ok", "empty", "unknown type", "bad length", "bad field"],
+        decoded,
+    );
+    let ends_text = named(
+        [
+            "clean end",
+            "truncated",
+            "empty frame",
+            "unknown type",
+            "bad length",
+            "bad field",
+        ],
+        ends,
+    );
+    println!("decode outcomes: {decoded_text}; stream ends: {ends_text}");
+    assert!(
+        decoded.iter().all(|&n| n >= 1),
+        "decode outcomes: {decoded_text}"
+    );
+    assert!(ends.iter().all(|&n| n >= 1), "stream ends: {ends_text}");
 }
