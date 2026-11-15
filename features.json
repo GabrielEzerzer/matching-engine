@@ -1,0 +1,155 @@
+{
+  "features": [
+    {
+      "name": "Order book commands",
+      "description": "Send limit and market orders, cancels, reduces and replaces to a single-instrument price-time priority book.",
+      "command": "matching_engine::OrderBook::apply",
+      "entry_point": "src/book.rs",
+      "inputs": "A Command (Limit, Market, Cancel, Reduce or Replace)",
+      "outputs": "Events appended to a caller-owned Vec<Event>: accepted, trades, fills, cancels, reductions, replacements, rejections",
+      "test": "tests/book.rs"
+    },
+    {
+      "name": "Order book queries",
+      "description": "Read the best bid and ask, depth per level, a full snapshot, one resting order and the order with time priority.",
+      "command": "matching_engine::OrderBook::{best_bid, best_ask, depth, snapshot, order, front_order}",
+      "entry_point": "src/book.rs",
+      "inputs": "A side or an order id",
+      "outputs": "Prices, LevelDepth list, Snapshot, OrderInfo or an order id",
+      "test": "tests/book.rs"
+    },
+    {
+      "name": "Book invariant check",
+      "description": "Check that the book is not crossed and that its levels, queues and id map agree.",
+      "command": "matching_engine::OrderBook::check_invariants",
+      "entry_point": "src/book.rs",
+      "inputs": "An OrderBook",
+      "outputs": "Ok, or an error message naming the broken invariant",
+      "test": "tests/prop.rs"
+    },
+    {
+      "name": "ITCH 5.0 parser",
+      "description": "Split length-prefixed ITCH 5.0 frames and decode each message without allocating.",
+      "command": "matching_engine::itch::{decode, split_frame, Frames}",
+      "entry_point": "src/itch.rs",
+      "inputs": "Bytes of ITCH 5.0 frames",
+      "outputs": "Message values, or an ItchError for a truncated, empty, unknown, wrong-length or invalid message",
+      "test": "tests/itch_prop.rs"
+    },
+    {
+      "name": "ITCH replay driver",
+      "description": "Drive one order book per stock locate from ITCH messages, replaying executions as aggressor orders.",
+      "command": "matching_engine::replay::Replay::apply",
+      "entry_point": "src/replay.rs",
+      "inputs": "Decoded ITCH messages in stream order",
+      "outputs": "The command and events of each message, per-book state and the replay counters (Stats)",
+      "test": "tests/replay.rs"
+    },
+    {
+      "name": "Golden replay check",
+      "description": "Replay a whole ITCH day, print the summary counts and the replay hash, and record or check them against a golden file.",
+      "command": "cargo run --release --example replay -- [--write GOLDEN | --check GOLDEN] [--limit N] [--diagnose] FILE",
+      "entry_point": "examples/replay.rs",
+      "inputs": "An ITCH 5.0 file, optionally a golden file",
+      "outputs": "Summary lines and the replay hash on stdout; with --check, exit status 1 and the differing lines on any difference",
+      "test": "tests/golden.rs"
+    },
+    {
+      "name": "Differential replay against the reference book",
+      "description": "Replay the book commands of chosen symbols through the real book and the slow reference book and compare every event.",
+      "command": "cargo run --release --example diff_slice -- [--symbols A,B,...] [--limit N] [--snapshot-every K] FILE",
+      "entry_point": "examples/diff_slice.rs",
+      "inputs": "An ITCH 5.0 file",
+      "outputs": "A per-book report; exit status 1 with the command and both event lists on the first difference",
+      "test": "none",
+      "debt_issue": 36
+    },
+    {
+      "name": "Latency and throughput benchmark",
+      "description": "Time every message of the ITCH day through the replay and measure throughput, as one JSON line per run.",
+      "command": "cargo run --release --example bench -- [--limit N] [--window HH:MM:SS-HH:MM:SS] [--commit LABEL] [--no-throughput] [--allow-non-linux] FILE",
+      "entry_point": "examples/bench.rs",
+      "inputs": "An ITCH 5.0 file",
+      "outputs": "One JSON line with latency percentiles, throughput, timer cost and host readings",
+      "test": "none",
+      "debt_issue": 36
+    },
+    {
+      "name": "Repeated benchmark runs",
+      "description": "Run the benchmark several times pinned to one CPU and summarise the runs.",
+      "command": "scripts/bench.sh [-n RUNS] [-c CPU] [-l LIMIT] [FILE]",
+      "entry_point": "scripts/bench.sh",
+      "inputs": "An ITCH 5.0 file (default $ITCH_DIR/12302019.NASDAQ_ITCH50)",
+      "outputs": "One JSON line per run and a summary JSON line on stdout; a table on stderr",
+      "test": "none",
+      "debt_issue": 36
+    },
+    {
+      "name": "Microbenchmarks of the book's parts",
+      "description": "Time one part of the book (side, level, orders, book or parse) on a workload derived from the real day.",
+      "command": "cargo run --release --features internals --example micro -- side|level|orders|book|parse [--passes N] [--commit LABEL] [--allow-non-linux] FILE",
+      "entry_point": "examples/micro.rs",
+      "inputs": "A part name and an ITCH 5.0 file; a workload cache in micro-cache/ beside the file",
+      "outputs": "One JSON line with ns per operation, operation and allocation counts and the workload checksum",
+      "test": "tests/workload.rs"
+    },
+    {
+      "name": "Keep benchmark binaries",
+      "description": "Build the release benchmark and microbenchmarks for the current checkout and keep copies for later comparisons.",
+      "command": "scripts/bench-build.sh [LABEL]",
+      "entry_point": "scripts/bench-build.sh",
+      "inputs": "The current checkout; BENCH_BINS (default $HOME/bench-bins)",
+      "outputs": "$BENCH_BINS/LABEL/bench and micro with commit.txt, build.txt and settings.txt",
+      "test": "none",
+      "debt_issue": 36
+    },
+    {
+      "name": "Compare two builds",
+      "description": "Run a baseline and a candidate binary in alternating pairs and give a verdict on one declared statistic.",
+      "command": "scripts/compare.sh [-s STAT] [-n PAIRS] [-c CPU] [-l LIMIT] [-t] [-w WINDOW] [-m PART] [-f FLOOR] BASELINE CANDIDATE [FILE]",
+      "entry_point": "scripts/compare.sh",
+      "inputs": "Two bench or micro binaries and an ITCH 5.0 file",
+      "outputs": "Run lines, per-pair differences and a summary line with the verdict on stdout; tables on stderr",
+      "test": "none",
+      "debt_issue": 36
+    },
+    {
+      "name": "Comparison summary",
+      "description": "Recompute a comparison's effects, intervals and verdict from its saved run lines.",
+      "command": "python3 scripts/compare_summary.py [--check] [-s STAT] [-f FLOOR] RUNS",
+      "entry_point": "scripts/compare_summary.py",
+      "inputs": "A file of compare.sh run lines with one metadata or summary line",
+      "outputs": "Per-pair difference lines and a summary line on stdout; tables on stderr; exit status 2 on a refusal",
+      "test": "scripts/test_compare_summary.py"
+    },
+    {
+      "name": "Fetch the ITCH sample day",
+      "description": "Download, verify and decompress the public Nasdaq TotalView-ITCH 5.0 sample for 30 December 2019.",
+      "command": "scripts/fetch-itch.sh [DIR]",
+      "entry_point": "scripts/fetch-itch.sh",
+      "inputs": "A target folder (default $ITCH_DIR)",
+      "outputs": "12302019.NASDAQ_ITCH50.gz and the decompressed file, checked against the pinned size and SHA-256",
+      "test": "none",
+      "debt_issue": 36
+    },
+    {
+      "name": "Benchmark commit label",
+      "description": "Print the checkout's commit as a benchmark label, with -dirty for uncommitted tracked changes.",
+      "command": "scripts/commit-label.sh",
+      "entry_point": "scripts/commit-label.sh",
+      "inputs": "The current checkout",
+      "outputs": "The full commit SHA, optionally with -dirty, or unknown",
+      "test": "none",
+      "debt_issue": 36
+    },
+    {
+      "name": "Benchmark comparisons on Kaggle",
+      "description": "Validate a plan of comparisons, package it as a Kaggle kernel and run it on a Kaggle CPU session.",
+      "command": "python3 scripts/kaggle_bench.py --write-kernel PLAN DIR [--owner NAME] | --dry-run PLAN | --self-test",
+      "entry_point": "scripts/kaggle_bench.py",
+      "inputs": "A plan in scripts/kaggle-plans/ and the git branches it names",
+      "outputs": "Dataset and kernel folders to upload; on Kaggle, results/ with per-step output, STATUS.json and SUMMARY.md",
+      "test": "scripts/kaggle_bench.py"
+    }
+  ]
+}

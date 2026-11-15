@@ -1,39 +1,8 @@
 #!/usr/bin/env python3
-# Runs a plan of benchmark comparisons on a Kaggle CPU session. One file is both the local
-# packager and the kernel: --write-kernel writes the dataset and kernel folders that the kaggle
-# CLI uploads, and the kernel's copy (this file with the plan embedded) runs the plan on Kaggle.
-#
-#   python scripts/kaggle_bench.py --write-kernel PLAN DIR [--owner NAME]
-#   python scripts/kaggle_bench.py --dry-run PLAN
-#   python scripts/kaggle_bench.py --self-test
-#
-# --write-kernel writes DIR/src (a git bundle with dataset-metadata.json) and DIR/kernel (the
-# kernel's code with the plan and the commit ids embedded, with kernel-metadata.json: a private
-# script kernel, CPU only, internet on, DIR/src's dataset attached). The bundle holds no history:
-# for each branch the plan names, one commit of that branch's tree with no parent, author and
-# committer "bench <bench@localhost>", a fixed date and a fixed message, under
-# refs/kaggle-bundle/<branch>. The real commit ids travel only in the plan, so STATUS.json and
-# SUMMARY.md report them. The Kaggle owner is --owner or $KAGGLE_USERNAME.
-#
-# On Kaggle (run with no arguments under /kaggle) the kernel installs Rust with rustup into
-# /kaggle/tmp, fetches each label's branch from the bundle and checks it is at the embedded bundle
-# commit, fetches the ITCH day with the base checkout's scripts/fetch-itch.sh into /kaggle/tmp/itch,
-# builds every label with that label's scripts/bench-build.sh (then writes the real commit into the
-# build's commit.txt, which compare.sh passes to the binaries), and only then runs the plan's steps
-# one at a time with the base checkout's scripts/compare.sh (bench.sh for `bench` steps, whose
-# output gets the real commit in place of the bundle commit). Every command stops at a hard limit
-# of 700 minutes from kernel start. Each step's stdout goes to /kaggle/working/results/<step>.jsonl
-# and stderr to <step>.err; STATUS.json and SUMMARY.md are rewritten every time the status changes.
-# Before setup the kernel writes plan.json (the plan as it runs, defaults filled in); STATUS.json and
-# SUMMARY.md carry the session id (<plan name>-<UTC start as YYYYMMDDTHHMMSSZ>) and the SHA-256 of
-# this file as it runs. Each label that built gets its settings.txt and build.txt copied to
-# build-<label>-settings.txt and build-<label>-build.txt. Each step that runs a comparison or bench.sh
-# records the pinned CPU's steal and total jiffies from /proc/stat across the step and its wall
-# seconds; the readings are informational and never change a state, a verdict or a winner.
-# BENCHMARKING.md, "Running the comparisons on Kaggle", describes the plan format and the step kinds.
-#
-# KAGGLE_BENCH_ROOT (default /kaggle) moves the kernel's root, for trying the kernel elsewhere.
-# Standard library only.
+# Runs a plan of benchmark comparisons on a Kaggle CPU session. One file is both the local packager and the kernel:
+# --write-kernel writes the folders the kaggle CLI uploads, and the kernel's copy, with the plan embedded, runs it.
+# BENCHMARKING.md, "Running the comparisons on Kaggle", describes the plan format, the steps and the outputs.
+
 import argparse
 import ast
 import contextlib
@@ -55,29 +24,29 @@ import unittest.mock
 from pathlib import Path, PurePath, PurePosixPath
 from types import SimpleNamespace
 
-PLAN = None  # --write-kernel replaces this line in the kernel's copy
+PLAN = None
 
 KINDS = ("aa", "compare", "confirm_best", "window", "golden", "bench")
 PARTS = ("side", "level", "orders", "book", "parse")
 MICRO_STATS = ("ns_per_op_median", "ns_per_op_min")
 WINDOW_STATS = tuple(f"{s}_{q}_ns" for s in ("all", "book") for q in ("mean", "p50", "p99", "p999"))
 DEFAULT_CPU = 3
-DEFAULT_STOP_MIN = 630  # 10 h 30 min; Kaggle ends a session at 12 h
-HARD_STOP_MIN = 700  # no command runs past this many minutes from kernel start
-SEPARATING_KINDS = ("aa", "bench", "window")  # with a compare outside the group: see separators()
+DEFAULT_STOP_MIN = 630
+HARD_STOP_MIN = 700
+SEPARATING_KINDS = ("aa", "bench", "window")
 BUNDLE_REF = "refs/kaggle-bundle/"
 BUNDLE_ENV = {"GIT_AUTHOR_NAME": "bench", "GIT_AUTHOR_EMAIL": "bench@localhost",
               "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000", "GIT_COMMITTER_NAME": "bench",
               "GIT_COMMITTER_EMAIL": "bench@localhost", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000"}
 BUNDLE_MESSAGE = "benchmark snapshot"
-MIN_FREE_GB = 40  # ITCH (12 GB with the .gz), a release target per label, test builds
+MIN_FREE_GB = 40
 ITCH_NAME = "12302019.NASDAQ_ITCH50"
 GOLDEN = "harness/golden/12302019.txt"
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 LABEL_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
 WINDOW_RE = re.compile(r"\d\d:\d\d:\d\d-\d\d:\d\d:\d\d")
 
-PROC_STAT = Path("/proc/stat")  # the self-test points this at a temporary file
+PROC_STAT = Path("/proc/stat")
 UNAVAILABLE = "unavailable"
 
 T0 = time.monotonic()
@@ -95,17 +64,12 @@ def slug(plan):
     return f"me-bench-{plan['name']}"
 
 
-# ---------------------------------------------------------------- the plan
-
 def check_pairs(n, where, err):
     if not isinstance(n, int) or isinstance(n, bool) or n < 6 or n % 2:
         err(f"{where}: pairs must be an even number of at least 6, not {n!r}")
 
 
 def separators(steps, i):
-    """The steps between the last of confirm_best steps[i]'s comparisons and the confirmation that
-    separate the two measurements: an aa, bench or window step, or a compare of a candidate outside
-    the group."""
     ids = [x.get("id") if isinstance(x, dict) else None for x in steps]
     members = [m for m in steps[i]["steps"] if m in ids[:i]]
     if not members:
@@ -117,7 +81,6 @@ def separators(steps, i):
 
 
 def validate(plan):
-    """Every problem with the plan, as messages; empty when it can run."""
     errs = []
     err = errs.append
     if not isinstance(plan, dict):
@@ -231,8 +194,6 @@ def load_plan(path):
     return plan
 
 
-# ---------------------------------------------------------------- paths and commands
-
 def layout(root):
     root = root if isinstance(root, PurePath) else Path(root)
     tmp = root / "tmp"
@@ -252,7 +213,6 @@ def env_for(L, label=None):
 
 
 def compare_argv(plan, L, s, cand):
-    """compare.sh for an aa, compare or window step against candidate label `cand`."""
     base = plan["base"]
     cmd = [L.src / base / "scripts" / "compare.sh"]
     if s["kind"] == "window":
@@ -266,7 +226,6 @@ def compare_argv(plan, L, s, cand):
 
 
 def golden_argvs(L, label):
-    """(cwd, argv) of the golden check and the tests in label's checkout."""
     co = L.src / label
     replay = L.target / label / "release" / "examples" / "replay"
     return [(co, ["cargo", "build", "--release", "--example", "replay"]),
@@ -275,7 +234,6 @@ def golden_argvs(L, label):
 
 
 def checkout_argvs(bundle, br, dest):
-    """Branch br from the bundle as a checkout at dest, on a local branch of the same name."""
     return [["git", "init", "-q", str(dest)],
             ["git", "-C", str(dest), "fetch", "-q", str(bundle), f"{BUNDLE_REF}{br}"],
             ["git", "-C", str(dest), "checkout", "-q", "-B", br, "FETCH_HEAD"]]
@@ -302,7 +260,7 @@ def setup_lines(plan, L):
 
 def dry_run(plan_path):
     plan = load_plan(plan_path)
-    L = layout(PurePosixPath("/kaggle"))  # the kernel's paths, also when shown on Windows
+    L = layout(PurePosixPath("/kaggle"))
     print(f"# plan {plan['name']}: base {plan['base']} ({plan['labels'][plan['base']]}), "
           f"cpu {plan.get('cpu', DEFAULT_CPU)}, stop after {plan.get('stop_after_min', DEFAULT_STOP_MIN)} min")
     print("# setup, once")
@@ -335,10 +293,7 @@ def dry_run(plan_path):
     return 0
 
 
-# ---------------------------------------------------------------- results
-
 def read_summary(path):
-    """The last {"summary":true,...} line of a compare.sh or bench.sh output, or None."""
     try:
         lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -361,14 +316,11 @@ def comparison_fields(summary, stat):
 
 
 def choose_best(candidates):
-    """candidates: (step id, label, fields or None) in the group's order. The improved one with the
-    lowest effect (every statistic here is lower-is-better); a tie goes to the earlier step. None
-    when no alternative improved."""
     improved = [c for c in candidates if c[2] and c[2].get("verdict") == "improved"
                 and c[2].get("effect_ln_x100") is not None]
     if not improved:
         return None
-    return min(improved, key=lambda c: c[2]["effect_ln_x100"])  # min keeps the first of equals
+    return min(improved, key=lambda c: c[2]["effect_ln_x100"])
 
 
 def past_stop(elapsed_s, stop_min):
@@ -387,15 +339,13 @@ def write_json(path, obj):
 
 
 def runner_sha256():
-    """SHA-256 of this file as it runs (the kernel's copy has the plan embedded)."""
     try:
         return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    except (OSError, NameError):  # NameError: a host that runs the script without __file__
+    except (OSError, NameError):
         return UNAVAILABLE
 
 
 def cpu_jiffies(cpu):
-    """(steal, total of every field) from /proc/stat's line for cpu, or None when there is none."""
     try:
         lines = PROC_STAT.read_text(encoding="ascii", errors="replace").splitlines()
     except OSError:
@@ -407,12 +357,11 @@ def cpu_jiffies(cpu):
                 vals = [int(x) for x in f[1:]]
             except ValueError:
                 return None
-            return (vals[7], sum(vals)) if len(vals) > 7 else None  # steal is the 8th field
+            return (vals[7], sum(vals)) if len(vals) > 7 else None
     return None
 
 
 def readings(before, after, wall_s):
-    """A step record's scheduling readings, informational only."""
     rec = {"steal_jiffies": UNAVAILABLE, "total_jiffies": UNAVAILABLE, "wall_s": round(wall_s, 3)}
     if before and after:
         rec.update(steal_jiffies=after[0] - before[0], total_jiffies=after[1] - before[1])
@@ -456,14 +405,12 @@ def write_summary(L, status):
     write_text(L.results / "SUMMARY.md", text)
 
 
-# ---------------------------------------------------------------- the kernel
-
 class Kernel:
     def __init__(self, plan, L):
         self.plan, self.L = plan, L
         self.cpu = plan.get("cpu", DEFAULT_CPU)
         self.stop_min = plan.get("stop_after_min", DEFAULT_STOP_MIN)
-        self.deadline = T0 + HARD_STOP_MIN * 60  # monotonic time after which no command runs
+        self.deadline = T0 + HARD_STOP_MIN * 60
         start = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
         self.status = {
             "plan": plan["name"], "session": f"{plan['name']}-{start:%Y%m%dT%H%M%SZ}",
@@ -479,17 +426,15 @@ class Kernel:
     def save(self):
         self.status["updated"] = now_iso()
         write_json(self.L.results / "STATUS.json", self.status)
-        write_summary(self.L, self.status)  # current also when the session is killed
+        write_summary(self.L, self.status)
 
     def write_plan(self):
-        """results/plan.json: the plan as the kernel runs it, with cpu and stop time filled in."""
         write_json(self.L.results / "plan.json", {**self.plan, "cpu": self.cpu, "stop_after_min": self.stop_min})
 
     def stopped(self):
         return past_stop(time.monotonic() - T0, self.stop_min)
 
     def measured_sh(self, rec, argv, out, err, **kw):
-        """self.sh, with the pinned CPU's /proc/stat readings and the wall time put in rec."""
         before, t = cpu_jiffies(self.cpu), time.monotonic()
         try:
             return self.sh(argv, out, err, **kw)
@@ -497,8 +442,6 @@ class Kernel:
             rec.update(readings(before, cpu_jiffies(self.cpu), time.monotonic() - t))
 
     def sh(self, argv, out, err, cwd=None, env=None, mode="w"):
-        """Exit code of argv. Raises TimeoutError at the hard limit, after killing the command's
-        whole process group (a pinned grandchild would otherwise keep the CPU busy)."""
         log("$ " + shlex.join(str(a) for a in argv))
         why = f"stopped at the hard limit of {HARD_STOP_MIN} min from kernel start"
         left = self.deadline - time.monotonic()
@@ -520,14 +463,13 @@ class Kernel:
         try:
             note = fn()
             rec.update(state="done", note=note)
-        except Exception as e:  # recorded, and the run ends cleanly with STATUS written
+        except Exception as e:
             rec.update(state="failed", note=str(e))
         rec["end"] = now_iso()
         self.save()
         log(f"{name}: {rec['state']} {rec.get('note') or ''}")
         return rec["state"] == "done"
 
-    # setup phases
 
     def host(self):
         self.L.tmp.mkdir(parents=True, exist_ok=True)
@@ -613,7 +555,7 @@ class Kernel:
                            log_.with_suffix(".err"), cwd=self.L.src / lab, env=env_for(self.L, lab))
             ok = code == 0 and (self.L.bins / lab / "bench").is_file()
             rec["build"] = "ok" if ok else f"failed (exit {code}; see build-{lab}.err)"
-            if ok:  # bench-build.sh wrote the bundle commit; compare.sh passes this file to the binaries
+            if ok:
                 (self.L.bins / lab / "commit.txt").write_text(rec["commit"] + "\n", encoding="utf-8")
                 rec["build_files"] = {}
                 for name in ("settings.txt", "build.txt"):
@@ -623,7 +565,7 @@ class Kernel:
                         rec["build_files"][name] = copy
                     except OSError:
                         rec["build_files"][name] = "missing"
-        except Exception as e:  # recorded; the other labels still build
+        except Exception as e:
             rec["build"] = f"failed ({type(e).__name__}: {e})"
         self.save()
         log(f"build {lab}: {rec['build']}")
@@ -631,7 +573,6 @@ class Kernel:
     def built(self, lab):
         return self.status["labels"][lab]["build"] == "ok"
 
-    # steps
 
     def run_compare(self, s, rec, cand, out_id=None):
         missing = [x for x in (self.plan["base"], cand) if not self.built(x)]
@@ -684,7 +625,6 @@ class Kernel:
             rec["note"] = head + (f"; {rec['note']}" if rec.get("note") else "")
 
     def winner(self, by_id, group):
-        """(the group's winner or None, the group's confirm_best record)."""
         conf = next(r for r in by_id.values() if r["kind"] == "confirm_best" and r.get("group") == group)
         return conf.get("winner"), conf
 
@@ -715,7 +655,7 @@ class Kernel:
                                     cwd=self.L.src / lab, env=env_for(self.L, lab))
         finally:
             ids = self.status["labels"][lab]
-            for f in (Path(f"{out}.jsonl"), Path(f"{out}.err")):  # bench.sh labels its runs with the bundle commit
+            for f in (Path(f"{out}.jsonl"), Path(f"{out}.err")):
                 if ids.get("bundle_commit") and ids.get("commit") and f.is_file():
                     write_text(f, f.read_text(encoding="utf-8", errors="replace")
                                .replace(ids["bundle_commit"], ids["commit"]))
@@ -756,7 +696,7 @@ class Kernel:
                         self.run_golden(rec, lab)
                 elif k == "bench":
                     self.run_bench(s, rec)
-            except Exception as e:  # recorded; later steps that do not need this one still run
+            except Exception as e:
                 rec.update(state="failed", note=f"{type(e).__name__}: {e}")
             rec["end"] = now_iso()
             self.save()
@@ -788,23 +728,21 @@ class Kernel:
                         self.build(lab)
                 else:
                     self.steps()
-        except Exception as e:  # STATUS.json and SUMMARY.md are written below either way
+        except Exception as e:
             self.halt(f"error {type(e).__name__}: {e}")
         finally:
             if self.status["state"] == "running":
                 self.status["state"] = "done"
             self.save()
             log(f"STATUS {self.status['state']}")
-        return 0  # the output is kept either way; STATUS.json says what ran
+        return 0
 
-
-# ---------------------------------------------------------------- packaging
 
 def embed(source, plan):
-    marker = "PLAN = None" + "  # --write-kernel replaces this line in the kernel's copy"  # split: matches once
+    marker = "\nPLAN = " + "None\n"
     if source.count(marker) != 1:
         sys.exit("kaggle_bench: cannot find the PLAN line to fill in")
-    return source.replace(marker, f"PLAN = {plan!r}", 1)
+    return source.replace(marker, f"\nPLAN = {plan!r}\n", 1)
 
 
 def git(repo, *args, env=None):
@@ -815,10 +753,6 @@ def git(repo, *args, env=None):
 
 
 def make_bundle(repo, commits, bundle):
-    """Writes a bundle of one history-free commit per branch in commits (that commit's tree, the neutral
-    BUNDLE_ENV identity and dates, BUNDLE_MESSAGE) under refs/kaggle-bundle/<branch>, so no name or
-    address from the real history leaves the machine. Returns {branch: bundle commit}. The temporary
-    refs are deleted afterwards, also when bundling fails."""
     env = {**os.environ, **BUNDLE_ENV}
     made = {}
     try:
@@ -872,8 +806,6 @@ def write_kernel(plan_path, out_dir, owner):
     return 0
 
 
-# ---------------------------------------------------------------- self-test
-
 def fixture_plan():
     def cmp(i, cand, part="side"):
         return {"id": i, "kind": "compare", "part": part, "cand": cand, "pairs": 10, "stat": "ns_per_op_min"}
@@ -923,7 +855,7 @@ class SelfTest(unittest.TestCase):
             (lambda p: p["steps"][2].update(id="cx"), "used twice"),
             (lambda p: p["steps"][1].update(cand="base"), "kind aa"),
             (lambda p: p["steps"][5].update(window="9:30-10:00"), "HH:MM:SS"),
-            (lambda p: p["steps"].pop(3), "no other measurement"),  # nothing between cy and conf
+            (lambda p: p["steps"].pop(3), "no other measurement"),
             (lambda p: p["steps"][2].update(cand="x"), "compared twice"),
             (lambda p: p.update(stop_after_min=HARD_STOP_MIN), "below the hard limit"),
         ]
@@ -931,11 +863,7 @@ class SelfTest(unittest.TestCase):
             self.assertIn(want, self.errs(edit))
 
     def run_steps(self, canned, built=("base", "x", "y"), stat=True):
-        """Kernel.steps() on the fixture plan with the shell-out replaced. canned maps a step id (the
-        output file's name) to (verdict, effect, exit code); a missing id prints nothing and exits 1.
-        With stat, PROC_STAT is a file whose CPU 3 line gains 5 steal and 97 total jiffies across each
-        command; without, it is missing. Returns ({step id: record}, the step ids that ran a command)."""
-        def proc_stat(n):  # user nice system idle iowait irq softirq steal guest guest_nice
+        def proc_stat(n):
             return f"cpu  1 2 3 4 5 6 7 8 9 10\ncpu3 {10 * n} 0 {2 * n} {80 * n} 0 0 0 {5 * n} 0 0\n"
         with tempfile.TemporaryDirectory() as d, \
                 unittest.mock.patch(f"{__name__}.PROC_STAT", Path(d) / "stat"):
@@ -975,30 +903,30 @@ class SelfTest(unittest.TestCase):
         better = {"cx": ("improved", -3.0, 0), "cy": ("improved", -5.0, 0), "conf": ("improved", -4.0, 0),
                   "win": ("improved", -1.0, 0)}
 
-        r, _ = self.run_steps({**ok, **better})  # the best of two improved is confirmed
+        r, _ = self.run_steps({**ok, **better})
         self.assertEqual((r["conf"]["chosen_from"], r["conf"]["winner"]), ("cy", "y"))
         self.assertEqual((r["win"]["state"], r["win"]["label"]), ("done", "y"))
         self.assertEqual((r["gold"]["state"], r["gold"]["verdict"]), ("done", "pass"))
-        for x in ("aa", "cx", "cy", "bench", "conf", "win"):  # each command's scheduling readings
+        for x in ("aa", "cx", "cy", "bench", "conf", "win"):
             self.assertEqual((r[x]["steal_jiffies"], r[x]["total_jiffies"]), (5, 97), x)
             self.assertGreaterEqual(r[x]["wall_s"], 0)
         self.assertNotIn("steal_jiffies", r["gold"])
-        self.assertIn("| -5.00 .. -3.00 | 5.2 | y |", self.summary)  # the conf row: 5 / 97
+        self.assertIn("| -5.00 .. -3.00 | 5.2 | y |", self.summary)
 
-        r, _ = self.run_steps({**ok, **better}, stat=False)  # no /proc/stat: unavailable, never 0
+        r, _ = self.run_steps({**ok, **better}, stat=False)
         self.assertEqual((r["aa"]["steal_jiffies"], r["aa"]["total_jiffies"]), ("unavailable",) * 2)
         self.assertIsInstance(r["aa"]["wall_s"], float)
-        self.assertEqual(r["conf"]["winner"], "y")  # the readings change nothing
+        self.assertEqual(r["conf"]["winner"], "y")
         self.assertIn("| -5.00 .. -3.00 | n/a | y |", self.summary)
 
         r, ran = self.run_steps({**ok, "cx": ("inconclusive", -1.0, 0), "cy": ("regressed", 2.0, 0)})
-        self.assertEqual(r["conf"]["verdict"], "none improved")  # none improved: no confirmation runs
+        self.assertEqual(r["conf"]["verdict"], "none improved")
         self.assertNotIn("conf", ran)
         for x in ("win", "gold"):
             self.assertEqual(r[x]["state"], "skipped")
             self.assertIn("no confirmed winner for g", r[x]["note"])
 
-        for cx in ({}, {"cx": ("improved", -9.0, 1)}):  # no summary line; a summary but exit 1
+        for cx in ({}, {"cx": ("improved", -9.0, 1)}):
             canned = {**ok, **better}
             del canned["cx"]
             r, _ = self.run_steps({**canned, **cx})
@@ -1006,11 +934,11 @@ class SelfTest(unittest.TestCase):
             self.assertEqual(r["conf"]["chosen_from"], "cy")
 
         r, _ = self.run_steps({**ok, **better, "conf": ("inconclusive", -1.0, 0)})
-        self.assertEqual((r["conf"]["state"], r["conf"]["winner"]), ("done", None))  # not confirmed
+        self.assertEqual((r["conf"]["state"], r["conf"]["winner"]), ("done", None))
         self.assertIn("y not confirmed", r["conf"]["note"])
         self.assertEqual(r["win"]["state"], "skipped")
 
-        for aa in ({"aa": ("regressed", 3.0, 0)}, {"aa": ("inconclusive", 0.1, 1)}):  # A/A check failed
+        for aa in ({"aa": ("regressed", 3.0, 0)}, {"aa": ("inconclusive", 0.1, 1)}):
             r, _ = self.run_steps({**ok, **better, **aa})
             self.assertEqual((r["conf"]["verdict"], r["conf"]["winner"]), ("improved", None))
             self.assertIn("A/A method check", r["conf"]["note"])
@@ -1019,13 +947,13 @@ class SelfTest(unittest.TestCase):
         r, _ = self.run_steps({**ok, **better, "aa": ("regressed", 3.0, 0)})
         self.assertIn("A/A gave regressed", r["aa"]["note"])
 
-        r, ran = self.run_steps({"aa": ok["aa"], **better})  # the separating bench step failed
+        r, ran = self.run_steps({"aa": ok["aa"], **better})
         self.assertEqual(r["bench"]["state"], "failed")
         self.assertEqual(r["conf"]["state"], "skipped")
         self.assertNotIn("conf", ran)
         self.assertIn("separate blocks", r["gold"]["note"])
 
-        r, _ = self.run_steps({**ok, **better}, built=("base", "x"))  # y did not build
+        r, _ = self.run_steps({**ok, **better}, built=("base", "x"))
         self.assertEqual((r["cy"]["state"], r["cy"]["note"]), ("failed", "no build of y"))
         self.assertEqual(r["conf"]["chosen_from"], "cx")
 
@@ -1034,8 +962,8 @@ class SelfTest(unittest.TestCase):
                 unittest.mock.patch(f"{__name__}.PROC_STAT", Path(d) / "stat"):
             PROC_STAT.write_text("cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\ncpu3 1 2 3 4\n")
             self.assertEqual(cpu_jiffies(0), (8, 55))
-            self.assertIsNone(cpu_jiffies(3))  # no steal field
-            self.assertIsNone(cpu_jiffies(2))  # no line
+            self.assertIsNone(cpu_jiffies(3))
+            self.assertIsNone(cpu_jiffies(2))
             self.assertEqual(readings(None, (8, 55), 1.0)["steal_jiffies"], "unavailable")
 
     def test_session_record(self):
@@ -1047,7 +975,7 @@ class SelfTest(unittest.TestCase):
             k.write_plan()
             self.assertEqual(json.loads((L.results / "plan.json").read_text()),
                              {**plan, "cpu": DEFAULT_CPU, "stop_after_min": DEFAULT_STOP_MIN})
-            session = k.status["session"]  # the plan name and the UTC start, nothing else
+            session = k.status["session"]
             self.assertRegex(session, r"\At-\d{8}T\d{6}Z\Z")
             self.assertEqual(session, "t-" + k.status["started"].replace("-", "").replace(":", ""))
             self.assertEqual(k.status["runner_sha256"], hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
@@ -1057,7 +985,7 @@ class SelfTest(unittest.TestCase):
             self.assertIn(f"runner SHA-256 {k.status['runner_sha256']}", text)
             self.assertIn(f"| step (session {session}) | kind |", text)
 
-            def sh(argv, out, err, cwd=None, env=None, mode="w"):  # a build that writes only settings.txt
+            def sh(argv, out, err, cwd=None, env=None, mode="w"):
                 (L.bins / "x").mkdir(parents=True)
                 for f in ("bench", "settings.txt"):
                     (L.bins / "x" / f).write_text(f)
@@ -1118,17 +1046,17 @@ class SelfTest(unittest.TestCase):
                                       check=True, capture_output=True, text=True).stdout.strip()
             repo.mkdir()
             g("init", "-q")
-            g("symbolic-ref", "HEAD", "refs/heads/master")  # git's usual initial branch names: the
+            g("symbolic-ref", "HEAD", "refs/heads/master")
             (repo / "f.txt").write_text("one\n")
             g("add", "f.txt")
             g("commit", "-q", "-m", f"first, by {name}")
-            g("checkout", "-q", "-b", "main")  # kernel's checkout must not collide with either
+            g("checkout", "-q", "-b", "main")
             (repo / "f.txt").write_text("two\n")
             g("commit", "-q", "-am", f"second <{mail}>")
             commits = {br: g("rev-parse", br) for br in ("master", "main")}
             made = make_bundle(repo, commits, bundle)
-            self.assertEqual(made, make_bundle(repo, commits, bundle))  # reproducible
-            self.assertEqual(g("for-each-ref", BUNDLE_REF), "")  # temporary refs gone
+            self.assertEqual(made, make_bundle(repo, commits, bundle))
+            self.assertEqual(g("for-each-ref", BUNDLE_REF), "")
             data = bundle.read_bytes()
             for x in (name, mail):
                 self.assertNotIn(x.encode(), data)

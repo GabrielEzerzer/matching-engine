@@ -1,0 +1,168 @@
+id: layers-library-no-io
+language: Rust
+severity: error
+message: "The library in src/ does no I/O: no files, network, processes, environment, threads or clocks. Read input and time runs in examples/ or harness/ and pass bytes or values into the library."
+files:
+  - "src/**"
+rule:
+  any:
+    - kind: use_declaration
+      regex: '\bstd::(?:\{[^;]*\b)?(?:fs|io|net|process|env|thread|time)\b'
+    - kind: scoped_identifier
+      regex: '^(?:::)?std::(?:fs|io|net|process|env|thread|time)$'
+      not:
+        inside:
+          kind: use_declaration
+          stopBy: end
+---
+id: layers-library-no-includes
+language: Rust
+severity: error
+message: "Library code never pulls in files from outside its module tree. Keep library code in src/ as modules declared in src/lib.rs; shared test and benchmark code goes in harness/ and is included from tests/ or examples/."
+files:
+  - "src/**"
+rule:
+  any:
+    - kind: attribute_item
+      has:
+        kind: attribute
+        regex: '^path\s*='
+    - kind: macro_invocation
+      regex: '^include(?:_str|_bytes)?\s*!'
+---
+id: layers-book-no-feed
+language: Rust
+severity: error
+message: "The book modules (types, level, side, orders, book) know nothing of the ITCH feed or the replay. Turn feed messages into book commands in src/replay.rs."
+files:
+  - "src/types.rs"
+  - "src/level.rs"
+  - "src/side.rs"
+  - "src/orders.rs"
+  - "src/book.rs"
+rule:
+  any:
+    - kind: use_declaration
+      regex: '\b(?:crate|super)::(?:\{[^;]*\b)?(?:itch|replay)\b'
+    - kind: scoped_identifier
+      regex: '^(?:crate|super)::(?:itch|replay)$'
+      not:
+        inside:
+          kind: use_declaration
+          stopBy: end
+---
+id: layers-itch-standalone
+language: Rust
+severity: error
+message: "The ITCH parser in src/itch.rs depends on nothing else in the crate. Map decoded messages to book commands in src/replay.rs instead."
+files:
+  - "src/itch.rs"
+rule:
+  any:
+    - kind: crate
+    - kind: super
+  not:
+    any:
+      - inside:
+          kind: visibility_modifier
+      - inside:
+          kind: mod_item
+          stopBy: end
+---
+id: layers-types-leaf
+language: Rust
+severity: error
+message: "src/types.rs holds the public value types and depends on nothing else in the crate. Put logic that needs other modules in the module that owns it."
+files:
+  - "src/types.rs"
+rule:
+  any:
+    - kind: crate
+    - kind: super
+  not:
+    inside:
+      kind: visibility_modifier
+---
+id: layers-includes-harness-only
+language: Rust
+severity: error
+message: "Tests and examples share code only through harness/. Move the shared code into harness/NAME.rs and include it with #[path = \"../harness/NAME.rs\"]."
+files:
+  - "tests/**"
+  - "examples/**"
+rule:
+  any:
+    - kind: attribute_item
+      has:
+        kind: attribute
+        regex: '^path\s*='
+        not:
+          regex: '^path\s*=\s*"\.\./harness/[a-z_]+\.rs"$'
+    - kind: macro_invocation
+      regex: '^include(?:_str|_bytes)?\s*!'
+---
+id: layers-harness-no-includes
+language: Rust
+severity: error
+message: "harness/ files are included by tests and examples and include nothing themselves, so harness code never depends on a test or an example. Have the test or example include both harness files."
+files:
+  - "harness/**"
+rule:
+  any:
+    - kind: attribute_item
+      has:
+        kind: attribute
+        regex: '^path\s*='
+    - kind: macro_invocation
+      regex: '^include(?:_str|_bytes)?\s*!'
+---
+id: layers-internals-for-microbenchmarks
+language: Rust
+severity: error
+message: "matching_engine::internals exists only for the microbenchmarks (examples/micro.rs, harness/workload.rs, tests/workload.rs). Use the public API (OrderBook, Command, Event and the query methods) instead."
+files:
+  - "tests/**"
+  - "examples/**"
+  - "harness/**"
+ignores:
+  - "examples/micro.rs"
+  - "harness/workload.rs"
+  - "tests/workload.rs"
+rule:
+  any:
+    - kind: use_declaration
+      regex: '\bmatching_engine::(?:\{[^;]*\b)?internals\b'
+    - kind: scoped_identifier
+      regex: '^(?:::)?matching_engine::internals$'
+      not:
+        inside:
+          kind: use_declaration
+          stopBy: end
+---
+id: layers-scripts-no-test-imports
+language: Python
+severity: error
+message: "Scripts never import test modules. Move what both need into the script the test checks, and import it from the test."
+files:
+  - "scripts/**"
+ignores:
+  - "scripts/test_*.py"
+rule:
+  any:
+    - kind: import_statement
+      regex: '^import\s+(?:[^#\n]*[\s,])?test_\w+'
+    - kind: import_from_statement
+      regex: '^from\s+test_\w+'
+---
+id: layers-kaggle-runner-single-file
+language: Python
+severity: error
+message: "scripts/kaggle_bench.py runs on Kaggle as one uploaded file, so it imports no other repository module. Copy what it needs into it, standard library only."
+files:
+  - "scripts/kaggle_bench.py"
+rule:
+  any:
+    - kind: import_statement
+      regex: '\b(?:compare_summary|test_\w+)\b'
+    - kind: import_from_statement
+      regex: '^from\s+(?:\.|compare_summary\b|test_\w+)'

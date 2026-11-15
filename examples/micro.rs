@@ -1,40 +1,5 @@
 //! Microbenchmarks of the book's parts, one part per run, on workloads derived from the real day.
-//!
-//! ```text
-//! micro PART [--passes N] [--commit LABEL] [--allow-non-linux] FILE
-//! ```
-//!
-//! PART is one of:
-//! - `side`: price-level lookup (`BookSide`): best price, find, find or create, remove a level;
-//! - `level`: the queue at one price (`Level`): push, front, reduce, pop front, remove anywhere;
-//! - `orders`: the order-id map (`OrderMap`): insert, get, update, remove;
-//! - `book`: the commands applied to `OrderBook`, with allocations counted per command;
-//! - `parse`: ITCH frames split and decoded to `Message`, no book.
-//!
-//! The workload is fixed: the book commands of [`SYMBOLS`] from the start of the day until
-//! [`WORKLOAD_END`] (the opening hour of regular trading included), and for `parse` the
-//! [`PARSE_BYTES`] of frames that start at [`PARSE_START`]. The operations each part sees are
-//! derived by replaying those commands through the real book and watching it from outside
-//! (`harness/workload.rs`), so the same workload can drive a rewritten part through its adapter.
-//! The first run derives the workload from FILE and caches it in `micro-cache/` beside FILE,
-//! keyed by its inputs; later runs load the cache and refuse it unless it encodes back to the
-//! same bytes. Preparation is never timed.
-//!
-//! The timed region is one pass over the part's whole workload from empty state. One untimed
-//! pass runs first, then `--passes` timed ones (a default per part keeps a run near fifteen
-//! seconds in all), then two more untimed ones. The JSON line on stdout reports ns per
-//! operation as the median over the timed passes, the min, the max and the spread
-//! ((max - min) / median), the operation counts, the allocations per pass from a counting
-//! global allocator, and `workload_checksum`, a SHA-256 prefix of the part's workload: two runs
-//! with the same checksum ran the same operations. Allocations are counted in the three untimed
-//! passes only, so the timed passes pay nothing for the counting; the line gives their median,
-//! min and max (the order map's default hasher is seeded randomly per map, which moves where
-//! hashbrown rehashes in place instead of growing, so the count can differ by a few between
-//! passes). After each pass the part's final state is checked against the orders, levels and
-//! resting shares the derivation recorded. For `side`, `level` and `orders` the adapter also
-//! folds the result of every read into one number (`parts::fold`, inside the timed region), and
-//! that is checked against the fold the baseline adapters gave when the workload was derived,
-//! so an adapter that skips a read or returns a wrong value from one fails the run.
+//! BENCHMARKING.md, "Microbenchmarks", describes the parts, the workload and the checks.
 
 #[path = "../harness/host.rs"]
 mod host;
@@ -61,15 +26,10 @@ use host::{Json, control_ms, cpus_allowed, loadavg};
 use stream::{ChunkReader, DEFAULT_CHUNK};
 use workload::{BookIdx, LevelOp, MapOp, Recorder, SideOp, Workload, codec, parts};
 
-/// The busy symbols the book workloads come from, the same set as `examples/diff_slice.rs`.
 const SYMBOLS: [&str; 6] = ["AAPL", "MSFT", "AMD", "TSLA", "QQQ", "SPY"];
-/// The book workloads stop at the first message at or after 10:30:00 Eastern.
 const WORKLOAD_END: u64 = hms(10, 30, 0);
-/// The parse workload starts at the first frame at or after the 09:30:00 open.
 const PARSE_START: u64 = hms(9, 30, 0);
-/// Whole frames up to this many bytes, far more than the caches hold, as in the full replay.
 const PARSE_BYTES: u64 = 256 << 20;
-/// Bump when the derivation or the encoding changes, so old caches are not reused.
 const WORKLOAD_VERSION: u32 = 3;
 
 const fn hms(h: u64, m: u64, s: u64) -> u64 {
@@ -84,9 +44,6 @@ const PARTS: [(&str, usize); 5] = [
     ("parse", 30),
 ];
 
-/// Counts every allocation and reallocation and the bytes they request while [`COUNTING`] is
-/// set, so the benchmark can report allocations per operation exactly. Counting is off during
-/// the timed passes, which then pay one relaxed load per allocation and nothing more.
 struct Counting;
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
@@ -100,8 +57,7 @@ fn count(bytes: usize) {
     }
 }
 
-// SAFETY: every method forwards to the system allocator with the caller's arguments unchanged;
-// the counters are plain atomics.
+// SAFETY: every method forwards to the system allocator with the caller's arguments unchanged.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count(layout.size());
@@ -247,7 +203,6 @@ fn run(args: &Args) -> Result<String, String> {
                 args.passes,
                 w.side_ops.len(),
                 || parts::run_sides(w),
-                // Side operations carry no quantities: the levels a side holds stay empty.
                 |(sides, reads)| {
                     expect("levels", parts::count_sides(sides), w.final_levels)?;
                     expect_reads(*reads, w.final_reads.side)
@@ -388,22 +343,16 @@ fn expect_reads(got: u64, want: u64) -> Result<(), String> {
 }
 
 struct Timing {
-    /// When the control loop before the passes started: preparation ends here.
     started: Instant,
     loadavg_start: f64,
     control_ms_start: f64,
     ns_per_op: Vec<f64>,
     timed: Duration,
-    /// Allocations and allocated bytes of each counted pass (the untimed ones).
     allocs: Vec<(u64, u64)>,
 }
 
-/// Untimed passes that count allocations: the warm pass before the timed ones and the rest after.
 const COUNTED_PASSES: usize = 3;
 
-/// One untimed pass, then `passes` timed ones, then [`COUNTED_PASSES`] - 1 more untimed ones.
-/// Only the untimed passes count allocations. Each pass starts from empty state; the state it
-/// returns is checked and dropped outside the timed region.
 fn time_passes<S>(
     passes: usize,
     ops: usize,
@@ -445,8 +394,6 @@ fn time_passes<S>(
     })
 }
 
-/// Runs one pass with allocation counting on; returns its state and the allocations and bytes
-/// it made.
 fn counted<S>(pass: &mut impl FnMut() -> S) -> (S, (u64, u64)) {
     let (a0, b0) = (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed));
     COUNTING.store(true, Relaxed);
@@ -530,7 +477,6 @@ fn count_commands(out: &mut Json, commands: &[(BookIdx, Command)]) {
     }
 }
 
-/// `HH.MM.SS`; colons would break the scripts' split of the flat JSON line.
 fn dotted(ns: u64) -> String {
     let s = ns / 1_000_000_000;
     format!("{:02}.{:02}.{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -561,14 +507,11 @@ struct Cached {
     source: &'static str,
     workload: Workload,
     sections: [Vec<u8>; 5],
-    /// Offset, length and message count of the parse workload's byte range in FILE.
     parse: (u64, u64, u64),
 }
 
 const MAGIC: &[u8; 4] = b"MEWL";
 
-/// Loads the derived workload from `micro-cache/<key>.bin` beside `file`, or derives it and
-/// writes the cache. The key covers the file's name and size and every workload constant.
 fn load_or_derive(file: &Path) -> Result<Cached, String> {
     let size = std::fs::metadata(file)
         .map_err(|e| format!("{}: {e}", file.display()))?
@@ -590,7 +533,6 @@ fn load_or_derive(file: &Path) -> Result<Cached, String> {
         let (sections, parse) =
             read_cache(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         let workload = codec::decode(&sections)?;
-        // A changed codec could otherwise decode other operations under the same checksum.
         if codec::encode(&workload) != sections {
             return Err(format!(
                 "{}: the cached workload does not encode back to the same bytes; \
@@ -663,9 +605,6 @@ fn read_cache(bytes: &[u8]) -> Result<CacheParts, String> {
     Ok((sections, parse))
 }
 
-/// Replays the book messages of [`SYMBOLS`] up to [`WORKLOAD_END`] through one book per symbol
-/// and records each part's operations; finds the parse byte range on the way. Then runs the
-/// operations once through this build's adapters to record what their reads return.
 fn derive(file: &Path) -> Result<(Workload, (u64, u64, u64)), String> {
     let started = Instant::now();
     let mut reader = ChunkReader::open(file, DEFAULT_CHUNK).map_err(|e| e.to_string())?;

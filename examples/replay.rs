@@ -1,12 +1,5 @@
-//! Replays an ITCH 5.0 file through one book per instrument, prints the summary counts and the
-//! golden replay hash, and optionally records them or checks them against a recorded file.
-//!
-//! ```text
-//! replay [--write GOLDEN | --check GOLDEN] [--limit N] FILE
-//! ```
-//!
-//! `--check` exits with status 1 and prints the recorded and the computed value of every line
-//! that differs. The encoding behind `replay_hash` is documented in `harness/golden.rs`.
+//! Replays an ITCH 5.0 file through one book per instrument and prints the summary counts and the golden replay hash.
+//! It optionally records them or checks them against a recorded file, exiting with status 1 on any difference.
 
 #[path = "../harness/golden.rs"]
 mod golden;
@@ -102,7 +95,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Compares every recorded line with the computed one. `input_file` is informational only.
 fn check(path: &Path, computed: &[(String, String)]) -> ExitCode {
     let recorded = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -378,7 +370,6 @@ fn command_kind_name(kind: CommandKind) -> &'static str {
     }
 }
 
-/// State captured before a message, for `--diagnose`.
 struct Before {
     best_bid: Option<u32>,
     best_ask: Option<u32>,
@@ -396,14 +387,10 @@ impl Before {
     }
 }
 
-/// Explains unexpected trades, rejections and fallback executions: each unexpected trade and
-/// rejection is printed with its time, symbol and the book's best prices before the message;
-/// fallbacks are counted per 5-minute bucket of the trading day.
 #[derive(Default)]
 struct Diagnostics {
     printed: u64,
     fallback_buckets: std::collections::BTreeMap<u64, u64>,
-    /// Fallbacks by (E or C, reason, trading state, book diverged).
     fallback_kinds: std::collections::BTreeMap<(char, &'static str, char, bool), u64>,
     unexpected_buckets: std::collections::BTreeMap<u64, u64>,
 }

@@ -63,7 +63,6 @@ fn level(price: Price, orders: &[(OrderId, Qty)]) -> LevelSnapshot {
     }
 }
 
-/// Applies the setup commands, then returns only the events of the last command.
 fn run(book: &mut OrderBook, setup: &[Command], cmd: Command) -> Vec<Event> {
     let mut out = Vec::new();
     for &c in setup {

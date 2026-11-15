@@ -3,7 +3,6 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-/// Fields of the output line, in order.
 pub struct Json(pub Vec<(String, String)>);
 
 impl Json {
@@ -31,8 +30,6 @@ impl Json {
     }
 }
 
-/// Time for a fixed chain of 100 million dependent xorshift steps: a CPU-only workload with no
-/// memory traffic, so it varies only with the CPU's clock and with contention for the core.
 pub fn control_ms() -> f64 {
     let t = Instant::now();
     let mut x = black_box(0x9E37_79B9_7F4A_7C15u64);

@@ -1,8 +1,6 @@
-//! The microbenchmark workload derivation (`harness/workload.rs`) on a small synthetic command
-//! stream: replaying each part's derived operations into a plain model must end in exactly the
-//! state the real book reached, and the byte encoding must round-trip. With the `internals`
-//! feature the same check runs against the real parts through the benchmark's adapters, and
-//! adapters that skip a read or lose its result are shown to fail the read check.
+//! The microbenchmark workload derivation (harness/workload.rs) on a small synthetic command stream:
+//! replayed part operations must rebuild the real book's state and the byte encoding must round-trip.
+//! With the internals feature the real parts run through the adapters, and adapters that drop a read fail.
 
 #[path = "../harness/workload.rs"]
 mod workload;
@@ -24,9 +22,6 @@ fn lim(id: OrderId, side: Side, price: Price, qty: Qty) -> Command {
     }
 }
 
-/// Commands for two books covering resting, multi-level sweeps, partial and full fills, market
-/// orders, partial and full reduces, replaces (new id, same id, crossing) and every rejection,
-/// ending with a partial fill and a partial reduce of orders that still rest.
 fn commands() -> Vec<(BookIdx, Command)> {
     vec![
         (0, lim(1, Buy, 10, 100)),
@@ -35,11 +30,11 @@ fn commands() -> Vec<(BookIdx, Command)> {
         (0, lim(3, Buy, 9, 50)),
         (0, lim(4, Sell, 12, 70)),
         (0, lim(5, Sell, 13, 30)),
-        (0, lim(6, Sell, 9, 150)), // fills 1, half of 2
-        (0, lim(7, Sell, 9, 120)), // empties 10 and 9, rests 20 at 9
+        (0, lim(6, Sell, 9, 150)),
+        (0, lim(7, Sell, 9, 120)),
         (1, lim(2, Buy, 499, 10)),
         (0, Reduce { id: 4, by: 20 }),
-        (0, Reduce { id: 5, by: 30 }), // removes 5 and its level
+        (0, Reduce { id: 5, by: 30 }),
         (0, Cancel { id: 999 }),
         (0, Reduce { id: 4, by: 1000 }),
         (0, Reduce { id: 4, by: 0 }),
@@ -63,7 +58,7 @@ fn commands() -> Vec<(BookIdx, Command)> {
                 qty: 10,
             },
         ),
-        (0, lim(10, Buy, 9, 25)), // fills 9 at 8, part of 7 at 9
+        (0, lim(10, Buy, 9, 25)),
         (
             0,
             Market {
@@ -71,7 +66,7 @@ fn commands() -> Vec<(BookIdx, Command)> {
                 side: Buy,
                 qty: 100,
             },
-        ), // takes the rest of 7, cancels the remainder
+        ),
         (0, lim(12, Buy, 5, 10)),
         (0, lim(13, Buy, 5, 10)),
         (
@@ -102,8 +97,8 @@ fn commands() -> Vec<(BookIdx, Command)> {
             },
         ),
         (0, Cancel { id: 13 }),
-        (0, lim(15, Sell, 20, 5)),  // reuses a freed level slot
-        (1, lim(3, Sell, 499, 15)), // fills 2, rests 5 at 499
+        (0, lim(15, Sell, 20, 5)),
+        (1, lim(3, Sell, 499, 15)),
         (
             1,
             Replace {
@@ -114,12 +109,11 @@ fn commands() -> Vec<(BookIdx, Command)> {
             },
         ),
         (1, Cancel { id: 3 }),
-        (1, lim(5, Buy, 498, 15)), // 25 of 4 left
+        (1, lim(5, Buy, 498, 15)),
         (0, Reduce { id: 12, by: 4 }),
     ]
 }
 
-/// Applies the commands to real books and records the workload, as `examples/micro.rs` does.
 fn derive(cmds: &[(BookIdx, Command)]) -> (Workload, Vec<OrderBook>) {
     let mut books = vec![OrderBook::new(), OrderBook::new()];
     let mut rec = Recorder::new(books.len());
@@ -137,7 +131,6 @@ fn derive(cmds: &[(BookIdx, Command)]) -> (Workload, Vec<OrderBook>) {
     (rec.finish(), books)
 }
 
-/// Each side's level prices, each level's queue and total, and the id map, from snapshots.
 struct Expected {
     side_levels: BTreeSet<(u32, Price)>,
     queues: Vec<(Vec<OrderId>, u64)>,
@@ -207,7 +200,6 @@ fn derived_operations_rebuild_the_books_state() {
                 q.0.push_back(id);
                 q.1 += u64::from(qty);
             }
-            // A look that finds nothing is the one at a level just emptied, before it is dropped.
             LevelOp::Front { slot } => assert!(
                 !queues[slot as usize].0.is_empty()
                     || w.level_ops.get(i + 1) == Some(&LevelOp::Reset { slot })
@@ -258,7 +250,6 @@ fn derived_operations_rebuild_the_books_state() {
     }
     assert_eq!(map, e.map);
 
-    // The book workload is the commands themselves; replaying them reproduces the books.
     let replayed = workload::run_books(&w);
     for (a, b) in replayed.iter().zip(&books) {
         assert_eq!(a.snapshot(), b.snapshot());
@@ -273,12 +264,11 @@ fn shares(e: &Expected) -> u64 {
     e.map.values().map(|&(_, _, qty)| u64::from(qty)).sum()
 }
 
-/// One map operation for each lookup `OrderBook::apply` makes in its order map.
 #[test]
 fn map_operations_follow_the_books_lookups() {
     let cmds = [
-        (0, lim(1, Buy, 10, 5)), // duplicate check, insert
-        (0, lim(2, Buy, 10, 0)), // rejected for zero quantity before any lookup
+        (0, lim(1, Buy, 10, 5)),
+        (0, lim(2, Buy, 10, 0)),
         (
             0,
             Market {
@@ -286,9 +276,9 @@ fn map_operations_follow_the_books_lookups() {
                 side: Sell,
                 qty: 0,
             },
-        ), // likewise
-        (0, lim(4, Sell, 10, 7)), // duplicate check, fills maker 1 (get, remove), rests 2
-        (0, lim(5, Buy, 10, 1)), // duplicate check, partly fills maker 4 (get and update)
+        ),
+        (0, lim(4, Sell, 10, 7)),
+        (0, lim(5, Buy, 10, 1)),
     ];
     let (w, _) = derive(&cmds);
     use MapOp::{Get, Insert, Remove, Update};
@@ -323,19 +313,16 @@ fn map_operations_follow_the_books_lookups() {
     );
 }
 
-/// One `Front` for each `level.front()` in `OrderBook::match_order`: one before every trade, and
-/// one more that finds nothing when the taker empties a level and still has quantity, at that
-/// level before it is dropped. A taker that has finished looks no further.
 #[test]
 fn level_front_calls_follow_the_book() {
     let cmds = [
         (0, lim(1, Sell, 10, 5)),
         (0, lim(2, Sell, 10, 5)),
         (0, lim(3, Sell, 11, 5)),
-        (0, lim(4, Buy, 10, 3)), // partial fill of maker 1, taker done
-        (0, lim(5, Buy, 10, 2)), // full fill of maker 1 as the taker completes; 2 still rests
-        (0, lim(6, Buy, 11, 8)), // full fill of 2 empties 10 with 3 left; partial fill of 3
-        (0, lim(7, Buy, 11, 2)), // full fill of 3 empties 11 as the taker completes
+        (0, lim(4, Buy, 10, 3)),
+        (0, lim(5, Buy, 10, 2)),
+        (0, lim(6, Buy, 11, 8)),
+        (0, lim(7, Buy, 11, 2)),
         (0, lim(8, Sell, 12, 4)),
         (
             0,
@@ -344,9 +331,9 @@ fn level_front_calls_follow_the_book() {
                 side: Buy,
                 qty: 10,
             },
-        ), // empties 12 with 6 left, finds no level and cancels the rest
+        ),
         (0, lim(10, Sell, 13, 1)),
-        (0, lim(11, Buy, 13, 3)), // empties 13 with 2 left, then rests at 13
+        (0, lim(11, Buy, 13, 3)),
     ];
     let (w, _) = derive(&cmds);
     use LevelOp::{Front, PopFront, Push, Reduce, Reset};
@@ -368,14 +355,11 @@ fn level_front_calls_follow_the_book() {
                 id: 3,
                 qty: 5
             },
-            // 4
             Front { slot: 0 },
             Reduce { slot: 0, qty: 3 },
-            // 5
             Front { slot: 0 },
             Reduce { slot: 0, qty: 2 },
             PopFront { slot: 0 },
-            // 6
             Front { slot: 0 },
             Reduce { slot: 0, qty: 5 },
             PopFront { slot: 0 },
@@ -383,30 +367,25 @@ fn level_front_calls_follow_the_book() {
             Reset { slot: 0 },
             Front { slot: 1 },
             Reduce { slot: 1, qty: 3 },
-            // 7
             Front { slot: 1 },
             Reduce { slot: 1, qty: 2 },
             PopFront { slot: 1 },
             Reset { slot: 1 },
-            // 8 takes the slot freed last
             Push {
                 slot: 1,
                 id: 8,
                 qty: 4
             },
-            // 9
             Front { slot: 1 },
             Reduce { slot: 1, qty: 4 },
             PopFront { slot: 1 },
             Front { slot: 1 },
             Reset { slot: 1 },
-            // 10
             Push {
                 slot: 1,
                 id: 10,
                 qty: 1
             },
-            // 11
             Front { slot: 1 },
             Reduce { slot: 1, qty: 1 },
             PopFront { slot: 1 },
@@ -499,8 +478,6 @@ fn adapters_rebuild_the_books_state() {
     assert_eq!(got, e.map);
 }
 
-/// The benchmark's check after each pass compares these share totals with the workload's, so an
-/// adapter that skipped quantity changes fails it.
 #[cfg(feature = "internals")]
 #[test]
 fn share_totals_catch_skipped_updates_and_reduces() {
@@ -517,11 +494,6 @@ fn share_totals_catch_skipped_updates_and_reduces() {
     );
 }
 
-/// The benchmark's check after each pass also compares the fold of each part's reads with the
-/// workload's, so an adapter that skips a read, or folds a wrong result, fails it while its end
-/// state still passes. A read changes no state, so leaving one kind out of the operations runs
-/// the real adapter exactly as an adapter without that arm would. A removal does change state,
-/// so its case is a copy of the map adapter's loop.
 #[cfg(feature = "internals")]
 #[test]
 fn read_folds_catch_skipped_and_wrong_reads() {
@@ -532,7 +504,6 @@ fn read_folds_catch_skipped_and_wrong_reads() {
     w.final_reads = parts::final_reads(&w);
     let wrong = || derive(&commands()).0;
 
-    // Best price, then find a level, left out.
     let side_reads: [fn(&SideOp) -> bool; 2] = [
         |op| matches!(op, SideOp::Best { .. }),
         |op| matches!(op, SideOp::Find { .. }),
@@ -545,7 +516,6 @@ fn read_folds_catch_skipped_and_wrong_reads() {
         assert_ne!(reads, w.final_reads.side);
     }
 
-    // Front left out, including the look at a level just emptied.
     let mut v = wrong();
     v.level_ops
         .retain(|op| !matches!(op, LevelOp::Front { .. }));
@@ -556,15 +526,12 @@ fn read_folds_catch_skipped_and_wrong_reads() {
     );
     assert_ne!(reads, w.final_reads.level);
 
-    // Get left out.
     let mut v = wrong();
     v.map_ops.retain(|op| !matches!(op, MapOp::Get { .. }));
     let (maps, reads) = parts::run_maps(&v);
     assert_eq!(parts::count_maps(&maps), (w.final_orders, w.final_shares));
     assert_ne!(reads, w.final_reads.map);
 
-    // Remove still removes but folds a constant in place of the order it took out. The same loop
-    // folding the real result gives the stored value, so the copy differs in that arm only.
     let mut maps: Vec<OrderMap> = (0..w.books).map(|_| OrderMap::default()).collect();
     let (mut right, mut constant) = (0, 0);
     for &op in &w.map_ops {

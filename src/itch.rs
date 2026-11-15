@@ -1,38 +1,24 @@
-//! A zero-copy parser for Nasdaq TotalView-ITCH 5.0.
-//!
-//! A stream is a sequence of frames, each a 2-byte big-endian length followed by that many bytes
-//! of message. [`decode`] turns one message body into a [`Message`]; [`Frames`] walks a buffer of
-//! frames. Nothing allocates: decoded fields are integers (prices in $0.0001 ticks, quantities in
-//! shares) and byte arrays copied out of the input.
-//!
-//! The order messages (A, F, E, C, X, D, U), the system event (S), stock directory (R) and stock
-//! trading action (H) messages are fully decoded. Every other ITCH 5.0 message type is recognised by its type byte
-//! and its length is checked, then it is returned as [`Message::Other`]. An unknown type byte, a
-//! length that does not match the type, or a frame cut short is an error, never a skip.
+//! A zero-copy parser for Nasdaq TotalView-ITCH 5.0 messages and their length-prefixed frames.
 
 use std::fmt;
 
-/// Stock locate code: the per-day index of an instrument.
 pub type Locate = u16;
 
-/// An 8-byte, space-padded ASCII symbol as it appears in the feed.
 pub type Symbol = [u8; 8];
 
-/// Fields every ITCH 5.0 message starts with after its type byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub locate: Locate,
     pub tracking: u16,
-    /// Nanoseconds since midnight (48 bits on the wire).
     pub timestamp: u64,
 }
 
-/// One decoded ITCH 5.0 message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Message {
-    /// `S`: system event; `event` is the event code byte (`O`, `S`, `Q`, `M`, `E`, `C`).
-    SystemEvent { header: Header, event: u8 },
-    /// `R`: stock directory, which names the instrument behind a locate code.
+    SystemEvent {
+        header: Header,
+        event: u8,
+    },
     StockDirectory {
         header: Header,
         stock: Symbol,
@@ -50,43 +36,37 @@ pub enum Message {
         etp_leverage_factor: u32,
         inverse_indicator: u8,
     },
-    /// `H`: stock trading action. `state` is `H` (halted), `P` (paused), `Q` (quotation only)
-    /// or `T` (trading); while a security is not trading, Nasdaq accepts orders that cross.
     StockTradingAction {
         header: Header,
         stock: Symbol,
         state: u8,
         reason: [u8; 4],
     },
-    /// `A` (attribution `None`) or `F` (attribution `Some(mpid)`): a new displayed order.
     AddOrder {
         header: Header,
         reference: u64,
-        /// `true` for a buy (`B`), `false` for a sell (`S`).
         buy: bool,
         shares: u32,
         stock: Symbol,
         price: u32,
         attribution: Option<[u8; 4]>,
     },
-    /// `E` (price `None`) or `C` (price `Some`): shares of a resting order executed.
     OrderExecuted {
         header: Header,
         reference: u64,
         executed_shares: u32,
         match_number: u64,
-        /// For `C`: whether the execution prints to the tape, and the execution price.
         with_price: Option<ExecutionPrice>,
     },
-    /// `X`: part of a resting order cancelled.
     OrderCancel {
         header: Header,
         reference: u64,
         cancelled_shares: u32,
     },
-    /// `D`: a resting order deleted.
-    OrderDelete { header: Header, reference: u64 },
-    /// `U`: a resting order replaced by a new one on the same side.
+    OrderDelete {
+        header: Header,
+        reference: u64,
+    },
     OrderReplace {
         header: Header,
         original_reference: u64,
@@ -94,11 +74,12 @@ pub enum Message {
         shares: u32,
         price: u32,
     },
-    /// Any other ITCH 5.0 message, recognised and length-checked but not decoded.
-    Other { kind: u8, header: Header },
+    Other {
+        kind: u8,
+        header: Header,
+    },
 }
 
-/// The extra fields of an `Order Executed With Price` (`C`) message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionPrice {
     pub printable: bool,
@@ -121,22 +102,21 @@ impl Message {
     }
 }
 
-/// Why a frame or message could not be decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItchError {
-    /// The buffer ends partway through a frame: `needed` bytes are required, `available` remain.
-    Truncated { needed: usize, available: usize },
-    /// A frame with length zero has no type byte.
+    Truncated {
+        needed: usize,
+        available: usize,
+    },
     Empty,
-    /// The type byte is not an ITCH 5.0 message type.
-    UnknownType { kind: u8 },
-    /// The message length does not match the fixed length of its type.
+    UnknownType {
+        kind: u8,
+    },
     BadLength {
         kind: u8,
         expected: usize,
         actual: usize,
     },
-    /// A field holds a value the spec does not allow (for example a side other than `B`/`S`).
     BadField {
         kind: u8,
         field: &'static str,
@@ -174,42 +154,35 @@ impl fmt::Display for ItchError {
 
 impl std::error::Error for ItchError {}
 
-/// The fixed length in bytes (type byte included, length prefix excluded) of every ITCH 5.0
-/// message type, or `None` for a byte that is not a message type.
 pub fn message_length(kind: u8) -> Option<usize> {
     Some(match kind {
-        b'S' => 12, // system event
-        b'R' => 39, // stock directory
-        b'H' => 25, // stock trading action
-        b'Y' => 20, // Reg SHO short sale price test restricted indicator
-        b'L' => 26, // market participant position
-        b'V' => 35, // MWCB decline level
-        b'W' => 12, // MWCB status
-        b'K' => 28, // IPO quoting period update
-        b'J' => 35, // LULD auction collar
-        b'h' => 21, // operational halt
-        b'A' => 36, // add order, no MPID attribution
-        b'F' => 40, // add order with MPID attribution
-        b'E' => 31, // order executed
-        b'C' => 36, // order executed with price
-        b'X' => 23, // order cancel
-        b'D' => 19, // order delete
-        b'U' => 35, // order replace
-        b'P' => 44, // trade (non-cross)
-        b'Q' => 40, // cross trade
-        b'B' => 19, // broken trade
-        b'I' => 50, // net order imbalance indicator
-        b'N' => 20, // retail price improvement indicator
-        b'O' => 48, // direct listing with capital raise price discovery
+        b'S' => 12,
+        b'R' => 39,
+        b'H' => 25,
+        b'Y' => 20,
+        b'L' => 26,
+        b'V' => 35,
+        b'W' => 12,
+        b'K' => 28,
+        b'J' => 35,
+        b'h' => 21,
+        b'A' => 36,
+        b'F' => 40,
+        b'E' => 31,
+        b'C' => 36,
+        b'X' => 23,
+        b'D' => 19,
+        b'U' => 35,
+        b'P' => 44,
+        b'Q' => 40,
+        b'B' => 19,
+        b'I' => 50,
+        b'N' => 20,
+        b'O' => 48,
         _ => return None,
     })
 }
 
-/// Decodes one message body (the bytes after the 2-byte length prefix).
-///
-/// Errors are checked in this order: an empty body is `Empty`; an unknown type byte is
-/// `UnknownType` whatever the length; a length that does not match the type is `BadLength`; only
-/// a message of the right length can be `BadField`.
 pub fn decode(msg: &[u8]) -> Result<Message, ItchError> {
     let Some(&kind) = msg.first() else {
         return Err(ItchError::Empty);
@@ -308,8 +281,6 @@ pub fn decode(msg: &[u8]) -> Result<Message, ItchError> {
     })
 }
 
-/// Splits the first frame off `buf`. Returns the message body and the number of bytes the frame
-/// used, `Ok(None)` when `buf` is empty, or `Truncated` when `buf` ends inside the frame.
 pub fn split_frame(buf: &[u8]) -> Result<Option<(&[u8], usize)>, ItchError> {
     if buf.is_empty() {
         return Ok(None);
@@ -331,9 +302,6 @@ pub fn split_frame(buf: &[u8]) -> Result<Option<(&[u8], usize)>, ItchError> {
     }
 }
 
-/// Iterates over the frames in a buffer, decoding each. A trailing partial frame yields one
-/// `Truncated` error and ends the iteration; so does any other decode error. [`Frames::offset`]
-/// says how many bytes have been consumed, so a chunked reader can carry a partial frame over.
 #[derive(Clone, Debug)]
 pub struct Frames<'a> {
     buf: &'a [u8],
@@ -350,7 +318,6 @@ impl<'a> Frames<'a> {
         }
     }
 
-    /// Bytes consumed by the frames returned so far (not counting a failed frame).
     pub fn offset(&self) -> usize {
         self.offset
     }
@@ -393,7 +360,6 @@ fn side(kind: u8, byte: u8) -> Result<bool, ItchError> {
     }
 }
 
-// The callers have checked the message length against the type, so these slices are in bounds.
 fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
 }
@@ -424,12 +390,13 @@ fn arr8(b: &[u8], at: usize) -> [u8; 8] {
 mod tests {
     use super::*;
 
-    /// Builds a message: type byte, header with the given locate, then `body`.
     fn msg(kind: u8, locate: u16, body: &[u8]) -> Vec<u8> {
+        let tracking = 0x0102u16.to_be_bytes();
+        let timestamp = [0x00, 0x00, 0x12, 0x34, 0x56, 0x78];
         let mut m = vec![kind];
         m.extend_from_slice(&locate.to_be_bytes());
-        m.extend_from_slice(&0x0102u16.to_be_bytes()); // tracking
-        m.extend_from_slice(&[0x00, 0x00, 0x12, 0x34, 0x56, 0x78]); // timestamp
+        m.extend_from_slice(&tracking);
+        m.extend_from_slice(&timestamp);
         m.extend_from_slice(body);
         m
     }
@@ -732,7 +699,6 @@ mod tests {
         assert_eq!(full.len(), 2);
         assert!(full.iter().all(Result::is_ok));
 
-        // Every cut that is not on a frame boundary yields Truncated after the whole frames.
         let boundary = 2 + a.len();
         for cut in 1..stream.len() {
             let mut frames = Frames::new(&stream[..cut]);
@@ -762,14 +728,12 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[1], Err(ItchError::UnknownType { kind: b'Z' }));
 
-        // A frame whose length prefix disagrees with its type.
         let mut wrong = vec![0, 13];
         wrong.extend_from_slice(&msg(b'S', 0, b"OX"));
         assert!(matches!(
             Frames::new(&wrong).next(),
             Some(Err(ItchError::BadLength { .. }))
         ));
-        // A zero-length frame.
         assert_eq!(Frames::new(&[0, 0]).next(), Some(Err(ItchError::Empty)));
     }
 }

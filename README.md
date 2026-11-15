@@ -37,7 +37,7 @@ Built with AI coding agents under the author's direction. Every pull request tha
 The library crate has a single-instrument `OrderBook`.
 
 - Commands: limit and market orders, cancel, reduce (keeps time priority) and replace (new id, price and quantity; loses time priority and may trade). Invalid commands are rejected with a reason and leave the book unchanged.
-- Each command appends its events (accepted, trades, fills, cancels, reductions, replacements, rejections) to a `Vec<Event>` the caller owns, in a deterministic order documented on `Event`. A trade always prints at the resting order's price.
+- Each command appends its events (accepted, trades, fills, cancels, reductions, replacements, rejections) to a `Vec<Event>` the caller owns, in a deterministic order listed under "Library API rules". A trade always prints at the resting order's price.
 - Queries: best bid and ask, depth per level, a full snapshot of every resting order in priority order, one resting order's side, price and quantity (`order`), and the order with time priority at the best price of a side (`front_order`).
 - Prices are `u32` ticks of $0.0001 and quantities are `u32` shares, matching ITCH 5.0. Level totals are `u64`.
 - There is no self-trade prevention: orders carry no owner.
@@ -50,9 +50,51 @@ The replay and measurement rig:
 
 - `src/itch.rs` parses ITCH 5.0 without allocating. It fully decodes the order messages (A, F, E, C, X, D, U) and the system event (S), stock directory (R) and stock trading action (H) messages. Every other 5.0 message type is recognised and length-checked. An unknown type, a wrong length or a cut-off frame is an error.
 - `src/replay.rs` drives one `OrderBook` per stock locate from the messages (see "How ITCH maps to book commands").
-- `examples/replay.rs` replays a whole day, prints the summary counts and the golden hash, and records or checks them against `harness/golden/12302019.txt`. The hash encoding is documented in `harness/golden.rs`.
+- `examples/replay.rs` replays a whole day, prints the summary counts and the golden hash, and records or checks them against `harness/golden/12302019.txt`. The hash encoding is under "Checking the golden hash".
 - `examples/diff_slice.rs` replays busy symbols through the real book and the reference book and compares every event.
 - `examples/bench.rs` and `scripts/bench.sh` measure latency per message and throughput; `examples/micro.rs` times one part of the book at a time (see [BENCHMARKING.md](BENCHMARKING.md)).
+
+## Library API rules
+
+The book (`OrderBook`, `Command`, `Event`):
+
+- `OrderId` is `u64`, as ITCH order reference numbers are.
+- `Limit` matches against the opposite side while its price crosses, then rests the remainder. `Market` matches at any price and cancels its remainder.
+- `Reduce { by }` keeps time priority; reducing by the whole remaining quantity removes the order.
+- `Replace` cancels the order and enters a new limit order on the same side with `new_id` (which may equal `id`), `price` and `qty`. The new order loses time priority and may trade.
+- Events per command, in order:
+  - Limit: `Rejected`, or `Accepted`, then for each maker a `Trade` followed by the maker's `Filled` if the trade emptied it, then the taker's `Filled` if nothing is left. A remainder rests with no event.
+  - Market: `Rejected`, or `Accepted`, the same trades, then `Filled` or `Cancelled` for the taker's remainder.
+  - Cancel: `Rejected` or `Cancelled`. Reduce: `Rejected` or `Reduced`, with `remaining == 0` when the order was removed.
+  - Replace: `Rejected`, or `Replaced` followed by the new order's events as for Limit, without its `Accepted`.
+- `Filled` means the order has nothing left and is gone from the book. `Rejected.id` is the first id the command names (for Replace, the old id).
+- Rejection checks run in this order. Limit and Market: `ZeroQuantity`, `DuplicateOrderId`. Reduce: `UnknownOrder`, `ZeroQuantity`, `ReduceTooLarge`. Replace: `UnknownOrder`, `ZeroQuantity`, `DuplicateOrderId` (a `new_id` equal to the old id is fine).
+- `DuplicateOrderId` means the id belongs to an order resting in the book. `UnknownOrder` covers ids that never existed and orders already filled or cancelled.
+- `apply` never panics on bad input.
+- `check_invariants` returns an error when the book is crossed, a level is empty, a level's total differs from the sum of its orders, the levels and the id map disagree on an order's side, price or queue node, an order rests with zero quantity, a level's queue links disagree, or a queue node is in use that no order or level owns.
+- `LevelSnapshot.orders` lists `(id, remaining qty)` in time priority. `Snapshot` and `depth` list levels best price first.
+- The `internals` feature exposes the book's parts for `examples/micro.rs`. They are not a stable API.
+
+The ITCH parser (`itch`):
+
+- A stream is a sequence of frames, each a 2-byte big-endian length followed by that many bytes of message. Nothing allocates; decoded fields are integers and byte arrays copied out of the input.
+- `decode` takes the bytes after the length prefix and checks errors in this order: an empty body is `Empty`, an unknown type byte is `UnknownType` whatever the length, a length that does not match the type is `BadLength`, and only a message of the right length can be `BadField`.
+- `message_length` counts the type byte and not the length prefix.
+- `split_frame` returns `Ok(None)` for an empty buffer and `Truncated` when the buffer ends inside a frame.
+- `Frames` yields one `Truncated` error for a trailing partial frame and ends; any other error also ends it. `Frames::offset` counts the bytes of the frames returned so far, so a chunked reader can carry a partial frame over.
+- `Header.timestamp` is nanoseconds since midnight (48 bits on the wire). `Locate` is the per-day index of an instrument. `Symbol` is 8 bytes of space-padded ASCII.
+- An add order's `buy` is `true` for `B` and `false` for `S`. An `H` message's state is `H` (halted), `P` (paused), `Q` (quotation only) or `T` (trading). An `S` message's event code is one of `O`, `S`, `Q`, `M`, `E`, `C`.
+- Recognised and length-checked but not decoded: `Y` (Reg SHO restriction), `L` (market participant position), `V` (MWCB decline level), `W` (MWCB status), `K` (IPO quoting period update), `J` (LULD auction collar), `h` (operational halt), `P` (non-cross trade), `Q` (cross trade), `B` (broken trade), `I` (net order imbalance), `N` (retail price improvement), `O` (direct listing with capital raise price discovery).
+
+The replay driver (`replay`):
+
+- Synthetic aggressor ids start at `TAKER_ID_BASE` (2^63). An ITCH reference number at or above it is a `ReplayError`, and so is an aggressor that did not trade exactly against the named order.
+- A `C` execution's price is ignored: the aggressor trades at the resting order's price, and `c_price_differs` counts how often the two differ.
+- `R` records a locate's symbol and `H` its trading state; no other non-order message changes a book.
+- An execution falls back to `Reduce`, counted in `exec_fallback_*`, when the named order rests at a price worse than its side's best (`not_best_price`), at the best price behind an older order (`behind_at_best`), is not in the book (`unknown`), has fewer shares left than the execution (`too_large`), or the execution is for zero shares (`zero_shares`).
+- A security counts as trading when its last `H` state was `T` or no `H` has arrived for it yet.
+- `rejections` is indexed by command kind (`CommandKind::ALL`) and reason (zero quantity, duplicate order id, unknown order, reduce too large); read it with `Stats::rejections_for`.
+- `books` returns every book up to the highest locate that has received a command, by ascending locate; locates that never received one have empty books.
 
 ## Running the tests
 
@@ -62,6 +104,8 @@ cargo test --all-targets
 
 - `tests/book.rs` holds the unit tests for the edge cases.
 - `tests/prop.rs` sends random command streams to both books and requires identical events and identical snapshots after every command, along with the book's internal invariants. It runs 2,000 streams by default; set `PROPTEST_CASES` to run more, for example `PROPTEST_CASES=50000 cargo test --release --test prop`. It also checks that the generators reach the cases they are meant to cover.
+- `tests/prop.rs` also checks four properties of the book on its own, from a fixed seed: matching never leaves the book crossed; shares are conserved (twice the traded shares plus the resting, cancelled, reduced and replaced-away shares equal the shares submitted); makers trade best price first and oldest first within a price; and cancelling a resting order twice cancels it once and then rejects it with `UnknownOrder`, leaving the book unchanged.
+- `tests/layout.rs` requires every tracked file to sit under a known top-level folder or be a known top-level file, and `tests/features.rs` keeps `features.json`, the map of user-facing capabilities, complete: every library module, example and script is mapped, every mapped file exists, and each Python script's `--help` exits 0.
 - `tests/deep.rs` is a deterministic deep-book differential test. It builds 300 price levels per side with queues of up to 252 orders, then cancels, reduces, replaces, sweeps, drains and repopulates, comparing events, snapshots and invariants with the reference after each of its 8,684 commands.
 - `tests/replay.rs` covers the ITCH-to-command mapping and the counters; `tests/golden.rs` pins the hash encoding with digests computed independently from the documented byte layout; the parser's tests are in `src/itch.rs`.
 - `tests/workload.rs` checks the microbenchmark workloads (see "Microbenchmarks" in [BENCHMARKING.md](BENCHMARKING.md)) on a hand-made command stream: the derived operations rebuild each book's orders, levels and resting shares, each order-map operation matches a lookup the book makes, and the encoding round-trips. It also checks that the `level` operations contain exactly the looks at the front of a queue that the book makes. Its tests of the adapters that drive the real parts, of the share totals that catch an adapter skipping quantity changes, and of the read check that catches an adapter skipping a lookup or returning the wrong result, need the `internals` feature, so run the suite a second time with it:
@@ -70,7 +114,7 @@ cargo test --all-targets
 cargo test --all-targets --features internals
 ```
 
-CI runs `cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` both without and with `--features internals`, on every push to a branch other than `main`. CI never sees the ITCH file. The golden check, the differential slice and the benchmark are local runs under Linux.
+CI runs the comment-ban lint (`python3 setup/lint/ratchet`, see `setup/lint/README.md`, with the layer rules in `setup/lint/rules/matching-engine-layers.yml`), the lint pack's tests (`python3 -m unittest discover -s setup/lint/tests`) and `python3 scripts/test_compare_summary.py`, then `cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` both without and with `--features internals`, on every push to a branch other than `main`. CI never sees the ITCH file. The golden check, the differential slice and the benchmark are local runs under Linux.
 
 ## The ITCH data
 
@@ -107,9 +151,27 @@ cargo build --release --example replay
     --check harness/golden/12302019.txt "$ITCH_DIR"/12302019.NASDAQ_ITCH50
 ```
 
-The run takes about five minutes. It recomputes every line of the golden file (the input's size and SHA-256, message counts by type, execution, rejection and unexpected-trade counts, and the replay hash) and exits with status 1, printing the recorded and computed value of each differing line, if anything changed. `--write FILE` records a new golden file; `--limit N` stops after N messages for quick looks; `--diagnose` prints each unexpected trade and rejection with its time and the book's best prices, and breaks down the fallback executions.
+The run takes about five minutes. It recomputes every line of the golden file (the input's size and SHA-256, message counts by type, execution, rejection and unexpected-trade counts, and the replay hash) and exits with status 1, printing the recorded and computed value of each differing line, if anything changed. The `input_file` line is informational and never compared. `--write FILE` records a new golden file; `--limit N` stops after N messages for quick looks; `--diagnose` prints each unexpected trade and rejection with its time and the book's best prices, and breaks down the fallback executions.
 
 The replay hash is SHA-256 over every event of every book in message order, each tagged with its stock locate, plus the full state of every book (every level and order in priority order) every 2^20 messages (256 times over the sample day), after each system event and at the end. Events alone do not show where an order rests, since accepts, cancels and reductions carry no price and most orders are deleted without trading; the state checkpoints do. A change that alters any event, or the price level or queue position of any order resting at one of the checkpoints, changes the hash.
+
+The hash encoding, version 2 (`harness/golden.rs`). All integers are little-endian and fixed width. Every record starts with its own tag byte and has a fixed length given by the tag or by a count inside it, so the stream parses one way only.
+
+1. The ASCII domain string `matching-engine/replay-hash/v2\n` (31 bytes).
+2. For every event, in message order and then event order: the tag, the stock locate (`u16`), then the fields:
+   - `0x01` Accepted: id `u64`
+   - `0x02` Trade: taker id `u64`, maker id `u64`, price `u32`, qty `u32`
+   - `0x03` Filled: id `u64`
+   - `0x04` Cancelled: id `u64`, remaining `u32`
+   - `0x05` Reduced: id `u64`, by `u32`, remaining `u32`
+   - `0x06` Replaced: old id `u64`, new id `u64`
+   - `0x07` Rejected: id `u64`, reason `u8` (1 zero quantity, 2 duplicate order id, 3 unknown order, 4 reduce too large)
+
+   After a message's events and before the next message's, up to two checkpoints: after each `S` message, `0xF1`, the system event code byte, then the state of every book as in 3; after every message whose 1-based position is a multiple of `PERIOD` (2^20), `0xF2`, that position (`u64`), then the state of every book. When both apply, `0xF1` comes first.
+3. The final state: `0xF0`, then the number of books holding at least one order (`u32`), then each of those books by ascending locate: the locate (`u16`), then the bid side and the ask side, each a level count (`u32`) followed by every level best price first: price (`u32`), order count (`u32`), then each order in time priority as id (`u64`) and remaining qty (`u32`).
+4. `0xFF`, the number of messages replayed (`u64`) and the number of events (`u64`), which catch a stream cut short.
+
+Messages that change no book add nothing except to the message count and the checkpoints that fall on them. The `S` checkpoints add the start of market hours at 09:30 and the end at 16:00 to the periodic ones.
 
 ## Differential replay against the reference book
 
@@ -118,7 +180,7 @@ cargo build --release --example diff_slice
 "${CARGO_TARGET_DIR:-target}"/release/examples/diff_slice "$ITCH_DIR"/12302019.NASDAQ_ITCH50
 ```
 
-By default it takes AAPL, MSFT, AMD, TSLA, QQQ and SPY from the start of the day and stops after 5,000,000 of their book commands, which takes about two and a half minutes. It compares every event with the reference book, and snapshots and invariants every 200 commands per book and at the end. The default slice reaches books of up to 22,282 orders on 4,769 levels with queues of up to 1,336 orders. `--symbols A,B`, `--limit N` (0 for the whole day) and `--snapshot-every K` change the slice.
+By default it takes AAPL, MSFT, AMD, TSLA, QQQ and SPY from the start of the day and stops after 5,000,000 of their book commands, which takes about two and a half minutes. It compares every event with the reference book, and snapshots and invariants every 200 commands per book and at the end. The default slice reaches books of up to 22,282 orders on 4,769 levels with queues of up to 1,336 orders. `--symbols A,B`, `--limit N` (0 for the whole day) and `--snapshot-every K` change the slice. `--limit` counts book commands of the chosen symbols. It exits with status 1 on the first difference, printing the command and both event lists.
 
 ## Benchmark
 

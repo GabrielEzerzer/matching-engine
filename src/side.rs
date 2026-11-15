@@ -1,35 +1,14 @@
-//! Price-level lookup for one side of the book.
-//!
-//! A sorted index of `(key, slot)` pairs, worst price first so the best is the last element,
-//! points into a slab of levels. Most activity is within a few levels of the best: a lookup
-//! scans a few index entries back from the end before it falls back to a binary search, and
-//! creating or removing a level moves only the 8-byte index entries better than it, never a
-//! level. A removed level stays in the slab, empty, and the next level created takes its slot,
-//! so levels created and destroyed near the best reuse their queue's buffer instead of
-//! allocating a new one.
+//! Price-level lookup for one side of the book: a sorted index into a slab of levels.
 
 use crate::level::Level;
 use crate::types::{OrderId, Price, Qty, Side};
 
-/// How many index entries back from the best a lookup compares one by one before it
-/// binary-searches the rest.
 const SCAN: usize = 8;
 
 #[derive(Debug)]
 pub struct BookSide {
-    /// XORed into a price to make its sort key: zero for bids, all ones for asks. The key grows
-    /// as the price gets better on either side, over the whole `u32` range, so the best level is
-    /// always last.
     flip: u32,
-    /// `(key, slot in levels)`, sorted by key, worst price first.
-    /// shortcut: inserting or removing a level far from the best price moves every better entry
-    /// (8 bytes each), so its cost grows with book depth; switch to a tree or a chunked index if
-    /// books much deeper than the sample day's become normal.
     index: Vec<(u32, u32)>,
-    /// Every level this side has held at once. Slots not in `index` are empty and listed in
-    /// `free`.
-    /// shortcut: the slab never shrinks, so a side keeps its peak level count and each slot's
-    /// largest queue buffer for the day; free them if memory per book starts to matter.
     levels: Vec<Level>,
     free: Vec<u32>,
 }
@@ -47,8 +26,6 @@ impl BookSide {
         }
     }
 
-    /// `Ok(position)` in the index of the price with sort key `key`, or `Err(position)` where it
-    /// would be inserted.
     fn find(&self, key: u32) -> Result<usize, usize> {
         let split = self.index.len().saturating_sub(SCAN);
         for i in (split..self.index.len()).rev() {
@@ -60,7 +37,6 @@ impl BookSide {
                 return Err(i + 1);
             }
         }
-        // Every scanned entry is better than `key`, so its place is in the rest.
         self.index[..split].binary_search_by_key(&key, |&(k, _)| k)
     }
 
@@ -69,11 +45,9 @@ impl BookSide {
         Some(self.index[i].1 as usize)
     }
 
-    /// Takes the level at `position` out of the index and frees its slot. The level must be empty.
     fn remove_at(&mut self, position: usize) {
         let (_, slot) = self.index.remove(position);
         let level = &self.levels[slot as usize];
-        // Checked in release builds too: freeing a level that still holds orders would lose them.
         assert!(
             level.is_empty() && level.total() == 0,
             "only empty levels are freed"
@@ -81,7 +55,6 @@ impl BookSide {
         self.free.push(slot);
     }
 
-    /// Highest bid or lowest ask.
     pub fn best_price(&self) -> Option<Price> {
         self.index.last().map(|&(key, _)| key ^ self.flip)
     }
@@ -111,14 +84,12 @@ impl BookSide {
         &mut self.levels[slot as usize]
     }
 
-    /// Drops the level at `price`, which must be empty.
     pub fn remove_level(&mut self, price: Price) {
         if let Ok(i) = self.find(price ^ self.flip) {
             self.remove_at(i);
         }
     }
 
-    /// Removes a resting order and drops its level if that left it empty.
     pub fn remove_order(&mut self, price: Price, id: OrderId, remaining: Qty) {
         let i = self.find(price ^ self.flip).expect("order's level exists");
         let level = &mut self.levels[self.index[i].1 as usize];
@@ -128,7 +99,6 @@ impl BookSide {
         }
     }
 
-    /// Levels from the best price outwards.
     pub fn levels_best_first(&self) -> impl Iterator<Item = (Price, &Level)> + '_ {
         self.index
             .iter()
@@ -151,7 +121,6 @@ mod tests {
         side.levels_best_first().map(|(price, _)| price).collect()
     }
 
-    /// The node slab and the id-to-node map the book keeps beside its two sides.
     #[derive(Default)]
     struct Queues {
         nodes: Nodes,
@@ -165,15 +134,12 @@ mod tests {
             self.slots.insert(id, slot);
         }
 
-        /// Cancels the way the book does: unlink the order's node, then remove it from its level.
         fn cancel(&mut self, side: &mut BookSide, price: Price, id: OrderId, remaining: Qty) {
             let slot = self.slots.remove(&id).expect("the order was added");
             self.nodes.unlink(slot);
             side.remove_order(price, id, remaining);
         }
 
-        /// Takes the level's front order off the way a fill does: pop its node, then forget it.
-        /// The caller reduces the level's total first, as matching does.
         fn pop_front(&mut self, level: &mut Level) {
             let id = level.front(&self.nodes).expect("an order rests");
             level.pop_front(&mut self.nodes);
@@ -181,7 +147,6 @@ mod tests {
         }
     }
 
-    /// `prices` sorted best first for `side`.
     fn best_first(side: Side, prices: &[Price]) -> Vec<Price> {
         let mut sorted = prices.to_vec();
         sorted.sort_unstable();
@@ -247,7 +212,6 @@ mod tests {
                 queues.add(&mut side, price, OrderId::from(price), 1);
             }
             let want = best_first(s, &[100, 101, 102]);
-            // Remove the best the way matching does: empty the level, then drop it.
             let best = side.best_price().expect("not empty");
             let level = side.level_mut(best).expect("best level exists");
             level.reduce(1);
@@ -255,7 +219,6 @@ mod tests {
             side.remove_level(best);
             assert_eq!(side.best_price(), Some(want[1]));
             assert_eq!(prices(&side), want[1..]);
-            // Remove the worst through a cancel.
             queues.cancel(&mut side, want[2], OrderId::from(want[2]), 1);
             assert_eq!(prices(&side), want[1..2]);
             queues.cancel(&mut side, want[1], OrderId::from(want[1]), 1);
@@ -303,8 +266,6 @@ mod tests {
         }
     }
 
-    /// Compares `side` with `model` (price to its one resting order): the best price, every level
-    /// best first, and lookups of every level price, the prices next to each and the extremes.
     fn check_against(
         side: &BookSide,
         nodes: &Nodes,
@@ -326,10 +287,6 @@ mod tests {
         }
     }
 
-    /// Level counts on both sides of `SCAN`, built in orders that put new levels at the best,
-    /// at the worst and in the middle, so lookups go through both the scan and the binary
-    /// search. Each build removes one level at every position in turn, refills the freed slot,
-    /// then drains, checking against a `BTreeMap` after every step.
     #[test]
     fn scan_and_binary_search_boundary() {
         for s in SIDES {
@@ -363,7 +320,6 @@ mod tests {
                             );
                         }
 
-                        // Remove the level at `position` from the best through a cancel.
                         let p = prices(&side)[position];
                         queues.cancel(&mut side, p, model[&p], 1);
                         model.remove(&p);
@@ -375,7 +331,6 @@ mod tests {
                             &format!("{at}, removed {p}"),
                         );
 
-                        // A new level next to the removed one takes its slot.
                         next_id += 1;
                         queues.add(&mut side, p + 5, next_id, 1);
                         model.insert(p + 5, next_id);
@@ -389,8 +344,6 @@ mod tests {
                             &format!("{at}, inserted {}", p + 5),
                         );
 
-                        // Drain the way matching does: empty the level at `position`, or the
-                        // worst once fewer remain, then drop it.
                         while !model.is_empty() {
                             let p = prices(&side)[position.min(model.len() - 1)];
                             let level = side.level_mut(p).expect("level exists");
@@ -413,7 +366,6 @@ mod tests {
         }
     }
 
-    /// SplitMix64, so the stream is the same on every run.
     struct Rng(u64);
 
     impl Rng {
@@ -430,8 +382,6 @@ mod tests {
         }
     }
 
-    /// Mostly a narrow band of penny prices, some anywhere in the `u32` range, and the extremes,
-    /// so a side grows to thousands of levels with most of the churn near the best.
     fn price(rng: &mut Rng) -> Price {
         match rng.below(10) {
             0..=6 => 1_000_000 + 100 * rng.below(60) as Price,
@@ -440,8 +390,6 @@ mod tests {
         }
     }
 
-    /// Random adds, cancels and best-level drains against a `BTreeMap` model, comparing the best
-    /// price and a lookup after each step and the full level list regularly.
     #[test]
     fn matches_a_btreemap_model() {
         for s in SIDES {
