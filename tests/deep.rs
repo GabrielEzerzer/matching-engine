@@ -1,12 +1,5 @@
-//! A deterministic deep-book differential test. It builds hundreds of price levels on each side
-//! and long queues at a few of them, all with unique ids, then cancels, reduces, replaces,
-//! sweeps, drains and repopulates the book. After every command the real book must emit the same
-//! events as the slow reference book and hold the same orders in the same priority, and its
-//! invariants must hold.
-//!
-//! The property test (`tests/prop.rs`) uses short streams over a dozen prices; this one reaches
-//! the shapes an optimised book could get wrong only at depth: many levels, queues hundreds
-//! long, levels emptied and reused, and the id map growing and shrinking repeatedly.
+//! A deterministic deep-book differential test against the slow reference book: hundreds of levels per side,
+//! long queues, cancels, reduces, replaces, sweeps, drains and repopulation, compared after every command.
 
 #[path = "../harness/reference.rs"]
 mod reference;
@@ -14,7 +7,6 @@ mod reference;
 use matching_engine::{Command, Event, OrderBook, OrderId, Price, Qty, Side, Snapshot};
 use reference::ReferenceBook;
 
-/// A small deterministic generator (SplitMix64), so the stream is identical on every run.
 struct Rng(u64);
 
 impl Rng {
@@ -45,7 +37,6 @@ struct Harness {
     max_orders: usize,
     max_levels: usize,
     max_queue: usize,
-    /// The snapshot after the last command, used to pick live orders.
     snapshot: Snapshot,
 }
 
@@ -165,14 +156,12 @@ impl Harness {
     }
 }
 
-/// Bids rest at 10_000..10_000+LEVELS, asks above them, so building never crosses.
 const LEVELS: u32 = 300;
 const BID_LO: Price = 10_000;
 const ASK_LO: Price = BID_LO + LEVELS;
 const ASK_HI: Price = ASK_LO + LEVELS - 1;
 
 fn populate(h: &mut Harness, rng: &mut Rng, bid_lo: Price, ask_lo: Price) {
-    // One or two orders on every level of both sides.
     for i in 0..LEVELS {
         for _ in 0..1 + rng.below(2) {
             let q = rng.range(1, 500);
@@ -181,7 +170,6 @@ fn populate(h: &mut Harness, rng: &mut Rng, bid_lo: Price, ask_lo: Price) {
             h.limit(Side::Sell, ask_lo + i, q);
         }
     }
-    // Deep queues at the touch and at one level in the middle of each side.
     for _ in 0..250 {
         let q = rng.range(1, 300);
         h.limit(Side::Buy, bid_lo + LEVELS - 1, q);
@@ -196,7 +184,6 @@ fn populate(h: &mut Harness, rng: &mut Rng, bid_lo: Price, ask_lo: Price) {
     }
 }
 
-/// Random cancels, reduces, replaces and passive adds, with an occasional crossing order.
 fn churn(h: &mut Harness, rng: &mut Rng, steps: usize) {
     for _ in 0..steps {
         let Some((id, qty)) = h.pick(rng) else {
@@ -205,7 +192,6 @@ fn churn(h: &mut Harness, rng: &mut Rng, steps: usize) {
         match rng.below(100) {
             0..=24 => h.apply(Command::Cancel { id }),
             25..=44 => {
-                // Partial reduce, or exactly what is left (removes the order).
                 let by = if rng.below(4) == 0 {
                     qty
                 } else {
@@ -214,8 +200,6 @@ fn churn(h: &mut Harness, rng: &mut Rng, steps: usize) {
                 h.apply(Command::Reduce { id, by });
             }
             45..=64 => {
-                // Replace to a random price on either side's range: usually passive, sometimes
-                // crossing (it then trades). Half keep the id, half take a fresh one.
                 let new_id = if rng.below(2) == 0 { id } else { h.fresh_id() };
                 let price = rng.range(BID_LO, ASK_HI);
                 let qty = rng.range(1, 400);
@@ -250,7 +234,6 @@ fn churn(h: &mut Harness, rng: &mut Rng, steps: usize) {
     }
 }
 
-/// Large orders that each take out many levels, then one that clears the rest of a side.
 fn sweep(h: &mut Harness, side: Side) {
     let opposite = match side {
         Side::Buy => Side::Sell,
@@ -276,8 +259,6 @@ fn sweep(h: &mut Harness, side: Side) {
     assert!(h.live_on(opposite).is_empty(), "sweep cleared {opposite:?}");
 }
 
-/// Cancels every order on one side in random order, then reduces every order of the other side
-/// to nothing, so both sides end empty without trading.
 fn drain(h: &mut Harness, rng: &mut Rng) {
     let mut bids = h.live_on(Side::Buy);
     while !bids.is_empty() {
@@ -304,7 +285,6 @@ fn deep_book_matches_reference_through_build_churn_sweep_drain_and_repopulate() 
     sweep(&mut h, Side::Sell);
     drain(&mut h, &mut rng);
 
-    // Repopulate on prices shifted so old and new levels overlap, with ids continuing upwards.
     populate(&mut h, &mut rng, BID_LO + LEVELS / 3, ASK_LO + LEVELS / 3);
     churn(&mut h, &mut rng, 1_500);
     drain(&mut h, &mut rng);
@@ -316,7 +296,6 @@ fn deep_book_matches_reference_through_build_churn_sweep_drain_and_repopulate() 
         "deep book: {} commands, {} events, {} trades, up to {} orders on {} levels, longest queue {}",
         h.commands, h.events, h.trades, h.max_orders, h.max_levels, h.max_queue
     );
-    // The stream must actually reach the depths it is meant to cover.
     assert!(
         h.max_levels >= 2 * LEVELS as usize,
         "levels {}",

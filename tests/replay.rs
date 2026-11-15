@@ -1,5 +1,5 @@
-//! Tests for the ITCH replay driver: the message-to-command mapping, the aggressor replay of
-//! executions and its fallback, and the counters.
+//! Tests for the ITCH replay driver: the message-to-command mapping, the aggressor replay of executions and
+//! its fallback, and the counters.
 
 use matching_engine::itch::{ExecutionPrice, Header, Message};
 use matching_engine::replay::{CommandKind, Replay, ReplayError, TAKER_ID_BASE};
@@ -59,7 +59,6 @@ fn trading_action(state: u8) -> Message {
     }
 }
 
-/// Applies a message and returns its command and events.
 fn run(replay: &mut Replay, msg: Message) -> (Option<Command>, Vec<Event>) {
     let applied = replay.apply(&msg).expect("replay ok");
     assert_eq!(applied.locate, msg.header().locate);
@@ -183,7 +182,6 @@ fn execution_of_the_front_order_replays_as_an_aggressor() {
         ]
     );
 
-    // The rest of order 1: the maker's fill comes before the taker's, and the taker id advances.
     let (_, events) = run(&mut r, exec(1, 20));
     let t2 = TAKER_ID_BASE + 1;
     assert_eq!(
@@ -210,8 +208,6 @@ fn execution_of_the_front_order_replays_as_an_aggressor() {
 
 #[test]
 fn default_replay_numbers_takers_like_new() {
-    // A default replay must keep synthetic taker ids away from ITCH references: a taker id of 1
-    // would collide with resting reference 1 and abort the replay.
     let mut r = Replay::default();
     run(&mut r, add(1, false, 2, 1000));
     let (cmd, _) = run(&mut r, exec(1, 1));
@@ -333,7 +329,6 @@ fn execution_of_zero_shares_on_the_front_order_falls_back_to_reduce() {
         s.rejections_for(CommandKind::ExecutionFallback, RejectReason::ZeroQuantity),
         1
     );
-    // The order is untouched and a later execution still replays as an aggressor.
     run(&mut r, exec(1, 5));
     assert_eq!(r.stats().exec_aggressor, 1);
 }
@@ -344,7 +339,6 @@ fn crossing_adds_are_counted_by_trading_state_and_mark_the_book_diverged() {
     run(&mut r, trading_action(b'H'));
     assert_eq!(r.trading_state(L), Some(b'H'));
     run(&mut r, add(1, false, 50, 1000));
-    // Halted: Nasdaq would rest this crossing buy; our book trades it.
     let (_, events) = run(&mut r, add(2, true, 20, 1001));
     assert!(matches!(events[1], Event::Trade { maker_id: 1, .. }));
     assert!(r.diverged(L));
@@ -353,7 +347,6 @@ fn crossing_adds_are_counted_by_trading_state_and_mark_the_book_diverged() {
     assert_eq!(s.unexpected_trade_messages_while_trading, 0);
     assert_eq!(s.unexpected_trades, 1);
 
-    // Nasdaq still has order 2 and deletes it: our book has nothing to delete.
     run(
         &mut r,
         Message::OrderDelete {
@@ -368,7 +361,6 @@ fn crossing_adds_are_counted_by_trading_state_and_mark_the_book_diverged() {
     );
     assert_eq!(s.rejections_on_diverged_books, 1);
 
-    // Once trading, a crossing add on the already diverged book is counted as such.
     run(&mut r, trading_action(b'T'));
     run(&mut r, add(3, true, 10, 1000));
     let s = r.stats();
@@ -475,7 +467,6 @@ fn non_book_messages_change_no_book_and_books_are_per_locate() {
     );
     assert_eq!(cmd, None);
 
-    // The same reference may not repeat in one book, but books are separate per locate.
     let mut a = add(1, true, 10, 100);
     if let Message::AddOrder { header, .. } = &mut a {
         header.locate = 3;

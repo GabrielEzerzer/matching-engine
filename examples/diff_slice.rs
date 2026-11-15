@@ -1,16 +1,5 @@
-//! Feeds real ITCH messages for a set of symbols through both the real book and the slow
-//! reference book (`harness/reference.rs`) and requires identical events for every command, plus
-//! identical snapshots and the real book's invariants every `--snapshot-every` commands per book
-//! and at the end. The reference is O(resting orders) per operation, so the slice is bounded by
-//! the symbol set and an optional message limit.
-//!
-//! ```text
-//! diff_slice [--symbols A,B,...] [--limit N] [--snapshot-every K] FILE
-//! ```
-//!
-//! `--limit` counts book commands of the chosen symbols (default 5,000,000, which takes about
-//! two and a half minutes in release mode; `--limit 0` runs the whole day). Exits with status 1
-//! on the first difference, printing the command and both event lists.
+//! Feeds real ITCH messages for a set of symbols through the real book and the slow reference book.
+//! Events must match for every command; snapshots and invariants are compared every --snapshot-every commands per book.
 
 #[path = "../harness/reference.rs"]
 mod reference;
@@ -28,8 +17,6 @@ use matching_engine::{Command, OrderBook};
 use reference::ReferenceBook;
 use stream::{ChunkReader, DEFAULT_CHUNK};
 
-/// Busy Nasdaq symbols with deep books on the sample day; see the README for the measured
-/// coverage and runtime of this default.
 const DEFAULT_SYMBOLS: &str = "AAPL,MSFT,AMD,TSLA,QQQ,SPY";
 const DEFAULT_SNAPSHOT_EVERY: u64 = 200;
 const DEFAULT_LIMIT: u64 = 5_000_000;
@@ -90,7 +77,6 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-/// Per-book counters for the report.
 #[derive(Default)]
 struct Coverage {
     commands: u64,

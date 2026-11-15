@@ -1,5 +1,4 @@
-//! A deliberately slow reference book used only by the tests. It keeps every resting order in
-//! one flat Vec with a global sequence number and finds each match by scanning the whole Vec.
+//! A slow reference book for the tests: every resting order in one flat Vec, each match found by a full scan.
 //! It shares the crate's public command and event types but none of its internals.
 
 use matching_engine::{
@@ -11,7 +10,6 @@ struct RefOrder {
     side: Side,
     price: Price,
     qty: Qty,
-    /// Arrival order; lower is older. Reduce keeps it, Replace takes a new one.
     seq: u64,
 }
 
@@ -115,8 +113,6 @@ impl ReferenceBook {
         self.orders.iter().position(|o| o.id == id)
     }
 
-    /// The resting order a taker on `side` would trade with next: the best price it is allowed
-    /// to hit, then the oldest order at that price.
     fn best_counterparty(&self, side: Side, limit: Option<Price>) -> Option<usize> {
         self.orders
             .iter()

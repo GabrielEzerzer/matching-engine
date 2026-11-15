@@ -1,21 +1,8 @@
 #!/usr/bin/env python3
-# Summarises the runs of a scripts/compare.sh comparison and gives its verdict. compare.sh calls
-# it, and compare.sh's header and BENCHMARKING.md describe the rule. It recomputes everything from the
-# run lines, so -r and -f work on any saved comparison, and scripts/test_compare_summary.py checks
-# the arithmetic without a benchmark.
-#
-#   compare_summary.py [--check] [-s STAT] [-f FLOOR] RUNS
-#
-# RUNS holds the run lines (benchmark JSON lines with "pair", "position" and "role" added) and one
-# metadata line: compare.sh's {"meta":true,...} line during a run, or the {"summary":true,...}
-# line of an earlier compare.sh output. --check only validates STAT and FLOOR against that
-# metadata. stdout: one {"pair_diff":true,...} line per pair, then one {"summary":true,...} line.
-# Tables go to stderr. A refusal exits with status 2.
-#
-# All arithmetic is on d = 100 * ln(candidate / baseline), so that a multiplicative advantage of
-# running second cancels exactly between the two orders. Effects, interval ends, order effects and
-# floors are converted back to percent changes for display; the JSON keeps both, the log-scale
-# values under names ending in _ln_x100.
+# Summarises the runs of a scripts/compare.sh comparison and gives its verdict; compare.sh calls it.
+# BENCHMARKING.md, "Comparing two builds", describes the inputs, the outputs and the rule.
+# All arithmetic is on d = 100 * ln(candidate / baseline); the JSON keeps log-scale values under names ending _ln_x100.
+
 import argparse
 import json
 import math
@@ -23,12 +10,9 @@ import sys
 
 LATENCY = [f"{scope}_{q}_ns" for scope in ("all", "book") for q in ("mean", "p50", "p99", "p999")]
 THROUGHPUT = "throughput_msgs_per_s"
-# examples/micro.rs, compared with compare.sh -m PART.
 MICRO = ["ns_per_op_median", "ns_per_op_min"]
 MIN_PER_ORDER = 3
 
-# One-sided 99% critical values of Student's t by degrees of freedom. A df between two rows uses
-# the row below it, which gives the larger, more cautious value.
 T99 = {1: 31.821, 2: 6.965, 3: 4.541, 4: 3.747, 5: 3.365, 6: 3.143, 7: 2.998, 8: 2.896,
        9: 2.821, 10: 2.764, 11: 2.718, 12: 2.681, 13: 2.650, 14: 2.624, 15: 2.602, 16: 2.583,
        17: 2.567, 18: 2.552, 19: 2.539, 20: 2.528, 25: 2.485, 30: 2.457, 40: 2.423, 60: 2.390,
@@ -54,12 +38,10 @@ def var(xs):
 
 
 def pct(x):
-    """A difference of 100 * ln(ratio) as a percent change."""
     return None if x is None else 100 * math.expm1(x / 100)
 
 
 def load(path):
-    """The metadata line, the runs by (pair, role), and the pairs that have both runs."""
     meta, runs = None, {}
     with open(path) as fh:
         for line in fh:
@@ -99,28 +81,22 @@ def d(runs, p, stat):
 
 
 def diffs(runs, pairs, stat):
-    """d over the baseline-first pairs and over the candidate-first pairs."""
     ab = [d(runs, p, stat) for p in pairs if baseline_first(runs, p)]
     ba = [d(runs, p, stat) for p in pairs if not baseline_first(runs, p)]
     return ab, ba
 
 
 def estimate(ab, ba, higher_is_better):
-    """Effect, order effect and the effect's uncertainty, as 100 * ln(ratio); None where not
-    measured."""
     e = dict(effect=None, order=None, se=None, df=None, t=None, bound=None)
     if ab and ba:
         e["effect"] = (mean(ab) + mean(ba)) / 2
-        # Half the gap between the two orders' means: how much running second helps.
         order = (mean(ba) - mean(ab)) / 2
         e["order"] = -order if higher_is_better else order
     if len(ab) >= 2 and len(ba) >= 2:
-        # The variance within each order only, so the constant order effect stays out of it.
         a, b = var(ab) / len(ab), var(ba) / len(ba)
         if a + b == 0:
             e.update(se=0.0, bound=0.0)
         else:
-            # Welch-Satterthwaite degrees of freedom: the two orders may be unequally noisy.
             df = max(1, math.floor((a + b) ** 2 / (a * a / (len(ab) - 1) + b * b / (len(ba) - 1))))
             se = math.sqrt(a + b) / 2
             e.update(se=se, df=df, t=t99(df), bound=t99(df) * se)
@@ -128,7 +104,6 @@ def estimate(ab, ba, higher_is_better):
 
 
 def rule(e, higher_is_better, floor=0.0):
-    """What the interval says on its own, or None when there is no bound."""
     if e["bound"] is None:
         return None
     gain = e["effect"] if higher_is_better else -e["effect"]
@@ -140,7 +115,6 @@ def rule(e, higher_is_better, floor=0.0):
 
 
 def floors(path, meta, stats):
-    """Per statistic, the A/A comparison's absolute effect plus its own bound (log scale)."""
     fmeta, fruns, fpairs = load(path)
     if not same_binary(fmeta):
         die(f"{path} is not an A/A comparison (the same binary twice, by SHA-256)")
@@ -157,10 +131,6 @@ def floors(path, meta, stats):
 
 
 def report(e, floor, higher_is_better):
-    """The numbers of one statistic for the summary line: percent changes and the log scale.
-    order_effect_pct is how much faster the second run was. floor_pct is the bar the interval's
-    better end must clear for improved (latency: high_pct below it; throughput: low_pct above it),
-    and floor_regressed_pct the bar its worse end must clear for regressed."""
     lo = hi = None
     if e["bound"] is not None:
         lo, hi = e["effect"] - e["bound"], e["effect"] + e["bound"]
@@ -182,8 +152,6 @@ def median(xs):
 
 
 def flagged(order, wall):
-    """Runs whose wall time or either control-loop time is over 1.5 times the comparison's median:
-    the host slept or was busy. Flags never change a number."""
     mw = median([r[wall] for r in order])
     mc = median([r[k] for r in order for k in ("control_ms_start", "control_ms_end")])
     out = []
@@ -226,7 +194,6 @@ def main(argv=None):
     order = sorted((runs[p, role] for p in pairs for role in ("baseline", "candidate")),
                    key=lambda r: (r["pair"], r["position"]))
     if meta.get("part"):
-        # Runs that differ in any of these did not time the same work.
         for key, what in (("workload_checksum", "workload checksums"), ("passes", "pass counts"),
                           ("ops", "operation counts")):
             values = {str(r[key]) for r in order}

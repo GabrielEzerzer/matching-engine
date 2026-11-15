@@ -1,20 +1,18 @@
-//! Property tests: random command streams go to both the real book and the slow reference book.
-//! After every command the two must have emitted the same events and hold the same orders, and
-//! the real book's invariants must hold.
-//!
-//! Case count defaults to `DEFAULT_CASES`; set `PROPTEST_CASES` to run more.
+//! Property tests: random command streams go to both the real book and the slow reference book, which must
+//! emit the same events and hold the same orders after every command, with the book's invariants holding.
+//! Set PROPTEST_CASES to run more than DEFAULT_CASES.
 
 #[path = "../harness/reference.rs"]
 mod reference;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use matching_engine::{
-    Command, Event, LevelDepth, OrderBook, OrderId, RejectReason, Side, Snapshot,
+    Command, Event, LevelDepth, OrderBook, OrderId, Price, Qty, RejectReason, Side, Snapshot,
 };
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
-use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
+use proptest::test_runner::{Config, FileFailurePersistence, RngSeed, TestRunner};
 use reference::ReferenceBook;
 
 const DEFAULT_CASES: u32 = 2_000;
@@ -31,9 +29,6 @@ fn config() -> Config {
     }
 }
 
-/// A small id pool so that cancels, modifies and new orders keep hitting ids that are live,
-/// filled, cancelled or duplicated, plus a rare id from a wide range that is almost never known
-/// and a rare id at either end of the integer range.
 fn id() -> impl Strategy<Value = OrderId> {
     prop_oneof![
         24 => 1..=16u64,
@@ -42,8 +37,6 @@ fn id() -> impl Strategy<Value = OrderId> {
     ]
 }
 
-/// Mostly small sizes, some zeros, some large sizes that sweep several levels, and a rare size
-/// at the top of the integer range.
 fn qty() -> impl Strategy<Value = u32> {
     prop_oneof![
         2 => Just(0u32),
@@ -53,8 +46,6 @@ fn qty() -> impl Strategy<Value = u32> {
     ]
 }
 
-/// Reduce sizes skewed small, so a reduce often takes exactly what is left (reduce to zero),
-/// with some zeros and some that ask for more than is left.
 fn reduce_by() -> impl Strategy<Value = u32> {
     prop_oneof![
         1 => Just(0u32),
@@ -63,8 +54,6 @@ fn reduce_by() -> impl Strategy<Value = u32> {
     ]
 }
 
-/// A narrow band, so buy and sell prices overlap and orders cross often, plus a rare price at
-/// either end of the integer range, so a round that does arithmetic on prices cannot pass unseen.
 fn price() -> impl Strategy<Value = u32> {
     prop_oneof![
         30 => 96..=104u32,
@@ -143,8 +132,6 @@ proptest! {
     }
 }
 
-/// Proves the generators reach the cases the property test is meant to cover. Counts each case
-/// over a fixed set of generated streams and requires every one of them to show up often.
 #[test]
 fn generators_hit_the_interesting_cases() {
     #[derive(Default, Debug)]
@@ -257,7 +244,6 @@ fn generators_hit_the_interesting_cases() {
                     c.replace_trades += u32::from(!trades.is_empty());
                 }
                 Command::Limit { id, price, qty, .. } => {
-                    // Accepted limits at the ends of the integer ranges.
                     if matches!(events[0], Event::Accepted { .. }) {
                         c.extreme_price += u32::from(price <= 1 || price >= u32::MAX - 1);
                         c.extreme_qty += u32::from(qty >= u32::MAX - 1);
@@ -298,4 +284,172 @@ fn generators_hit_the_interesting_cases() {
         all.iter().all(|&n| n >= 100),
         "a case is rarely generated: {c:#?}"
     );
+}
+
+fn fixed_seed_config() -> Config {
+    Config {
+        rng_seed: RngSeed::Fixed(0x0B00_C0DE),
+        failure_persistence: None,
+        ..config()
+    }
+}
+
+fn resting_shares(book: &OrderBook) -> u128 {
+    let snapshot = book.snapshot();
+    snapshot
+        .bids
+        .iter()
+        .chain(&snapshot.asks)
+        .flat_map(|level| &level.orders)
+        .map(|&(_, qty)| u128::from(qty))
+        .sum()
+}
+
+fn taker_side(book: &OrderBook, cmd: Command) -> Option<Side> {
+    match cmd {
+        Command::Limit { side, .. } | Command::Market { side, .. } => Some(side),
+        Command::Replace { id, .. } => book.order(id).map(|order| order.side),
+        Command::Cancel { .. } | Command::Reduce { .. } => None,
+    }
+}
+
+fn makers_in_priority(
+    book: &OrderBook,
+    taker: Side,
+    arrival: &HashMap<OrderId, usize>,
+) -> Vec<(Price, OrderId, Qty)> {
+    let snapshot = book.snapshot();
+    let levels = match taker {
+        Side::Buy => &snapshot.asks,
+        Side::Sell => &snapshot.bids,
+    };
+    let mut makers: Vec<(Price, OrderId, Qty)> = levels
+        .iter()
+        .flat_map(|level| level.orders.iter().map(|&(id, qty)| (level.price, id, qty)))
+        .collect();
+    makers.sort_by_key(|&(price, id, _)| {
+        let better_first = match taker {
+            Side::Buy => i64::from(price),
+            Side::Sell => -i64::from(price),
+        };
+        (better_first, arrival[&id])
+    });
+    makers
+}
+
+proptest! {
+    #![proptest_config(fixed_seed_config())]
+
+    #[test]
+    fn matching_never_leaves_the_book_crossed(cmds in commands()) {
+        let mut book = OrderBook::new();
+        let mut events = Vec::new();
+        for (i, cmd) in cmds.iter().enumerate() {
+            book.apply(*cmd, &mut events);
+            if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
+                prop_assert!(bid < ask, "crossed after command {}: {:?}: bid {} ask {}", i, cmd, bid, ask);
+            }
+        }
+    }
+
+    #[test]
+    fn shares_are_conserved(cmds in commands()) {
+        let mut book = OrderBook::new();
+        let mut events = Vec::new();
+        let (mut submitted, mut traded, mut removed) = (0u128, 0u128, 0u128);
+        for (i, cmd) in cmds.iter().enumerate() {
+            let replaced_remaining = match *cmd {
+                Command::Replace { id, .. } => book.order(id).map_or(0, |order| u128::from(order.qty)),
+                _ => 0,
+            };
+            events.clear();
+            book.apply(*cmd, &mut events);
+            for event in &events {
+                match *event {
+                    Event::Accepted { .. } => match *cmd {
+                        Command::Limit { qty, .. } | Command::Market { qty, .. } => submitted += u128::from(qty),
+                        _ => {}
+                    },
+                    Event::Replaced { .. } => {
+                        if let Command::Replace { qty, .. } = *cmd {
+                            submitted += u128::from(qty);
+                        }
+                        removed += replaced_remaining;
+                    }
+                    Event::Trade { qty, .. } => traded += u128::from(qty),
+                    Event::Cancelled { remaining, .. } => removed += u128::from(remaining),
+                    Event::Reduced { by, .. } => removed += u128::from(by),
+                    _ => {}
+                }
+            }
+            prop_assert_eq!(
+                2 * traded + resting_shares(&book) + removed,
+                submitted,
+                "shares not conserved after command {}: {:?}", i, cmd
+            );
+        }
+    }
+
+    #[test]
+    fn makers_trade_in_price_then_time_priority(cmds in commands()) {
+        let mut book = OrderBook::new();
+        let mut events = Vec::new();
+        let mut arrival: HashMap<OrderId, usize> = HashMap::new();
+        for (i, cmd) in cmds.iter().enumerate() {
+            let expected = taker_side(&book, *cmd).map(|taker| makers_in_priority(&book, taker, &arrival));
+            events.clear();
+            book.apply(*cmd, &mut events);
+            let trades: Vec<(OrderId, Price, Qty)> = events
+                .iter()
+                .filter_map(|event| match *event {
+                    Event::Trade { maker_id, price, qty, .. } => Some((maker_id, price, qty)),
+                    _ => None,
+                })
+                .collect();
+            if let Some(expected) = expected {
+                for (k, &(maker_id, price, qty)) in trades.iter().enumerate() {
+                    let (want_price, want_id, resting) = expected[k];
+                    prop_assert_eq!((maker_id, price), (want_id, want_price),
+                        "trade {} of command {}: {:?} skipped an order with priority", k, i, cmd);
+                    prop_assert!(qty == resting || k + 1 == trades.len(),
+                        "maker {} kept shares but a later maker traded, command {}: {:?}", maker_id, i, cmd);
+                }
+            }
+            for event in &events {
+                match *event {
+                    Event::Accepted { id } => { arrival.insert(id, i); }
+                    Event::Replaced { new_id, .. } => { arrival.insert(new_id, i); }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_is_idempotent(cmds in commands()) {
+        let mut book = OrderBook::new();
+        let mut events = Vec::new();
+        for cmd in &cmds {
+            book.apply(*cmd, &mut events);
+        }
+        let resting: Vec<(OrderId, Qty)> = book
+            .snapshot()
+            .bids
+            .iter()
+            .chain(&book.snapshot().asks)
+            .flat_map(|level| level.orders.clone())
+            .collect();
+        for (id, qty) in resting {
+            events.clear();
+            book.apply(Command::Cancel { id }, &mut events);
+            prop_assert_eq!(&events, &vec![Event::Cancelled { id, remaining: qty }]);
+            prop_assert_eq!(book.order(id), None);
+            let after_first = book.snapshot();
+            events.clear();
+            book.apply(Command::Cancel { id }, &mut events);
+            prop_assert_eq!(&events, &vec![Event::Rejected { id, reason: RejectReason::UnknownOrder }]);
+            prop_assert_eq!(book.snapshot(), after_first);
+        }
+        prop_assert_eq!(book.snapshot(), Snapshot::default());
+    }
 }

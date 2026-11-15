@@ -1,58 +1,17 @@
-//! Replays an ITCH 5.0 stream through one [`OrderBook`] per stock locate.
-//!
-//! Each order message becomes at most one book command:
-//!
-//! | ITCH | Command |
-//! |---|---|
-//! | `A`, `F` add order | `Limit` with the ITCH reference number as id |
-//! | `D` order delete | `Cancel` |
-//! | `X` order cancel | `Reduce` by the cancelled shares |
-//! | `U` order replace | `Replace` (same side, new reference, price and shares) |
-//! | `E`, `C` order executed | an aggressor `Limit`, or `Reduce` as a fallback (below) |
-//!
-//! An execution names the resting order it executed against. If that order is at the front of
-//! the best level of its side, the driver replays the execution as the incoming order it really
-//! was: an opposite-side `Limit` at the resting order's price for the executed shares, with a
-//! synthetic id at or above [`TAKER_ID_BASE`]. The book's matching then has to pick exactly the
-//! named order, and the driver checks that it did (a mismatch is a [`ReplayError`]). If the named
-//! order is not at the front of the best level (around the crosses and in other special cases),
-//! or the execution is for zero shares or more than the book has left, the driver falls back to
-//! `Reduce`, so the book stays as Nasdaq's is. The `C` execution price is ignored: the aggressor
-//! trades at the resting order's price, and [`Stats::c_price_differs`] counts how often the two
-//! differ.
-//!
-//! Every other message type changes no book. `R` (stock directory) records the symbol of a
-//! locate and `H` (stock trading action) its trading state.
-//!
-//! While a security is halted, paused or in a quotation-only period, Nasdaq accepts and displays
-//! orders that lock or cross the book and matches them only in the reopening cross. This book
-//! always matches, so such an add trades here although it rested at Nasdaq, and from then on that
-//! book differs from Nasdaq's (later deletes of the orders it traded away are rejected). The
-//! driver does not hide this: it counts every add or replace that traded as an unexpected trade,
-//! split by whether the security was trading at the time, and counts rejections on books that
-//! had already diverged this way separately from rejections on books that had not.
+//! Replays an ITCH 5.0 stream through one order book per stock locate.
 
 use crate::itch::{Locate, Message, Symbol};
 use crate::{Command, Event, OrderBook, OrderId, RejectReason, Side};
 
-/// Synthetic ids for replayed aggressors start here. ITCH reference numbers in a day stay far
-/// below 2^63; the driver returns an error if one does not, so the two cannot collide.
 pub const TAKER_ID_BASE: OrderId = 1 << 63;
 
-/// The kind of command a message was turned into, for counting rejections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandKind {
-    /// `A`/`F` as `Limit`.
     Add,
-    /// `D` as `Cancel`.
     Delete,
-    /// `X` as `Reduce`.
     PartialCancel,
-    /// `U` as `Replace`.
     Replace,
-    /// `E`/`C` replayed as an aggressor `Limit`.
     ExecutionAggressor,
-    /// `E`/`C` replayed as `Reduce`.
     ExecutionFallback,
 }
 
@@ -76,51 +35,25 @@ fn reason_index(reason: RejectReason) -> usize {
     }
 }
 
-/// Counts kept while replaying.
 #[derive(Clone, Debug)]
 pub struct Stats {
-    /// Messages applied, of every type.
     pub messages: u64,
-    /// Messages by type byte.
     pub by_type: [u64; 256],
-    /// Messages that became a book command.
     pub book_messages: u64,
-    /// Events emitted by all books.
     pub events: u64,
-    /// `Trade` events emitted by all books.
     pub trades: u64,
-    /// Executions replayed as an aggressor that traded against exactly the named order.
     pub exec_aggressor: u64,
-    /// Executions replayed as `Reduce` because the named order rests at a price worse than the
-    /// best price of its side.
     pub exec_fallback_not_best_price: u64,
-    /// Executions replayed as `Reduce` because the named order rests at the best price of its
-    /// side but behind an older order.
     pub exec_fallback_behind_at_best: u64,
-    /// Executions replayed as `Reduce` because the named order is not in the book.
     pub exec_fallback_unknown: u64,
-    /// Executions replayed as `Reduce` because they are larger than the order's remaining shares.
     pub exec_fallback_too_large: u64,
-    /// Executions replayed as `Reduce` because they are for zero shares, which the book rejects.
     pub exec_fallback_zero_shares: u64,
-    /// `C` messages whose execution price differs from the named order's resting price.
     pub c_price_differs: u64,
-    /// Rejections by command kind (index in [`CommandKind::ALL`]) and reason (zero quantity,
-    /// duplicate order id, unknown order, reduce too large). Read with [`Stats::rejections_for`].
     pub rejections: [[u64; 4]; 6],
-    /// Add or replace commands that traded in our book. Nasdaq rests these only while the
-    /// security is not trading (see the module docs).
     pub unexpected_trade_messages: u64,
-    /// Those of `unexpected_trade_messages` that arrived while the security was trading: its
-    /// last trading state was `T`, or no `H` message had arrived for it yet. Only an explicit
-    /// halted, paused or quotation-only state counts as not trading.
     pub unexpected_trade_messages_while_trading: u64,
-    /// Those that arrived while the security was trading and its book had not diverged yet.
-    /// A consistent feed and a correct book make this zero.
     pub unexpected_trade_messages_on_clean_trading_books: u64,
-    /// `Trade` events the unexpected trade messages produced.
     pub unexpected_trades: u64,
-    /// Rejections on a book that had an unexpected trade earlier, so no longer matches Nasdaq's.
     pub rejections_on_diverged_books: u64,
 }
 
@@ -171,12 +104,12 @@ impl Stats {
     }
 }
 
-/// A replay that cannot continue faithfully.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplayError {
-    /// An ITCH reference number reached the synthetic taker id range.
-    ReferenceInTakerSpace { locate: Locate, reference: u64 },
-    /// A replayed aggressor did not trade exactly against the named order.
+    ReferenceInTakerSpace {
+        locate: Locate,
+        reference: u64,
+    },
     AggressorMismatch {
         locate: Locate,
         reference: OrderId,
@@ -205,31 +138,24 @@ impl std::fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
-/// What one message did.
 #[derive(Debug)]
 pub struct Applied<'a> {
     pub locate: Locate,
-    /// The command sent to the book of `locate`, if the message was a book message.
     pub command: Option<Command>,
-    /// The events that command emitted, in order. Empty for non-book messages.
     pub events: &'a [Event],
 }
 
-/// One order book per stock locate, driven by ITCH messages.
 #[derive(Debug)]
 pub struct Replay {
     books: Vec<OrderBook>,
     symbols: Vec<Option<Symbol>>,
-    /// Last `H` trading state byte per locate; 0 before the first `H`.
     trading_states: Vec<u8>,
-    /// Whether the book of a locate has had an unexpected trade.
     diverged: Vec<bool>,
     events: Vec<Event>,
     next_taker: OrderId,
     stats: Stats,
 }
 
-/// The same as [`Replay::new`]; synthetic taker ids start at [`TAKER_ID_BASE`] either way.
 impl Default for Replay {
     fn default() -> Self {
         Self::new()
@@ -253,12 +179,10 @@ impl Replay {
         &self.stats
     }
 
-    /// The symbol a stock directory message gave `locate`, if one has arrived.
     pub fn symbol(&self, locate: Locate) -> Option<Symbol> {
         self.symbols.get(usize::from(locate)).copied().flatten()
     }
 
-    /// The last trading state (`H`, `P`, `Q` or `T`) an `H` message gave `locate`, if any.
     pub fn trading_state(&self, locate: Locate) -> Option<u8> {
         match self.trading_states.get(usize::from(locate)) {
             Some(&state) if state != 0 => Some(state),
@@ -266,7 +190,6 @@ impl Replay {
         }
     }
 
-    /// Whether the book of `locate` has had an unexpected trade and so differs from Nasdaq's.
     pub fn diverged(&self, locate: Locate) -> bool {
         self.diverged
             .get(usize::from(locate))
@@ -278,8 +201,6 @@ impl Replay {
         self.books.get(usize::from(locate))
     }
 
-    /// Every book up to the highest locate that has received a command, by ascending locate.
-    /// Books of locates that never received one are empty.
     pub fn books(&self) -> impl Iterator<Item = (Locate, &OrderBook)> {
         self.books.iter().enumerate().map(|(i, book)| {
             (
@@ -289,7 +210,6 @@ impl Replay {
         })
     }
 
-    /// Applies one message to the book of its locate.
     pub fn apply(&mut self, msg: &Message) -> Result<Applied<'_>, ReplayError> {
         let locate = msg.header().locate;
         let kind_byte = match msg {
@@ -441,7 +361,6 @@ impl Replay {
         }
     }
 
-    /// Chooses the command for an execution of `shares` against resting order `reference`.
     fn execution(
         &mut self,
         locate: Locate,
@@ -462,7 +381,6 @@ impl Replay {
             self.stats.c_price_differs += 1;
         }
         if shares == 0 {
-            // An aggressor for zero shares would be rejected and fail the aggressor check.
             self.stats.exec_fallback_zero_shares += 1;
             return (fallback, CommandKind::ExecutionFallback);
         }
@@ -497,9 +415,6 @@ impl Replay {
         (cmd, CommandKind::ExecutionAggressor)
     }
 
-    /// The events of a replayed aggressor must be exactly: accepted, one trade against the named
-    /// order for all the shares at the limit price, the named order's fill if that emptied it,
-    /// and the taker's fill.
     fn check_aggressor(
         &mut self,
         locate: Locate,
@@ -554,7 +469,6 @@ impl Replay {
     }
 }
 
-/// The entry for `locate` in a per-locate table, growing the table with defaults as needed.
 fn slot<T: Default + Clone>(table: &mut Vec<T>, locate: Locate) -> &mut T {
     let i = usize::from(locate);
     if table.len() <= i {

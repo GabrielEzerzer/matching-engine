@@ -1,4 +1,4 @@
-//! Matching: applies commands to the two sides and the order map and emits events.
+//! Applies commands to the two sides and the order map, matches orders and emits events.
 
 use std::collections::HashSet;
 
@@ -15,7 +15,6 @@ pub struct OrderBook {
     bids: BookSide,
     asks: BookSide,
     orders: OrderMap,
-    /// The queue nodes of every level on both sides.
     nodes: Nodes,
 }
 
@@ -35,8 +34,6 @@ impl OrderBook {
         }
     }
 
-    /// Applies one command and appends its events to `out`. Never panics on bad input:
-    /// invalid commands produce a `Rejected` event and leave the book unchanged.
     pub fn apply(&mut self, cmd: Command, out: &mut Vec<Event>) {
         match cmd {
             Command::Limit {
@@ -152,7 +149,6 @@ impl OrderBook {
         self.asks.best_price()
     }
 
-    /// The side, price and remaining quantity of a resting order, or `None` if `id` is not resting.
     pub fn order(&self, id: OrderId) -> Option<OrderInfo> {
         self.orders.get(&id).map(|o| OrderInfo {
             side: o.side,
@@ -161,15 +157,12 @@ impl OrderBook {
         })
     }
 
-    /// The order with time priority at the best price of `side`: the one an incoming order on
-    /// the opposite side would trade with first. `None` if the side is empty.
     pub fn front_order(&self, side: Side) -> Option<OrderId> {
         let side = self.side(side);
         let price = side.best_price()?;
         side.level(price)?.front(&self.nodes)
     }
 
-    /// Levels of one side, best price first.
     pub fn depth(&self, side: Side) -> Vec<LevelDepth> {
         self.side(side)
             .levels_best_first()
@@ -181,7 +174,6 @@ impl OrderBook {
             .collect()
     }
 
-    /// Every resting order, by side, level (best first) and time priority.
     pub fn snapshot(&self) -> Snapshot {
         let side = |side: Side| {
             self.side(side)
@@ -201,11 +193,6 @@ impl OrderBook {
         }
     }
 
-    /// Checks the book's internal consistency: it is not crossed, no level is empty, each
-    /// level's total equals the sum of its orders, the levels and the id map hold exactly the
-    /// same orders at the same side, price and queue node, each with quantity left, each level's
-    /// queue links are consistent, and the queue slab has no node in use that no order or level
-    /// owns.
     pub fn check_invariants(&self) -> Result<(), String> {
         if let (Some(bid), Some(ask)) = (self.best_bid(), self.best_ask())
             && bid >= ask
@@ -295,8 +282,6 @@ impl OrderBook {
         }
     }
 
-    /// Matches an accepted order and rests what is left if it has a limit price.
-    /// Emits `Filled` for the taker when nothing is left. Returns the unfilled quantity.
     fn submit(
         &mut self,
         id: OrderId,
@@ -329,8 +314,6 @@ impl OrderBook {
         remaining
     }
 
-    /// Trades `qty` of the taker against the opposite side, best price first and oldest order
-    /// first within a price, while the limit (if any) crosses. Returns the unfilled quantity.
     fn match_order(
         &mut self,
         taker_id: OrderId,
@@ -383,7 +366,6 @@ impl OrderBook {
     }
 }
 
-/// Whether a taker on `side` with limit `limit` can trade against a resting price `resting`.
 fn crosses(side: Side, limit: Price, resting: Price) -> bool {
     match side {
         Side::Buy => resting <= limit,

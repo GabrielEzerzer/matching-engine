@@ -1,38 +1,5 @@
-//! Latency and throughput benchmark: the full ITCH day through one book per instrument.
-//!
-//! ```text
-//! bench [--limit N] [--window HH:MM:SS-HH:MM:SS] [--commit LABEL] [--no-throughput]
-//!       [--allow-non-linux] FILE
-//! ```
-//!
-//! Prints one JSON line. Run it through `scripts/bench.sh`, which pins it to one CPU, repeats it
-//! and summarises the runs, or through `scripts/compare.sh`, which compares two builds in pairs.
-//!
-//! What is timed, per ITCH message: splitting its frame off the buffer, decoding it, and applying
-//! it to the replay (the driver's command choice, the book's work, the driver's counters). The
-//! file is read in 64 MiB chunks into a buffer that was written once before any timing, so no
-//! file I/O, decompression or page fault of the input happens inside a timed region. Nothing is
-//! hashed. The events the book emits go into a `Vec` the driver reuses, so the sink allocates
-//! only while it first grows. The book's own allocations are part of what is measured.
-//!
-//! Two passes, each over the whole file with a fresh replay (`--no-throughput` skips the first,
-//! and the output then has no `throughput_*` fields):
-//! - Throughput: no per-message timer. Each chunk's parse-and-apply loop is timed as a whole with
-//!   `Instant`, and throughput is messages over the summed time.
-//! - Latency: each message is timed with the TSC (`lfence; rdtsc; lfence` before,
-//!   `rdtscp; lfence` after). The raw tick counts go into a preallocated array; they are added
-//!   to the HDR histograms after the chunk, outside any timed region. Reported values include
-//!   the timer's own cost, which is measured and printed next to them (`timer_overhead_ns_*`).
-//!
-//! `--window` times only the messages whose timestamp (Eastern time, as in the feed) falls in the
-//! window. Each pass first replays every earlier message untimed, so the books hold the full
-//! day's state when the window opens, and stops at the first message past it. `--limit` then
-//! counts timed messages, and `messages` and `book_messages` count only the window.
-//!
-//! A virtual machine does not always report steal time, so a run slowed by other work on the
-//! host may not be visible from inside. Each run therefore times a fixed CPU-bound loop before and
-//! after its passes (`control_ms_start`, `control_ms_end`); a run whose control time is out of
-//! line with the others ran on a contended or slower CPU.
+//! Latency and throughput benchmark: the full ITCH day through one book per instrument, one JSON line out.
+//! Run it through scripts/bench.sh or scripts/compare.sh; README.md and BENCHMARKING.md describe the method.
 
 #[path = "../harness/host.rs"]
 mod host;
@@ -50,9 +17,7 @@ use matching_engine::itch::{Frames, ItchError};
 use matching_engine::replay::Replay;
 use stream::{ChunkReader, DEFAULT_CHUNK};
 
-/// The smallest ITCH 5.0 frame: a 2-byte length and a 12-byte message.
 const MIN_FRAME: usize = 14;
-/// Per-message tick counts are stored in 31 bits; the top bit marks book messages.
 const TICK_MASK: u32 = (1 << 31) - 1;
 const BOOK_BIT: u32 = 1 << 31;
 
@@ -60,7 +25,6 @@ const BOOK_BIT: u32 = 1 << 31;
 mod tsc {
     use std::arch::x86_64::{__rdtscp, _mm_lfence, _rdtsc};
 
-    /// Reads the TSC after all earlier instructions have completed and before later ones start.
     #[inline(always)]
     pub fn start() -> u64 {
         // SAFETY: lfence and rdtsc are available on every x86_64 CPU and touch no memory.
@@ -72,8 +36,6 @@ mod tsc {
         }
     }
 
-    /// Reads the TSC after all earlier instructions have completed (rdtscp waits for them),
-    /// and keeps later instructions from starting before the read.
     #[inline(always)]
     pub fn stop() -> u64 {
         let mut aux = 0u32;
@@ -108,7 +70,6 @@ mod tsc {
 
 struct Args {
     limit: Option<u64>,
-    /// Timed window as nanoseconds since midnight, start inclusive, end exclusive.
     window: Option<(u64, u64)>,
     commit: String,
     throughput: bool,
@@ -155,7 +116,6 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-/// `HH:MM:SS-HH:MM:SS` as nanoseconds since midnight; the end must be after the start.
 fn parse_window(v: &str) -> Option<(u64, u64)> {
     let ns = |t: &str| -> Option<u64> {
         let mut parts = t.split(':').map(|p| p.parse::<u64>().ok());
@@ -226,7 +186,6 @@ fn run(args: &Args) -> Result<String, String> {
         "limit",
         &args.limit.map_or("none".to_string(), |l| l.to_string()),
     );
-    // Dots, not colons: the scripts split the flat JSON line on colons.
     out.text(
         "window",
         &args.window.map_or("none".to_string(), |(a, b)| {
@@ -330,8 +289,6 @@ fn run(args: &Args) -> Result<String, String> {
     Ok(out.render())
 }
 
-/// Measures TSC ticks per second against the monotonic clock over three 100 ms windows and
-/// takes the median.
 fn calibrate_tsc() -> f64 {
     let mut rates: Vec<f64> = (0..3)
         .map(|_| {
@@ -358,8 +315,6 @@ struct TimerCost {
     instant_resolution: f64,
 }
 
-/// The cost of an empty timed region with each timer, from a million back-to-back pairs, and
-/// the smallest non-zero step `Instant` reports.
 fn timer_cost() -> TimerCost {
     const N: usize = 1_000_000;
     let mut tsc: Vec<u64> = (0..N)
@@ -472,8 +427,6 @@ fn latency_pass(args: &Args) -> Result<Latency, String> {
     let mut all = new_hist();
     let mut book = new_hist();
     let (mut all_ticks, mut book_ticks, mut saturated) = (0u64, 0u64, 0u64);
-    // One slot per possible frame in a chunk. vec! of zeros is mapped lazily, so write every
-    // slot now to fault the pages in before the timed loop; black_box keeps the write.
     let mut timings: Vec<u32> = vec![0; DEFAULT_CHUNK / MIN_FRAME + 1];
     timings.fill(1);
     std::hint::black_box(&mut timings);
@@ -550,16 +503,12 @@ fn latency_pass(args: &Args) -> Result<Latency, String> {
     })
 }
 
-/// What the untimed replay before the window did.
 struct Warmup {
     messages: u64,
     book_messages: u64,
     wall: Duration,
 }
 
-/// Replays every message before the window's start untimed, so the books hold the day's state
-/// when timing begins, and leaves the first message of the window unread in `reader`. Without a
-/// window it does nothing.
 fn warm_up(
     reader: &mut ChunkReader,
     replay: &mut Replay,
@@ -600,7 +549,6 @@ fn warm_up(
     })
 }
 
-/// Whether the kernel reports an invariant TSC (`constant_tsc` and `nonstop_tsc`).
 fn tsc_invariant() -> String {
     match std::fs::read_to_string("/proc/cpuinfo") {
         Ok(c) => {

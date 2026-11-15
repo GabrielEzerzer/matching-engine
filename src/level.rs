@@ -1,35 +1,19 @@
-//! The queue of orders resting at one price, oldest first.
-//!
-//! Each queue is a doubly linked list threaded through `Nodes`, one slab per book: a node per
-//! resting order holds its id and the slab indices of its neighbours, and each level owns a
-//! sentinel node that closes its list into a ring. The order map records each order's slab
-//! index, so an order leaves its queue from anywhere in O(1): `Nodes::unlink` rewires its two
-//! neighbours and frees its node. Freed nodes go on a free list and are reused, so the slab
-//! holds at most the book's peak number of resting orders plus levels.
-//!
-//! The level stores ids only; each order's remaining quantity lives in the order map. The level
-//! keeps its order count and a running total of its orders' quantity, which the caller keeps in
-//! step through `push_back`, `reduce`, `remove` and `pop_front`.
+//! The queue of orders resting at one price, oldest first, as a ring of nodes in a per-book slab.
 
 use crate::types::{OrderId, Qty};
 
-/// The null slab index: no sentinel yet, or the end of the free list.
 const NIL: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug)]
 struct Node {
     id: OrderId,
-    /// The previous node in the level's ring. Unused while the node is free.
     prev: u32,
-    /// The next node in the level's ring, or the next free node.
     next: u32,
 }
 
-/// The slab every level of one book keeps its queue nodes in.
 #[derive(Debug)]
 pub struct Nodes {
     nodes: Vec<Node>,
-    /// The first free node, or `NIL`.
     free: u32,
 }
 
@@ -43,9 +27,6 @@ impl Default for Nodes {
 }
 
 impl Nodes {
-    /// A fresh node holding `id`, linked to itself.
-    /// shortcut: `u32` indices cap a book at 2^32 - 1 resting orders plus levels; widen them if a
-    /// single instrument ever needs more.
     fn alloc(&mut self, id: OrderId) -> u32 {
         let slot = self.free;
         if slot == NIL {
@@ -74,20 +55,16 @@ impl Nodes {
         self.free = slot;
     }
 
-    /// Takes the order at `slot` out of its level's queue and frees its node, and the level's
-    /// sentinel too if the queue is now empty. The caller then calls `Level::remove`.
     pub fn unlink(&mut self, slot: u32) {
         let Node { prev, next, .. } = self.nodes[slot as usize];
         self.nodes[prev as usize].next = next;
         self.nodes[next as usize].prev = prev;
         self.release(slot);
-        // Only the node of a one-order queue has the same node, the sentinel, on both sides.
         if prev == next {
             self.release(prev);
         }
     }
 
-    /// The number of nodes in use: one per resting order and one per level.
     pub fn in_use(&self) -> Result<usize, String> {
         let mut free = 0;
         let mut slot = self.free;
@@ -105,7 +82,6 @@ impl Nodes {
 #[derive(Debug)]
 pub struct Level {
     total: u64,
-    /// This level's sentinel node in `Nodes`, allocated by the first `push_back`.
     sentinel: u32,
     len: u32,
 }
@@ -121,7 +97,6 @@ impl Default for Level {
 }
 
 impl Level {
-    /// Appends `id` and returns its slab index, which the caller records with the order.
     pub fn push_back(&mut self, nodes: &mut Nodes, id: OrderId, qty: Qty) -> u32 {
         if self.sentinel == NIL {
             self.sentinel = nodes.alloc(0);
@@ -145,7 +120,6 @@ impl Level {
         Some(nodes.nodes[head as usize].id)
     }
 
-    /// Removes the front order, which must already have been reduced to zero.
     pub fn pop_front(&mut self, nodes: &mut Nodes) {
         let head = nodes.nodes[self.sentinel as usize].next;
         nodes.unlink(head);
@@ -155,15 +129,10 @@ impl Level {
         }
     }
 
-    /// Lowers the total after one of this level's orders lost `qty` shares.
     pub fn reduce(&mut self, qty: Qty) {
         self.total -= u64::from(qty);
     }
 
-    /// Accounts for the removal of an order with `remaining` shares from anywhere in the queue.
-    /// The caller must already have unlinked its node with `Nodes::unlink`.
-    /// shortcut: removal is split in two because `BookSide::remove_order` passes the id, not the
-    /// slab index; fold `unlink` into this method once that signature can carry the index.
     pub fn remove(&mut self, _id: OrderId, remaining: Qty) {
         self.len -= 1;
         self.reduce(remaining);
@@ -184,7 +153,6 @@ impl Level {
         self.len as usize
     }
 
-    /// The orders at this level, oldest first, with their slab indices.
     pub fn slots<'a>(&self, nodes: &'a Nodes) -> impl Iterator<Item = (u32, OrderId)> + 'a {
         let sentinel = self.sentinel;
         let mut slot = if sentinel == NIL {
@@ -206,8 +174,6 @@ impl Level {
         self.slots(nodes).map(|(_, id)| id)
     }
 
-    /// Checks the queue's own invariants: a non-empty level has a sentinel, its ring's links
-    /// agree in both directions and the ring holds exactly `len` orders.
     pub fn check(&self, nodes: &Nodes) -> Result<(), String> {
         let in_slab = |slot: u32| (slot as usize) < nodes.nodes.len();
         if self.len == 0 || !in_slab(self.sentinel) {
@@ -222,8 +188,6 @@ impl Level {
             if !in_slab(next) || nodes.nodes[next as usize].prev != slot {
                 return Err(format!("queue links disagree after node {slot}"));
             }
-            // Steps 0 to len - 1 reach the orders; only the last step may reach the sentinel.
-            // Without this a ring shorter than `len` could wrap round and still end on it.
             if next == self.sentinel && step < self.len {
                 return Err(format!(
                     "level's queue ring closes after {step} of its {} orders",
@@ -248,7 +212,6 @@ mod tests {
 
     use super::*;
 
-    /// One level, with each order's slab index and quantity as the order map would hold them.
     #[derive(Default)]
     struct Fixture {
         nodes: Nodes,
@@ -287,7 +250,6 @@ mod tests {
             for (slot, id) in self.level.slots(&self.nodes) {
                 assert_eq!(self.orders[&id].0, slot);
             }
-            // One node per order, plus the sentinel while the level is not empty.
             let sentinel = usize::from(!ids.is_empty());
             assert_eq!(self.nodes.in_use(), Ok(ids.len() + sentinel));
             if !ids.is_empty() {
@@ -347,7 +309,6 @@ mod tests {
         f.remove(2);
         assert_eq!(f.push(4, 4), freed);
         f.assert_state(&[1, 3, 4]);
-        // Emptying the level frees its sentinel too, and a new queue reuses every node.
         for id in [1, 3, 4] {
             f.remove(id);
         }
@@ -371,7 +332,6 @@ mod tests {
             f.remove(id);
         }
         f.assert_state(&[1, 500]);
-        // Steady churn behind a long-lived front order reuses the freed nodes.
         let slab = f.nodes.nodes.len();
         for id in 501..5_000 {
             f.push(id, 1);
@@ -401,9 +361,6 @@ mod tests {
 
     #[test]
     fn check_reports_a_ring_shorter_than_the_count() {
-        // Unlinking two of three nodes without telling the level leaves a ring of one order
-        // under a count of three. A walk of count + 1 steps round that ring of two nodes ends
-        // back on the sentinel, so only the early sentinel shows the missing orders.
         let mut f = filled(1..=3);
         for id in [2, 3] {
             f.nodes.unlink(f.orders[&id].0);
@@ -415,9 +372,6 @@ mod tests {
 
     #[test]
     fn check_reports_a_ring_longer_than_the_count() {
-        // Removing an order from the level's count without unlinking its node leaves a ring of
-        // three orders under a count of two. A walk of count + 1 steps stops on the third order,
-        // short of the sentinel.
         let mut f = filled(1..=3);
         f.level.remove(3, 3);
         assert_eq!(f.level.len(), 2);
@@ -427,8 +381,6 @@ mod tests {
 
     #[test]
     fn check_reports_a_back_link_that_disagrees() {
-        // Pointing the third order's back link at the first order breaks the ring in one
-        // direction only. The forward walk is intact, so only the back link check sees it.
         let mut f = filled(1..=3);
         let (first, second, third) = (f.orders[&1].0, f.orders[&2].0, f.orders[&3].0);
         f.nodes.nodes[third as usize].prev = first;
