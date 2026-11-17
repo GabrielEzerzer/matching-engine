@@ -1,4 +1,4 @@
-# local environment files stay out of git
+# hush: secrets live in the hush vault, never in files in the repo
 .env
 .env.*
 !.env.example
