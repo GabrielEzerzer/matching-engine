@@ -5,7 +5,7 @@ use std::process::Command;
 const TOP_LEVEL_FOLDERS: [&str; 7] = [
     ".github", "examples", "harness", "scripts", "setup", "src", "tests",
 ];
-const TOP_LEVEL_FILES: [&str; 11] = [
+const TOP_LEVEL_FILES: [&str; 10] = [
     ".gitattributes",
     ".gitignore",
     ".lint-baseline.json",
@@ -16,7 +16,6 @@ const TOP_LEVEL_FILES: [&str; 11] = [
     "LICENSE-MIT",
     "README.md",
     "features.json",
-    "hush.toml",
 ];
 
 fn misplaced<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
