@@ -66,9 +66,11 @@ impl OrderBook {
                     reason: RejectReason::UnknownOrder,
                 }),
                 Some(order) => {
-                    self.nodes.unlink(order.slot);
-                    self.side_mut(order.side)
-                        .remove_order(order.price, id, order.qty);
+                    let book_side = match order.side {
+                        Side::Buy => &mut self.bids,
+                        Side::Sell => &mut self.asks,
+                    };
+                    book_side.remove_order(&mut self.nodes, order.price, order.slot, order.qty);
                     out.push(Event::Cancelled {
                         id,
                         remaining: order.qty,
@@ -97,8 +99,11 @@ impl OrderBook {
                 let remaining = order.qty - by;
                 if remaining == 0 {
                     self.orders.remove(&id);
-                    self.nodes.unlink(order.slot);
-                    self.side_mut(order.side).remove_order(order.price, id, by);
+                    let book_side = match order.side {
+                        Side::Buy => &mut self.bids,
+                        Side::Sell => &mut self.asks,
+                    };
+                    book_side.remove_order(&mut self.nodes, order.price, order.slot, by);
                 } else {
                     self.orders.get_mut(&id).expect("checked above").qty = remaining;
                     self.side_mut(order.side)
@@ -133,8 +138,11 @@ impl OrderBook {
                     return;
                 }
                 self.orders.remove(&id);
-                self.nodes.unlink(old.slot);
-                self.side_mut(old.side).remove_order(old.price, id, old.qty);
+                let book_side = match old.side {
+                    Side::Buy => &mut self.bids,
+                    Side::Sell => &mut self.asks,
+                };
+                book_side.remove_order(&mut self.nodes, old.price, old.slot, old.qty);
                 out.push(Event::Replaced { old_id: id, new_id });
                 self.submit(new_id, old.side, Some(price), qty, out);
             }
@@ -198,14 +206,12 @@ impl OrderBook {
             return Err(format!("book is crossed: best bid {bid} >= best ask {ask}"));
         }
         let mut seen = HashSet::new();
-        let mut levels = 0;
         for side in [Side::Buy, Side::Sell] {
             for (price, level) in self.side(side).levels_best_first() {
                 if level.is_empty() {
                     return Err(format!("{side:?} level {price} is empty"));
                 }
                 level.check(&self.nodes)?;
-                levels += 1;
                 let mut sum = 0u64;
                 for (slot, id) in level.slots(&self.nodes) {
                     if !seen.insert(id) {
@@ -247,9 +253,9 @@ impl OrderBook {
             ));
         }
         let in_use = self.nodes.in_use()?;
-        if in_use != seen.len() + levels {
+        if in_use != seen.len() {
             return Err(format!(
-                "{in_use} queue nodes in use for {} orders on {levels} levels",
+                "{in_use} queue nodes in use for {} orders",
                 seen.len()
             ));
         }

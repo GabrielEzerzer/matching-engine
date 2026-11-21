@@ -475,8 +475,7 @@ pub mod parts {
                 LevelOp::Remove { slot, id, qty } => {
                     let b = usize::from(books[slot as usize]);
                     let order = orders[b].remove(&id).expect("removed order is mapped");
-                    nodes[b].unlink(order.slot);
-                    levels[slot as usize].remove(id, qty);
+                    levels[slot as usize].remove(&mut nodes[b], order.slot, qty);
                 }
                 LevelOp::Reset { slot } => levels[slot as usize] = Level::default(),
             }

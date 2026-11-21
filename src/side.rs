@@ -1,7 +1,7 @@
 //! Price-level lookup for one side of the book: a sorted vector of inline levels, best price last.
 
-use crate::level::Level;
-use crate::types::{OrderId, Price, Qty, Side};
+use crate::level::{Level, Nodes};
+use crate::types::{Price, Qty, Side};
 
 const SCAN: usize = 8;
 
@@ -119,10 +119,10 @@ impl BookSide {
         }
     }
 
-    pub fn remove_order(&mut self, price: Price, id: OrderId, remaining: Qty) {
+    pub fn remove_order(&mut self, nodes: &mut Nodes, price: Price, slot: u32, remaining: Qty) {
         let i = self.find(price ^ self.flip).expect("order's level exists");
         let level = &mut self.entries[i].level;
-        level.remove(id, remaining);
+        level.remove(nodes, slot, remaining);
         if level.is_empty() {
             self.remove_at(i);
         }
@@ -165,8 +165,7 @@ mod tests {
 
         fn cancel(&mut self, side: &mut BookSide, price: Price, id: OrderId, remaining: Qty) {
             let slot = self.slots.remove(&id).expect("the order was added");
-            self.nodes.unlink(slot);
-            side.remove_order(price, id, remaining);
+            side.remove_order(&mut self.nodes, price, slot, remaining);
         }
 
         fn pop_front(&mut self, level: &mut Level) {
