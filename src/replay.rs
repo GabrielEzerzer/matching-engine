@@ -210,51 +210,23 @@ impl Replay {
         })
     }
 
+    #[inline(always)]
     pub fn apply(&mut self, msg: &Message) -> Result<Applied<'_>, ReplayError> {
         let locate = msg.header().locate;
-        let kind_byte = match msg {
-            Message::SystemEvent { .. } => b'S',
-            Message::StockDirectory { .. } => b'R',
-            Message::StockTradingAction { .. } => b'H',
-            Message::AddOrder { attribution, .. } => {
-                if attribution.is_some() {
-                    b'F'
-                } else {
-                    b'A'
-                }
-            }
-            Message::OrderExecuted { with_price, .. } => {
-                if with_price.is_some() {
-                    b'C'
-                } else {
-                    b'E'
-                }
-            }
-            Message::OrderCancel { .. } => b'X',
-            Message::OrderDelete { .. } => b'D',
-            Message::OrderReplace { .. } => b'U',
-            Message::Other { kind, .. } => *kind,
-        };
         self.stats.messages += 1;
-        self.stats.by_type[usize::from(kind_byte)] += 1;
         self.events.clear();
 
         let (command, kind) = match *msg {
-            Message::StockDirectory { stock, .. } => {
-                *slot(&mut self.symbols, locate) = Some(stock);
-                return Ok(self.applied(locate, None));
-            }
-            Message::StockTradingAction { state, .. } => {
-                *slot(&mut self.trading_states, locate) = state;
-                return Ok(self.applied(locate, None));
-            }
             Message::AddOrder {
                 reference,
                 buy,
                 shares,
                 price,
+                attribution,
                 ..
             } => {
+                let kind_byte = if attribution.is_some() { b'F' } else { b'A' };
+                self.stats.by_type[usize::from(kind_byte)] += 1;
                 check_reference(locate, reference)?;
                 let side = if buy { Side::Buy } else { Side::Sell };
                 let cmd = Command::Limit {
@@ -266,19 +238,9 @@ impl Replay {
                 (cmd, CommandKind::Add)
             }
             Message::OrderDelete { reference, .. } => {
+                self.stats.by_type[usize::from(b'D')] += 1;
                 (Command::Cancel { id: reference }, CommandKind::Delete)
             }
-            Message::OrderCancel {
-                reference,
-                cancelled_shares,
-                ..
-            } => (
-                Command::Reduce {
-                    id: reference,
-                    by: cancelled_shares,
-                },
-                CommandKind::PartialCancel,
-            ),
             Message::OrderReplace {
                 original_reference,
                 new_reference,
@@ -286,6 +248,7 @@ impl Replay {
                 price,
                 ..
             } => {
+                self.stats.by_type[usize::from(b'U')] += 1;
                 check_reference(locate, new_reference)?;
                 let cmd = Command::Replace {
                     id: original_reference,
@@ -300,20 +263,90 @@ impl Replay {
                 executed_shares,
                 with_price,
                 ..
-            } => self.execution(
-                locate,
+            } => {
+                let kind_byte = if with_price.is_some() { b'C' } else { b'E' };
+                self.stats.by_type[usize::from(kind_byte)] += 1;
+                self.execution(
+                    locate,
+                    reference,
+                    executed_shares,
+                    with_price.map(|p| p.price),
+                )
+            }
+            Message::OrderCancel {
                 reference,
-                executed_shares,
-                with_price.map(|p| p.price),
-            ),
-            Message::SystemEvent { .. } | Message::Other { .. } => {
+                cancelled_shares,
+                ..
+            } => {
+                self.stats.by_type[usize::from(b'X')] += 1;
+                (
+                    Command::Reduce {
+                        id: reference,
+                        by: cancelled_shares,
+                    },
+                    CommandKind::PartialCancel,
+                )
+            }
+            Message::Other { kind, .. } => {
+                self.stats.by_type[usize::from(kind)] += 1;
+                return Ok(self.applied(locate, None));
+            }
+            Message::StockDirectory { stock, .. } => {
+                self.record_stock_directory(locate, stock);
+                return Ok(self.applied(locate, None));
+            }
+            Message::StockTradingAction { state, .. } => {
+                self.record_trading_action(locate, state);
+                return Ok(self.applied(locate, None));
+            }
+            Message::SystemEvent { .. } => {
+                self.stats.by_type[usize::from(b'S')] += 1;
                 return Ok(self.applied(locate, None));
             }
         };
 
         book_at(&mut self.books, locate).apply(command, &mut self.events);
         self.stats.book_messages += 1;
-        self.stats.events += self.events.len() as u64;
+        let event_count = self.events.len();
+        self.stats.events += event_count as u64;
+        if event_count == 1 {
+            if let Event::Rejected { reason, .. } = self.events[0] {
+                self.record_rejection(locate, kind, reason);
+            }
+            if kind == CommandKind::ExecutionAggressor {
+                let Message::OrderExecuted { reference, .. } = *msg else {
+                    unreachable!("only executions become aggressors");
+                };
+                self.check_aggressor(locate, command, reference)?;
+            }
+        } else {
+            self.finish_multi_event(locate, kind, command, msg)?;
+        }
+        Ok(self.applied(locate, Some(command)))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_stock_directory(&mut self, locate: Locate, stock: Symbol) {
+        self.stats.by_type[usize::from(b'R')] += 1;
+        *slot(&mut self.symbols, locate) = Some(stock);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_trading_action(&mut self, locate: Locate, state: u8) {
+        self.stats.by_type[usize::from(b'H')] += 1;
+        *slot(&mut self.trading_states, locate) = state;
+    }
+
+    #[inline(never)]
+    fn finish_multi_event(
+        &mut self,
+        locate: Locate,
+        kind: CommandKind,
+        command: Command,
+        msg: &Message,
+    ) -> Result<(), ReplayError> {
         let trades = self
             .events
             .iter()
@@ -321,26 +354,11 @@ impl Replay {
             .count() as u64;
         self.stats.trades += trades;
         if let Some(Event::Rejected { reason, .. }) = self.events.first() {
-            let k = CommandKind::ALL
-                .iter()
-                .position(|&c| c == kind)
-                .expect("listed");
-            self.stats.rejections[k][reason_index(*reason)] += 1;
-            if self.diverged(locate) {
-                self.stats.rejections_on_diverged_books += 1;
-            }
+            self.record_rejection(locate, kind, *reason);
         }
         match kind {
             CommandKind::Add | CommandKind::Replace if trades > 0 => {
-                self.stats.unexpected_trade_messages += 1;
-                self.stats.unexpected_trades += trades;
-                if !matches!(self.trading_state(locate), Some(b'H' | b'P' | b'Q')) {
-                    self.stats.unexpected_trade_messages_while_trading += 1;
-                    if !self.diverged(locate) {
-                        self.stats.unexpected_trade_messages_on_clean_trading_books += 1;
-                    }
-                }
-                *slot(&mut self.diverged, locate) = true;
+                self.record_unexpected_trade(locate, trades);
             }
             CommandKind::ExecutionAggressor => {
                 let Message::OrderExecuted { reference, .. } = *msg else {
@@ -350,7 +368,34 @@ impl Replay {
             }
             _ => {}
         }
-        Ok(self.applied(locate, Some(command)))
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_rejection(&mut self, locate: Locate, kind: CommandKind, reason: RejectReason) {
+        let k = CommandKind::ALL
+            .iter()
+            .position(|&c| c == kind)
+            .expect("listed");
+        self.stats.rejections[k][reason_index(reason)] += 1;
+        if self.diverged(locate) {
+            self.stats.rejections_on_diverged_books += 1;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_unexpected_trade(&mut self, locate: Locate, trades: u64) {
+        self.stats.unexpected_trade_messages += 1;
+        self.stats.unexpected_trades += trades;
+        if !matches!(self.trading_state(locate), Some(b'H' | b'P' | b'Q')) {
+            self.stats.unexpected_trade_messages_while_trading += 1;
+            if !self.diverged(locate) {
+                self.stats.unexpected_trade_messages_on_clean_trading_books += 1;
+            }
+        }
+        *slot(&mut self.diverged, locate) = true;
     }
 
     fn applied(&self, locate: Locate, command: Option<Command>) -> Applied<'_> {
@@ -361,6 +406,7 @@ impl Replay {
         }
     }
 
+    #[inline(never)]
     fn execution(
         &mut self,
         locate: Locate,
@@ -415,6 +461,7 @@ impl Replay {
         (cmd, CommandKind::ExecutionAggressor)
     }
 
+    #[inline(never)]
     fn check_aggressor(
         &mut self,
         locate: Locate,
@@ -469,26 +516,47 @@ impl Replay {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn grow_slot<T: Default + Clone>(table: &mut Vec<T>, len: usize) {
+    table.resize(len, T::default());
+}
+
+#[inline(always)]
 fn slot<T: Default + Clone>(table: &mut Vec<T>, locate: Locate) -> &mut T {
     let i = usize::from(locate);
     if table.len() <= i {
-        table.resize(i + 1, T::default());
+        grow_slot(table, i + 1);
     }
     &mut table[i]
 }
 
+#[cold]
+#[inline(never)]
+fn grow_books(books: &mut Vec<OrderBook>, len: usize) {
+    books.resize_with(len, OrderBook::new);
+}
+
+#[inline(always)]
 fn book_at(books: &mut Vec<OrderBook>, locate: Locate) -> &mut OrderBook {
     let i = usize::from(locate);
     if books.len() <= i {
-        books.resize_with(i + 1, OrderBook::new);
+        grow_books(books, i + 1);
     }
     &mut books[i]
 }
 
+#[inline(always)]
 fn check_reference(locate: Locate, reference: u64) -> Result<(), ReplayError> {
     if reference >= TAKER_ID_BASE {
-        Err(ReplayError::ReferenceInTakerSpace { locate, reference })
+        Err(reference_error(locate, reference))
     } else {
         Ok(())
     }
+}
+
+#[cold]
+#[inline(never)]
+fn reference_error(locate: Locate, reference: u64) -> ReplayError {
+    ReplayError::ReferenceInTakerSpace { locate, reference }
 }
