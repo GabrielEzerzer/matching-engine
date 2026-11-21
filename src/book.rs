@@ -158,9 +158,7 @@ impl OrderBook {
     }
 
     pub fn front_order(&self, side: Side) -> Option<OrderId> {
-        let side = self.side(side);
-        let price = side.best_price()?;
-        side.level(price)?.front(&self.nodes)
+        self.side(side).best_level()?.front(&self.nodes)
     }
 
     pub fn depth(&self, side: Side) -> Vec<LevelDepth> {
@@ -335,7 +333,7 @@ impl OrderBook {
             {
                 break;
             }
-            let level = opposite.level_mut(price).expect("best level exists");
+            let (_, level) = opposite.best_level_mut().expect("best level exists");
             while qty > 0
                 && let Some(maker_id) = level.front(nodes)
             {
@@ -359,7 +357,7 @@ impl OrderBook {
                 }
             }
             if level.is_empty() {
-                opposite.remove_level(price);
+                opposite.remove_best();
             }
         }
         qty
