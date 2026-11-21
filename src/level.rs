@@ -1,4 +1,4 @@
-//! The queue of orders resting at one price, oldest first, as a ring of nodes in a per-book slab.
+//! The queue of orders resting at one price, oldest first, as a doubly linked list in a per-book slab.
 
 use crate::types::{OrderId, Qty};
 
@@ -27,42 +27,24 @@ impl Default for Nodes {
 }
 
 impl Nodes {
-    fn alloc(&mut self, id: OrderId) -> u32 {
+    fn alloc(&mut self, id: OrderId, prev: u32, next: u32) -> u32 {
         let slot = self.free;
         if slot == NIL {
             let slot = u32::try_from(self.nodes.len())
                 .ok()
                 .filter(|&slot| slot != NIL)
                 .expect("fewer than 2^32 - 1 queue nodes per book");
-            self.nodes.push(Node {
-                id,
-                prev: slot,
-                next: slot,
-            });
+            self.nodes.push(Node { id, prev, next });
             return slot;
         }
         self.free = self.nodes[slot as usize].next;
-        self.nodes[slot as usize] = Node {
-            id,
-            prev: slot,
-            next: slot,
-        };
+        self.nodes[slot as usize] = Node { id, prev, next };
         slot
     }
 
     fn release(&mut self, slot: u32) {
         self.nodes[slot as usize].next = self.free;
         self.free = slot;
-    }
-
-    pub fn unlink(&mut self, slot: u32) {
-        let Node { prev, next, .. } = self.nodes[slot as usize];
-        self.nodes[prev as usize].next = next;
-        self.nodes[next as usize].prev = prev;
-        self.release(slot);
-        if prev == next {
-            self.release(prev);
-        }
     }
 
     pub fn in_use(&self) -> Result<usize, String> {
@@ -82,7 +64,8 @@ impl Nodes {
 #[derive(Debug)]
 pub struct Level {
     total: u64,
-    sentinel: u32,
+    head: u32,
+    tail: u32,
     len: u32,
 }
 
@@ -90,7 +73,8 @@ impl Default for Level {
     fn default() -> Self {
         Self {
             total: 0,
-            sentinel: NIL,
+            head: NIL,
+            tail: NIL,
             len: 0,
         }
     }
@@ -98,47 +82,58 @@ impl Default for Level {
 
 impl Level {
     pub fn push_back(&mut self, nodes: &mut Nodes, id: OrderId, qty: Qty) -> u32 {
-        if self.sentinel == NIL {
-            self.sentinel = nodes.alloc(0);
+        let tail = self.tail;
+        let slot = nodes.alloc(id, tail, NIL);
+        if tail == NIL {
+            self.head = slot;
+        } else {
+            nodes.nodes[tail as usize].next = slot;
         }
-        let slot = nodes.alloc(id);
-        let tail = nodes.nodes[self.sentinel as usize].prev;
-        nodes.nodes[slot as usize].prev = tail;
-        nodes.nodes[slot as usize].next = self.sentinel;
-        nodes.nodes[tail as usize].next = slot;
-        nodes.nodes[self.sentinel as usize].prev = slot;
+        self.tail = slot;
         self.len += 1;
         self.total += u64::from(qty);
         slot
     }
 
     pub fn front(&self, nodes: &Nodes) -> Option<OrderId> {
-        if self.len == 0 {
+        if self.head == NIL {
             return None;
         }
-        let head = nodes.nodes[self.sentinel as usize].next;
-        Some(nodes.nodes[head as usize].id)
+        Some(nodes.nodes[self.head as usize].id)
     }
 
     pub fn pop_front(&mut self, nodes: &mut Nodes) {
-        let head = nodes.nodes[self.sentinel as usize].next;
-        nodes.unlink(head);
-        self.len -= 1;
-        if self.len == 0 {
-            self.sentinel = NIL;
+        let head = self.head;
+        let next = nodes.nodes[head as usize].next;
+        self.head = next;
+        if next == NIL {
+            self.tail = NIL;
+        } else {
+            nodes.nodes[next as usize].prev = NIL;
         }
+        nodes.release(head);
+        self.len -= 1;
     }
 
     pub fn reduce(&mut self, qty: Qty) {
         self.total -= u64::from(qty);
     }
 
-    pub fn remove(&mut self, _id: OrderId, remaining: Qty) {
+    pub fn remove(&mut self, nodes: &mut Nodes, slot: u32, remaining: Qty) {
+        let Node { prev, next, .. } = nodes.nodes[slot as usize];
+        if prev == NIL {
+            self.head = next;
+        } else {
+            nodes.nodes[prev as usize].next = next;
+        }
+        if next == NIL {
+            self.tail = prev;
+        } else {
+            nodes.nodes[next as usize].prev = prev;
+        }
+        nodes.release(slot);
         self.len -= 1;
         self.reduce(remaining);
-        if self.len == 0 {
-            self.sentinel = NIL;
-        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -154,14 +149,9 @@ impl Level {
     }
 
     pub fn slots<'a>(&self, nodes: &'a Nodes) -> impl Iterator<Item = (u32, OrderId)> + 'a {
-        let sentinel = self.sentinel;
-        let mut slot = if sentinel == NIL {
-            NIL
-        } else {
-            nodes.nodes[sentinel as usize].next
-        };
+        let mut slot = self.head;
         std::iter::from_fn(move || {
-            (slot != sentinel).then(|| {
+            (slot != NIL).then(|| {
                 let node = nodes.nodes[slot as usize];
                 let item = (slot, node.id);
                 slot = node.next;
@@ -176,29 +166,31 @@ impl Level {
 
     pub fn check(&self, nodes: &Nodes) -> Result<(), String> {
         let in_slab = |slot: u32| (slot as usize) < nodes.nodes.len();
-        if self.len == 0 || !in_slab(self.sentinel) {
+        if self.len == 0 || !in_slab(self.head) || !in_slab(self.tail) {
             return Err(format!(
-                "level with {} orders has sentinel {}",
-                self.len, self.sentinel
+                "level with {} orders has head {} and tail {}",
+                self.len, self.head, self.tail
             ));
         }
-        let mut slot = self.sentinel;
-        for step in 0..=self.len {
-            let next = nodes.nodes[slot as usize].next;
-            if !in_slab(next) || nodes.nodes[next as usize].prev != slot {
-                return Err(format!("queue links disagree after node {slot}"));
-            }
-            if next == self.sentinel && step < self.len {
+        let mut prev = NIL;
+        let mut slot = self.head;
+        for step in 0..self.len {
+            if !in_slab(slot) {
                 return Err(format!(
-                    "level's queue ring closes after {step} of its {} orders",
+                    "level's queue ends after {step} of its {} orders",
                     self.len
                 ));
             }
-            slot = next;
+            let node = nodes.nodes[slot as usize];
+            if node.prev != prev {
+                return Err(format!("queue links disagree at node {slot}"));
+            }
+            prev = slot;
+            slot = node.next;
         }
-        if slot != self.sentinel {
+        if slot != NIL || prev != self.tail {
             return Err(format!(
-                "level's queue ring does not close after {} orders",
+                "level's queue does not end after {} orders",
                 self.len
             ));
         }
@@ -228,8 +220,7 @@ mod tests {
 
         fn remove(&mut self, id: OrderId) {
             let (slot, qty) = self.orders.remove(&id).expect("order rests");
-            self.nodes.unlink(slot);
-            self.level.remove(id, qty);
+            self.level.remove(&mut self.nodes, slot, qty);
         }
 
         fn fill_front(&mut self) -> OrderId {
@@ -250,8 +241,7 @@ mod tests {
             for (slot, id) in self.level.slots(&self.nodes) {
                 assert_eq!(self.orders[&id].0, slot);
             }
-            let sentinel = usize::from(!ids.is_empty());
-            assert_eq!(self.nodes.in_use(), Ok(ids.len() + sentinel));
+            assert_eq!(self.nodes.in_use(), Ok(ids.len()));
             if !ids.is_empty() {
                 self.level.check(&self.nodes).unwrap();
             }
@@ -350,43 +340,38 @@ mod tests {
         let b = other.push_back(&mut f.nodes, 11, 11);
         assert_eq!(other.ids(&f.nodes).collect::<Vec<_>>(), [10, 11]);
         other.check(&f.nodes).unwrap();
-        assert_eq!(f.nodes.in_use(), Ok(2 + 1 + 2 + 1));
-        f.nodes.unlink(a);
-        other.remove(10, 10);
-        f.nodes.unlink(b);
-        other.remove(11, 11);
+        assert_eq!(f.nodes.in_use(), Ok(4));
+        other.remove(&mut f.nodes, a, 10);
+        other.remove(&mut f.nodes, b, 11);
         assert!(other.is_empty());
         f.assert_state(&[1, 3]);
     }
 
     #[test]
-    fn check_reports_a_ring_shorter_than_the_count() {
+    fn check_reports_a_queue_shorter_than_the_count() {
         let mut f = filled(1..=3);
-        for id in [2, 3] {
-            f.nodes.unlink(f.orders[&id].0);
-        }
-        assert_eq!(f.level.len(), 3);
+        let first = f.orders[&1].0;
+        f.nodes.nodes[first as usize].next = NIL;
         let err = f.level.check(&f.nodes).unwrap_err();
-        assert!(err.contains("closes after 1 of its 3 orders"), "{err}");
+        assert!(err.contains("ends after 1 of its 3 orders"), "{err}");
     }
 
     #[test]
-    fn check_reports_a_ring_longer_than_the_count() {
+    fn check_reports_a_queue_longer_than_the_count() {
         let mut f = filled(1..=3);
-        f.level.remove(3, 3);
-        assert_eq!(f.level.len(), 2);
+        f.level.len = 2;
         let err = f.level.check(&f.nodes).unwrap_err();
-        assert!(err.contains("does not close after 2 orders"), "{err}");
+        assert!(err.contains("does not end after 2 orders"), "{err}");
     }
 
     #[test]
     fn check_reports_a_back_link_that_disagrees() {
         let mut f = filled(1..=3);
-        let (first, second, third) = (f.orders[&1].0, f.orders[&2].0, f.orders[&3].0);
+        let (first, third) = (f.orders[&1].0, f.orders[&3].0);
         f.nodes.nodes[third as usize].prev = first;
         let err = f.level.check(&f.nodes).unwrap_err();
         assert!(
-            err.contains(&format!("queue links disagree after node {second}")),
+            err.contains(&format!("queue links disagree at node {third}")),
             "{err}"
         );
     }

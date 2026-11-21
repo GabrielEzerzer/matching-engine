@@ -1,16 +1,21 @@
-//! Price-level lookup for one side of the book: a sorted index into a slab of levels.
+//! Price-level lookup for one side of the book: a sorted vector of inline levels, best price last.
 
-use crate::level::Level;
-use crate::types::{OrderId, Price, Qty, Side};
+use crate::level::{Level, Nodes};
+use crate::types::{Price, Qty, Side};
 
 const SCAN: usize = 8;
 
 #[derive(Debug)]
+struct PriceLevel {
+    key: u32,
+    level: Level,
+}
+
+#[derive(Debug)]
 pub struct BookSide {
     flip: u32,
-    index: Vec<(u32, u32)>,
-    levels: Vec<Level>,
-    free: Vec<u32>,
+    best: Price,
+    entries: Vec<PriceLevel>,
 }
 
 impl BookSide {
@@ -20,16 +25,15 @@ impl BookSide {
                 Side::Buy => 0,
                 Side::Sell => u32::MAX,
             },
-            index: Vec::new(),
-            levels: Vec::new(),
-            free: Vec::new(),
+            best: 0,
+            entries: Vec::new(),
         }
     }
 
     fn find(&self, key: u32) -> Result<usize, usize> {
-        let split = self.index.len().saturating_sub(SCAN);
-        for i in (split..self.index.len()).rev() {
-            let k = self.index[i].0;
+        let split = self.entries.len().saturating_sub(SCAN);
+        for i in (split..self.entries.len()).rev() {
+            let k = self.entries[i].key;
             if k == key {
                 return Ok(i);
             }
@@ -37,73 +41,98 @@ impl BookSide {
                 return Err(i + 1);
             }
         }
-        self.index[..split].binary_search_by_key(&key, |&(k, _)| k)
-    }
-
-    fn slot(&self, price: Price) -> Option<usize> {
-        let i = self.find(price ^ self.flip).ok()?;
-        Some(self.index[i].1 as usize)
+        self.entries[..split].binary_search_by_key(&key, |e| e.key)
     }
 
     fn remove_at(&mut self, position: usize) {
-        let (_, slot) = self.index.remove(position);
-        let level = &self.levels[slot as usize];
+        let entry = self.entries.remove(position);
         assert!(
-            level.is_empty() && level.total() == 0,
+            entry.level.is_empty() && entry.level.total() == 0,
             "only empty levels are freed"
         );
-        self.free.push(slot);
+        if position == self.entries.len() {
+            self.best = self.entries.last().map_or(0, |e| e.key ^ self.flip);
+        }
     }
 
     pub fn best_price(&self) -> Option<Price> {
-        self.index.last().map(|&(key, _)| key ^ self.flip)
+        (!self.entries.is_empty()).then_some(self.best)
     }
 
+    pub fn best_level(&self) -> Option<&Level> {
+        self.entries.last().map(|e| &e.level)
+    }
+
+    pub fn best_level_mut(&mut self) -> Option<(Price, &mut Level)> {
+        let flip = self.flip;
+        self.entries
+            .last_mut()
+            .map(|e| (e.key ^ flip, &mut e.level))
+    }
+
+    pub fn remove_best(&mut self) {
+        if let Some(entry) = self.entries.pop() {
+            assert!(
+                entry.level.is_empty() && entry.level.total() == 0,
+                "only empty levels are freed"
+            );
+            self.best = self.entries.last().map_or(0, |e| e.key ^ self.flip);
+        }
+    }
+
+    #[cfg(any(test, feature = "internals"))]
     pub fn level(&self, price: Price) -> Option<&Level> {
-        Some(&self.levels[self.slot(price)?])
+        let i = self.find(price ^ self.flip).ok()?;
+        Some(&self.entries[i].level)
     }
 
     pub fn level_mut(&mut self, price: Price) -> Option<&mut Level> {
-        let slot = self.slot(price)?;
-        Some(&mut self.levels[slot])
+        let i = self.find(price ^ self.flip).ok()?;
+        Some(&mut self.entries[i].level)
     }
 
     pub fn level_or_insert(&mut self, price: Price) -> &mut Level {
         let key = price ^ self.flip;
-        let slot = match self.find(key) {
-            Ok(i) => self.index[i].1,
+        let i = match self.find(key) {
+            Ok(i) => i,
             Err(i) => {
-                let slot = self.free.pop().unwrap_or_else(|| {
-                    self.levels.push(Level::default());
-                    u32::try_from(self.levels.len() - 1).expect("fewer than 2^32 levels")
-                });
-                self.index.insert(i, (key, slot));
-                slot
+                if i == self.entries.len() {
+                    self.best = price;
+                }
+                self.entries.insert(
+                    i,
+                    PriceLevel {
+                        key,
+                        level: Level::default(),
+                    },
+                );
+                i
             }
         };
-        &mut self.levels[slot as usize]
+        &mut self.entries[i].level
     }
 
+    #[cfg(any(test, feature = "internals"))]
     pub fn remove_level(&mut self, price: Price) {
         if let Ok(i) = self.find(price ^ self.flip) {
             self.remove_at(i);
         }
     }
 
-    pub fn remove_order(&mut self, price: Price, id: OrderId, remaining: Qty) {
+    pub fn remove_order(&mut self, nodes: &mut Nodes, price: Price, slot: u32, remaining: Qty) {
         let i = self.find(price ^ self.flip).expect("order's level exists");
-        let level = &mut self.levels[self.index[i].1 as usize];
-        level.remove(id, remaining);
+        let level = &mut self.entries[i].level;
+        level.remove(nodes, slot, remaining);
         if level.is_empty() {
             self.remove_at(i);
         }
     }
 
     pub fn levels_best_first(&self) -> impl Iterator<Item = (Price, &Level)> + '_ {
-        self.index
+        self.entries
             .iter()
             .rev()
-            .map(|&(key, slot)| (key ^ self.flip, &self.levels[slot as usize]))
+            .map(|e| (e.key ^ self.flip, &e.level))
     }
 }
 
@@ -136,8 +165,7 @@ mod tests {
 
         fn cancel(&mut self, side: &mut BookSide, price: Price, id: OrderId, remaining: Qty) {
             let slot = self.slots.remove(&id).expect("the order was added");
-            self.nodes.unlink(slot);
-            side.remove_order(price, id, remaining);
+            side.remove_order(&mut self.nodes, price, slot, remaining);
         }
 
         fn pop_front(&mut self, level: &mut Level) {
@@ -247,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn freed_slots_are_reused_empty() {
+    fn removed_level_is_dropped_and_reinserted_cleanly() {
         for s in SIDES {
             let mut side = BookSide::new(s);
             let mut queues = Queues::default();
@@ -255,8 +283,7 @@ mod tests {
             queues.add(&mut side, 101, 2, 20);
             queues.cancel(&mut side, 100, 1, 10);
             queues.add(&mut side, 99, 3, 7);
-            assert_eq!(side.levels.len(), 2, "the freed slot was reused");
-            assert!(side.free.is_empty());
+            assert_eq!(side.entries.len(), 2);
             let level = side.level(99).expect("level exists");
             assert_eq!(
                 (level.total(), level.ids(&queues.nodes).collect::<Vec<_>>()),
@@ -334,8 +361,7 @@ mod tests {
                         next_id += 1;
                         queues.add(&mut side, p + 5, next_id, 1);
                         model.insert(p + 5, next_id);
-                        assert_eq!(side.levels.len(), n, "{at}: the freed slot was reused");
-                        assert!(side.free.is_empty(), "{at}");
+                        assert_eq!(side.entries.len(), n, "{at}");
                         check_against(
                             &side,
                             &queues.nodes,
@@ -351,7 +377,7 @@ mod tests {
                             queues.pop_front(level);
                             side.remove_level(p);
                             model.remove(&p);
-                            assert_eq!(side.free.len(), n - model.len(), "{at}");
+                            assert_eq!(side.entries.len(), model.len(), "{at}");
                             check_against(
                                 &side,
                                 &queues.nodes,

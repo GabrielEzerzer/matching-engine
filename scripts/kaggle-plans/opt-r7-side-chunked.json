@@ -1,0 +1,20 @@
+{
+  "name": "opt-r7-side-chunked",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "opt-base",
+    "side-chunked": "opt-r7-side-chunked"
+  },
+  "steps": [
+    {"id": "aa-win", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "cmp-win", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "side-chunked", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "aa-side", "kind": "aa", "part": "side", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-side", "kind": "compare", "part": "side", "cand": "side-chunked", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-win", "kind": "confirm_best", "group": "r7", "steps": ["cmp-win"]},
+    {"id": "guard-win", "kind": "window", "group": "r7", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-r7", "kind": "golden", "group": "r7"},
+    {"id": "diff-r7", "kind": "diff_slice", "group": "r7"}
+  ]
+}

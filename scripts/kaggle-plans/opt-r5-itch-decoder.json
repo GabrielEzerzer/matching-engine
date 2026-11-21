@@ -1,0 +1,20 @@
+{
+  "name": "opt-r5-itch-decoder",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "opt-base",
+    "itch-decoder": "opt-r5-itch-decoder"
+  },
+  "steps": [
+    {"id": "aa-win", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 16, "stat": "all_p50_ns"},
+    {"id": "cmp-win", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "itch-decoder", "pairs": 16, "stat": "all_p50_ns"},
+    {"id": "aa-parse", "kind": "aa", "part": "parse", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-parse", "kind": "compare", "part": "parse", "cand": "itch-decoder", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-win", "kind": "confirm_best", "group": "r5", "steps": ["cmp-win"]},
+    {"id": "guard-win", "kind": "window", "group": "r5", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-r5", "kind": "golden", "group": "r5"},
+    {"id": "diff-r5", "kind": "diff_slice", "group": "r5"}
+  ]
+}

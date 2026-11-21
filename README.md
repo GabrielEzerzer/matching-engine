@@ -4,7 +4,7 @@ A price-time priority order-matching engine in Rust. A deliberately slow referen
 
 ## Current state
 
-The work ran in three stages, all finished. Stage 1 built a correct, unoptimised order book and the reference book that checks it. Stage 2 built the rig that makes measurements trustworthy: an ITCH 5.0 parser, a replay driver, a golden hash of the whole day's output, differential checks and a latency benchmark. Stage 3 tried optimisations one part at a time under a rule fixed before any numbers were seen, and kept three of them.
+The work ran in three initial stages followed by an end-to-end optimisation pass. Stage 1 built a correct, unoptimised order book and the reference book that checks it. Stage 2 built the rig that makes measurements trustworthy: an ITCH 5.0 parser, a replay driver, a golden hash of the whole day's output, differential checks and a latency benchmark. Stage 3 replaced the book's core containers one part at a time under a rule fixed before any numbers were seen, and a subsequent pass measured thirteen further end-to-end ideas in eleven rounds and kept four of them.
 
 ### How correctness is checked
 
@@ -14,17 +14,18 @@ The work ran in three stages, all finished. Stage 1 built a correct, unoptimised
 
 ### Results
 
-Median of three whole-day runs of the final build (`2c792ab`) on one pinned vCPU of a shared Kaggle cloud VM: 4 vCPUs, Intel Xeon at 2.20 GHz (Broadwell), Linux, `rustc 1.100.0`, fat LTO.
+Median of three whole-day runs of the measured build (`5639d81`) on one pinned vCPU of a shared Kaggle cloud VM: 4 vCPUs, Intel Xeon at 2.20 GHz (Broadwell), Linux, `rustc 1.100.0`, fat LTO.
 
 | Measure | Result |
 |---|---|
-| Latency per message, p50 | 414 ns |
-| Latency per message, p99 | 2.0 µs |
-| Latency per message, p99.9 | 7.9 µs |
-| Throughput, one vCPU | 1.78 million messages per second |
-| Book command, final build against the unoptimised stage 2 build | 38.4% less time (98% interval 38.1% to 38.8%) |
+| Latency per message, p50 | 310 ns |
+| Latency per message, p99 | 1.7 µs |
+| Latency per message, p99.9 | 6.8 µs |
+| Throughput, one vCPU | 2.38 million messages per second |
+| Full-day latency p50, against previous `main` (`b0f637f`) | 23.9% less time (98% interval 20.5% to 27.2%) |
+| Full-day throughput, against previous `main` (`b0f637f`) | 32.5% higher (98% interval 17.7% to 49.2%) |
 
-What is timed: each message on its own, from splitting its frame off an in-memory buffer through decoding it and applying it to its book, matching included. Messages run back to back; the file is read in 64 MiB chunks outside the timed regions. The timer's own cost, about 20 ns on that machine, is included in every latency. Throughput comes from a separate pass with no per-message timer. The last row compares the final build with the unoptimised stage 2 code (`f84e022`) on 2,922,290 pre-decoded commands of six busy symbols, in 10 alternating pairs; a second comparison in the same session confirmed it at 34.8%.
+What is timed: each message on its own, from splitting its frame off an in-memory buffer through decoding it and applying it to its book, matching included. Messages run back to back; the file is read in 64 MiB chunks outside the timed regions. The timer's own cost, about 20 ns on that machine, is included in every latency. Throughput comes from a separate pass with no per-message timer. The last two rows compare `5639d81` against `b0f637f` over the full 268,744,780-message day in 6 alternating pairs in the same session (A/A check in that session: inconclusive at +1.6%, interval −2.9% to +6.2% on p50, and −4.9%, interval −16.0% to +7.7% on throughput). In the same comparison, full-day p99 latency fell 16.9% (interval 10.0% to 23.3%), p99.9 latency fell 16.4% (interval 5.1% to 26.4%), and mean book-message latency fell 22.7% (interval 18.6% to 26.6%). On the six-symbol pre-decoded `book` microbenchmark, the combined change took 18.7% longer (interval +17.2% to +20.3%): each price level now takes 32 bytes instead of 8, so inserting or removing a level deep in one large book moves more memory. Over all 8,906 symbols of the full day the change is faster end to end.
 
 These numbers are not directly comparable with the messages-per-second figures that ITCH book-building replays publish. Those replays rebuild the book from Nasdaq's executions without matching and divide wall time by the message count. Here matching runs throughout, the latency rows time each message separately, and the throughput pass times only parsing and applying from memory, leaving file reads out. Several published engines report higher throughput than this one.
 
@@ -42,7 +43,7 @@ The library crate has a single-instrument `OrderBook`.
 - Prices are `u32` ticks of $0.0001 and quantities are `u32` shares, matching ITCH 5.0. Level totals are `u64`.
 - There is no self-trade prevention: orders carry no owner.
 
-The book is split into modules that can be measured and replaced one at a time: `side` (price-level lookup, a sorted index into a slab of levels), `level` (the FIFO queue at one price, a doubly linked list in a slab of nodes per book), `orders` (the id map, a `HashMap` with a keyed integer hasher) and `book` (matching). Stage 3 replaced the first three, which started as a `BTreeMap` of levels, a `VecDeque` per level and a `HashMap` with SipHash. An ITCH decoder that reads fields from fixed-size arrays was faster on its own part but did not pass the end-to-end check, so it was not merged; it stays on the branch `parse-arrays`.
+The book is split into modules that can be measured and replaced one at a time: `side` (price-level lookup, a sorted vector of inline levels with the best price cached), `level` (the FIFO queue at one price, a sentinel-free doubly linked list in a slab of nodes per book), `orders` (the id map, a `HashMap` with a keyed integer hasher) and `book` (matching). Stage 3 replaced the first three, which started as a `BTreeMap` of levels, a `VecDeque` per level and a `HashMap` with SipHash; the subsequent end-to-end pass inlined levels into `side`, removed sentinel nodes from `level`, switched `itch` to fixed-size-array decoding with cold admin paths and inlined frame parsing, and streamlined `replay` dispatch.
 
 `harness/reference.rs` is the slow reference book. Only the tests and the differential replay compile it.
 

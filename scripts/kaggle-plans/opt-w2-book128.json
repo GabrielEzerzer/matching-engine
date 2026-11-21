@@ -1,0 +1,20 @@
+{
+  "name": "opt-w2-book128",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "opt-w1-merged",
+    "w2-book128": "opt-w2-book128"
+  },
+  "steps": [
+    {"id": "aa-win", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "cmp-win", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "w2-book128", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "aa-book", "kind": "aa", "part": "book", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-book", "kind": "compare", "part": "book", "cand": "w2-book128", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-win", "kind": "confirm_best", "group": "w2d", "steps": ["cmp-win"]},
+    {"id": "guard-win", "kind": "window", "group": "w2d", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-w2d", "kind": "golden", "group": "w2d"},
+    {"id": "diff-w2d", "kind": "diff_slice", "group": "w2d"}
+  ]
+}

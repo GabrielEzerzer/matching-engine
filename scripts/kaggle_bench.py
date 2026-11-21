@@ -26,10 +26,11 @@ from types import SimpleNamespace
 
 PLAN = None
 
-KINDS = ("aa", "compare", "confirm_best", "window", "golden", "bench")
+KINDS = ("aa", "compare", "confirm_best", "window", "golden", "diff_slice", "bench")
 PARTS = ("side", "level", "orders", "book", "parse")
 MICRO_STATS = ("ns_per_op_median", "ns_per_op_min")
 WINDOW_STATS = tuple(f"{s}_{q}_ns" for s in ("all", "book") for q in ("mean", "p50", "p99", "p999"))
+THROUGHPUT_STAT = "throughput_msgs_per_s"
 DEFAULT_CPU = 3
 DEFAULT_STOP_MIN = 630
 HARD_STOP_MIN = 700
@@ -80,6 +81,42 @@ def separators(steps, i):
         x.get("kind") in SEPARATING_KINDS or (x.get("kind") == "compare" and x.get("cand") not in cands))]
 
 
+def step_scope(s):
+    if s.get("part") is not None:
+        return ("part", s.get("part"), False)
+    if s.get("window") is not None:
+        return ("window", s.get("window"), bool(s.get("throughput")))
+    if s.get("full"):
+        return ("full", None, bool(s.get("throughput")))
+    return None
+
+
+def validate_compare_target(s, where, err):
+    modes = sum(x is not None and x is not False for x in (s.get("part"), s.get("window"), s.get("full")))
+    if modes != 1:
+        err(f"{where}: specify exactly one of part, window or full")
+        return
+    if s.get("part") is not None:
+        if s.get("part") not in PARTS:
+            err(f"{where}: part must be one of {', '.join(PARTS)}, not {s.get('part')!r}")
+        if s.get("throughput"):
+            err(f"{where}: throughput cannot be combined with part")
+        if s.get("stat") not in MICRO_STATS:
+            err(f"{where}: part {s.get('part')} does not report {s.get('stat')!r}; "
+                f"microbenchmarks report {', '.join(MICRO_STATS)}")
+        return
+    if s.get("window") is not None:
+        if not isinstance(s.get("window"), str) or not WINDOW_RE.fullmatch(s["window"]):
+            err(f"{where}: window must be HH:MM:SS-HH:MM:SS, not {s.get('window')!r}")
+    elif s.get("full") is not True:
+        err(f"{where}: full must be true, not {s.get('full')!r}")
+    if "throughput" in s and not isinstance(s["throughput"], bool):
+        err(f"{where}: throughput must be a boolean, not {s['throughput']!r}")
+    allowed = WINDOW_STATS + ((THROUGHPUT_STAT,) if s.get("throughput") else ())
+    if s.get("stat") not in allowed:
+        err(f"{where}: comparison does not report {s.get('stat')!r}; it reports {', '.join(allowed)}")
+
+
 def validate(plan):
     errs = []
     err = errs.append
@@ -125,21 +162,18 @@ def validate(plan):
             err(f"{where}: unknown kind {kind!r}; kinds are {', '.join(KINDS)}")
             continue
         if kind in ("aa", "compare"):
-            if s.get("part") not in PARTS:
-                err(f"{where}: part must be one of {', '.join(PARTS)}, not {s.get('part')!r}")
-            if s.get("stat") not in MICRO_STATS:
-                err(f"{where}: part {s.get('part')} does not report {s.get('stat')!r}; "
-                    f"microbenchmarks report {', '.join(MICRO_STATS)}")
+            validate_compare_target(s, where, err)
             check_pairs(s.get("pairs"), where, err)
             if kind == "compare":
+                scope = step_scope(s)
                 if s.get("cand") not in labels:
                     err(f"{where}: candidate label {s.get('cand')!r} has no branch in labels")
                 elif s.get("cand") == base:
                     err(f"{where}: the candidate is the base; an A/A comparison is kind aa")
-                elif (s.get("part"), s.get("cand")) in compared:
-                    err(f"{where}: {s['cand']} is compared twice on part {s.get('part')}; "
+                elif (scope, s.get("cand")) in compared:
+                    err(f"{where}: {s['cand']} is compared twice on {scope}; "
                         f"each candidate gets exactly one first comparison")
-                compared.add((s.get("part"), s.get("cand")))
+                compared.add((scope, s.get("cand")))
         elif kind == "confirm_best":
             group, members = s.get("group"), s.get("steps")
             if not isinstance(group, str) or not group:
@@ -155,23 +189,34 @@ def validate(plan):
                 elif seen[m]["kind"] != "compare":
                     err(f"{where}: {m!r} is a {seen[m]['kind']} step, not a compare step")
             known = [seen[m] for m in members if m in seen and seen[m]["kind"] == "compare"]
-            for key in ("part", "stat", "pairs"):
+            for key in ("part", "window", "full", "throughput", "stat", "pairs"):
                 if len({json.dumps(m.get(key)) for m in known}) > 1:
                     err(f"{where}: the alternatives of one group must share their {key}")
             if known and len(known) == len(members) and not separators(steps, i - 1):
                 err(f"{where}: no other measurement (an aa, bench or window step, or a compare of a "
                     f"candidate outside the group) between the group's last comparison and its confirmation")
             groups.add(group)
-        elif kind in ("window", "golden"):
+        elif kind == "window":
             if s.get("group") not in groups:
                 err(f"{where}: no earlier confirm_best step for group {s.get('group')!r}")
-            if kind == "window":
-                if not isinstance(s.get("window"), str) or not WINDOW_RE.fullmatch(s["window"]):
-                    err(f"{where}: window must be HH:MM:SS-HH:MM:SS, not {s.get('window')!r}")
-                if s.get("stat") not in WINDOW_STATS:
-                    err(f"{where}: the window comparison does not report {s.get('stat')!r}; "
-                        f"it reports {', '.join(WINDOW_STATS)}")
-                check_pairs(s.get("pairs"), where, err)
+            if not isinstance(s.get("window"), str) or not WINDOW_RE.fullmatch(s["window"]):
+                err(f"{where}: window must be HH:MM:SS-HH:MM:SS, not {s.get('window')!r}")
+            if "throughput" in s and not isinstance(s["throughput"], bool):
+                err(f"{where}: throughput must be a boolean, not {s['throughput']!r}")
+            allowed = WINDOW_STATS + ((THROUGHPUT_STAT,) if s.get("throughput") else ())
+            if s.get("stat") not in allowed:
+                err(f"{where}: the window comparison does not report {s.get('stat')!r}; "
+                    f"it reports {', '.join(allowed)}")
+            check_pairs(s.get("pairs"), where, err)
+        elif kind in ("golden", "diff_slice"):
+            has_group = "group" in s
+            has_label = "label" in s
+            if has_group == has_label:
+                err(f"{where}: specify exactly one of group or label")
+            elif has_group and s.get("group") not in groups:
+                err(f"{where}: no earlier confirm_best step for group {s.get('group')!r}")
+            elif has_label and s.get("label") not in labels:
+                err(f"{where}: label {s.get('label')!r} has no branch in labels")
         elif kind == "bench":
             if s.get("label") not in labels:
                 err(f"{where}: label {s.get('label')!r} has no branch in labels")
@@ -215,12 +260,15 @@ def env_for(L, label=None):
 def compare_argv(plan, L, s, cand):
     base = plan["base"]
     cmd = [L.src / base / "scripts" / "compare.sh"]
-    if s["kind"] == "window":
-        cmd += ["-w", s["window"]]
-        b, c = L.bins / base / "bench", L.bins / cand / "bench"
-    else:
+    if s.get("part") is not None:
         cmd += ["-m", s["part"]]
         b, c = L.bins / base / "micro", L.bins / cand / "micro"
+    else:
+        if s.get("window") is not None:
+            cmd += ["-w", s["window"]]
+        if s.get("throughput"):
+            cmd += ["-t"]
+        b, c = L.bins / base / "bench", L.bins / cand / "bench"
     cmd += ["-n", s["pairs"], "-s", s["stat"], "-c", plan.get("cpu", DEFAULT_CPU), b, c]
     return [str(x) for x in cmd]
 
@@ -230,7 +278,15 @@ def golden_argvs(L, label):
     replay = L.target / label / "release" / "examples" / "replay"
     return [(co, ["cargo", "build", "--release", "--example", "replay"]),
             (co, [str(replay), "--check", GOLDEN, str(L.itch_file)]),
-            (co, ["cargo", "test", "--all-targets"])]
+            (co, ["cargo", "test", "--all-targets"]),
+            (co, ["cargo", "test", "--all-targets", "--features", "internals"])]
+
+
+def diff_slice_argvs(L, label):
+    co = L.src / label
+    diff = L.target / label / "release" / "examples" / "diff_slice"
+    return [(co, ["cargo", "build", "--release", "--example", "diff_slice"]),
+            (co, [str(diff), str(L.itch_file)])]
 
 
 def checkout_argvs(bundle, br, dest):
@@ -285,8 +341,15 @@ def dry_run(plan_path):
             cmd = compare_argv(plan, L, s, f"<winner of {s['group']}>")
             print(f"{shlex.join(cmd)} > {out}.jsonl 2> {out}.err   # skipped without a winner")
         elif k == "golden":
-            for cwd, argv in golden_argvs(L, f"<winner of {s['group']}>"):
-                print(f"(cd {cwd} && {shlex.join(argv)}) >> {out}.out 2>> {out}.err   # skipped without a winner")
+            target = s["label"] if "label" in s else f"<winner of {s['group']}>"
+            suffix = "" if "label" in s else "   # skipped without a winner"
+            for cwd, argv in golden_argvs(L, target):
+                print(f"(cd {cwd} && {shlex.join(argv)}) >> {out}.out 2>> {out}.err{suffix}")
+        elif k == "diff_slice":
+            target = s["label"] if "label" in s else f"<winner of {s['group']}>"
+            suffix = "" if "label" in s else "   # skipped without a winner"
+            for cwd, argv in diff_slice_argvs(L, target):
+                print(f"(cd {cwd} && {shlex.join(argv)}) >> {out}.out 2>> {out}.err{suffix}")
         elif k == "bench":
             print(f"(cd {L.src / s['label']} && CARGO_TARGET_DIR={L.target / s['label']} "
                   f"{shlex.join(bench_argv(plan, L, s))}) > {out}.jsonl 2> {out}.err")
@@ -315,12 +378,13 @@ def comparison_fields(summary, stat):
             "effect_ln_x100": s.get("effect_ln_x100"), "flagged_runs": summary.get("flagged_runs")}
 
 
-def choose_best(candidates):
+def choose_best(candidates, higher_is_better=False):
     improved = [c for c in candidates if c[2] and c[2].get("verdict") == "improved"
                 and c[2].get("effect_ln_x100") is not None]
     if not improved:
         return None
-    return min(improved, key=lambda c: c[2]["effect_ln_x100"])
+    pick = max if higher_is_better else min
+    return pick(improved, key=lambda c: c[2]["effect_ln_x100"])
 
 
 def past_stop(elapsed_s, stop_min):
@@ -589,7 +653,7 @@ class Kernel:
         rec.update(state="done", **comparison_fields(summary, s["stat"]))
         notes = [f"{summary['flagged_runs']} flagged run(s)"] if summary.get("flagged_runs") else []
         if s["kind"] == "aa" and rec["verdict"] != "inconclusive":
-            notes.append(f"A/A gave {rec['verdict']}: the method check failed for part {s['part']}, "
+            notes.append(f"A/A gave {rec['verdict']}: the method check failed for {step_scope(s)}, "
                          f"so its comparisons cannot be trusted")
         if notes:
             rec["note"] = "; ".join(notes)
@@ -605,14 +669,15 @@ class Kernel:
             r = by_id[m]
             fields = r if r["state"] == "done" else None
             cands.append((m, specs[m]["cand"], fields))
-        best = choose_best(cands)
+        first_spec = specs[s["steps"][0]]
+        best = choose_best(cands, higher_is_better=first_spec["stat"] == THROUGHPUT_STAT)
         if best is None:
             return rec.update(state="done", verdict="none improved",
                               note="no alternative improved; nothing to confirm")
         sid, lab, _ = best
-        part = specs[sid]["part"]
+        scope = step_scope(specs[sid])
         bad_aa = [f"{x['id']} {by_id[x['id']]['state']} {by_id[x['id']].get('verdict') or ''}".strip()
-                  for x in steps[:i] if x["kind"] == "aa" and x["part"] == part
+                  for x in steps[:i] if x["kind"] == "aa" and step_scope(x) == scope
                   and not (by_id[x["id"]]["state"] == "done" and by_id[x["id"]].get("verdict") == "inconclusive")]
         rec["chosen_from"] = sid
         self.run_compare(specs[sid], rec, lab, out_id=s["id"])
@@ -620,8 +685,8 @@ class Kernel:
             rec["winner"] = lab if rec["verdict"] == "improved" and not bad_aa else None
             head = f"{lab} confirmed" if rec["winner"] else f"{lab} not confirmed"
             if bad_aa and rec["verdict"] == "improved":
-                head = (f"{lab} improved again, but no winner is named: the A/A method check for part "
-                        f"{part} did not come out inconclusive ({', '.join(bad_aa)})")
+                head = (f"{lab} improved again, but no winner is named: the A/A method check for "
+                        f"{scope} did not come out inconclusive ({', '.join(bad_aa)})")
             rec["note"] = head + (f"; {rec['note']}" if rec.get("note") else "")
 
     def winner(self, by_id, group):
@@ -639,10 +704,22 @@ class Kernel:
         out_text = Path(f"{out}.out").read_text(errors="replace")
         golden_ok = results[1] == 0 and "golden check passed against" in err_text
         tests = re.findall(r"^test result: (ok|FAILED)\.", out_text, re.M)
-        tests_ok = results[2] == 0 and bool(tests) and all(t == "ok" for t in tests)
+        tests_ok = results[2] == 0 and results[3] == 0 and bool(tests) and all(t == "ok" for t in tests)
         rec.update(state="done", label=lab, verdict="pass" if golden_ok and tests_ok else "fail",
                    note=f"golden {'passed' if golden_ok else 'FAILED'}; "
                         f"tests {'ok' if tests_ok else 'FAILED'} ({tests.count('ok')} test binaries ok)")
+
+    def run_diff_slice(self, rec, lab):
+        out = self.L.results / rec["id"]
+        open(f"{out}.out", "w").close()
+        open(f"{out}.err", "w").close()
+        results = []
+        for cwd, argv in diff_slice_argvs(self.L, lab):
+            results.append(self.sh(argv, f"{out}.out", f"{out}.err", cwd=cwd, env=env_for(self.L, lab), mode="a"))
+        out_text = Path(f"{out}.out").read_text(errors="replace")
+        ok = results[0] == 0 and results[1] == 0 and "no differences;" in out_text
+        rec.update(state="done", label=lab, verdict="pass" if ok else "fail",
+                   note="diff_slice passed" if ok else f"diff_slice FAILED (exits {results})")
 
     def run_bench(self, s, rec):
         lab = s["label"]
@@ -685,15 +762,24 @@ class Kernel:
                     self.run_compare(s, rec, s["cand"])
                 elif k == "confirm_best":
                     self.run_confirm(i, rec, by_id, specs)
-                elif k in ("window", "golden"):
-                    lab, conf = self.winner(by_id, s["group"])
-                    if lab is None:
-                        rec.update(state="skipped", note=f"no confirmed winner for {s['group']} ({conf['id']} "
-                                                         f"{conf['state']}: {conf.get('note') or ''})")
-                    elif k == "window":
-                        self.run_compare(s, rec, lab)
+                elif k in ("window", "golden", "diff_slice"):
+                    if "label" in s:
+                        lab = s["label"]
+                        if k == "golden":
+                            self.run_golden(rec, lab)
+                        else:
+                            self.run_diff_slice(rec, lab)
                     else:
-                        self.run_golden(rec, lab)
+                        lab, conf = self.winner(by_id, s["group"])
+                        if lab is None:
+                            rec.update(state="skipped", note=f"no confirmed winner for {s['group']} ({conf['id']} "
+                                                             f"{conf['state']}: {conf.get('note') or ''})")
+                        elif k == "window":
+                            self.run_compare(s, rec, lab)
+                        elif k == "golden":
+                            self.run_golden(rec, lab)
+                        else:
+                            self.run_diff_slice(rec, lab)
                 elif k == "bench":
                     self.run_bench(s, rec)
             except Exception as e:
@@ -1107,6 +1193,65 @@ class SelfTest(unittest.TestCase):
         self.assertFalse(past_stop(629 * 60, 630))
         self.assertTrue(past_stop(630 * 60, 630))
         self.assertTrue(past_stop(11 * 3600, DEFAULT_STOP_MIN))
+
+    def test_window_and_diff_slice(self):
+        plan = {
+            "name": "w", "base": "base", "labels": {"base": "b0", "x": "bx"},
+            "steps": [
+                {"id": "aa", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 6, "stat": "all_p50_ns"},
+                {"id": "cx", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "x", "pairs": 6, "stat": "all_p50_ns"},
+                {"id": "aa2", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 6, "stat": "all_p50_ns"},
+                {"id": "conf", "kind": "confirm_best", "group": "g", "steps": ["cx"]},
+                {"id": "diff", "kind": "diff_slice", "group": "g"},
+                {"id": "gold", "kind": "golden", "label": "x"},
+                {"id": "full", "kind": "compare", "full": True, "throughput": True, "cand": "x", "pairs": 6,
+                 "stat": "throughput_msgs_per_s"},
+            ],
+        }
+        self.assertEqual(validate(plan), [])
+        L = layout(PurePosixPath("/kaggle"))
+        self.assertIn("-w", compare_argv(plan, L, plan["steps"][1], "x"))
+        full_argv = compare_argv(plan, L, plan["steps"][6], "x")
+        self.assertIn("-t", full_argv)
+        self.assertNotIn("-w", full_argv)
+        self.assertNotIn("-m", full_argv)
+        self.assertEqual(
+            choose_best([("a", "A", {"verdict": "improved", "effect_ln_x100": 2.0}),
+                         ("b", "B", {"verdict": "improved", "effect_ln_x100": 5.0})],
+                        higher_is_better=True)[1],
+            "B",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            L2 = layout(d)
+            L2.results.mkdir(parents=True)
+            k = Kernel({**plan, "commits": {}, "bundle_commits": {}}, L2)
+            for lab in ("base", "x"):
+                k.status["labels"][lab]["build"] = "ok"
+            def sh(argv, out, err, cwd=None, env=None, mode="w"):
+                sid = Path(out).stem
+                with open(out, mode) as fo, open(err, mode) as fe:
+                    if sid == "gold":
+                        fe.write("golden check passed against x\n")
+                        fo.write("test result: ok. 3 passed\n")
+                        return 0
+                    if sid == "diff":
+                        fo.write("no differences; took 1.0 s\n")
+                        return 0
+                    stat = next(s["stat"] for s in plan["steps"] if s["id"] == sid or (sid == "conf" and s["id"] == "cx"))
+                    verdict = "inconclusive" if sid.startswith("aa") else "improved"
+                    eff = 0.1 if verdict == "inconclusive" else (-4.0 if stat != THROUGHPUT_STAT else 4.0)
+                    fo.write(json.dumps({"summary": True, "verdict": verdict, "flagged_runs": 0,
+                                         stat: {"effect_pct": eff, "low_pct": eff - 1, "high_pct": eff + 1,
+                                                "effect_ln_x100": eff}}) + "\n")
+                    return 0
+            k.sh = sh
+            with contextlib.redirect_stdout(io.StringIO()):
+                k.steps()
+            by_id = {r["id"]: r for r in k.status["steps"]}
+            self.assertEqual(by_id["conf"]["winner"], "x")
+            self.assertEqual(by_id["diff"]["verdict"], "pass")
+            self.assertEqual(by_id["gold"]["verdict"], "pass")
+            self.assertEqual(by_id["full"]["verdict"], "improved")
 
     def test_embed(self):
         plan = {**fixture_plan(), "commits": {"b0": "0" * 40}}
