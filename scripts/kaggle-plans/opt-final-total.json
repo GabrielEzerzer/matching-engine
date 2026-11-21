@@ -1,0 +1,23 @@
+{
+  "name": "opt-final-total",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "opt-orig-main",
+    "final": "neon-optimise"
+  },
+  "steps": [
+    {"id": "aa-win", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "cmp-win", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "final", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "aa-book", "kind": "aa", "part": "book", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-book", "kind": "compare", "part": "book", "cand": "final", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-win", "kind": "confirm_best", "group": "final-win", "steps": ["cmp-win"]},
+    {"id": "guard-win", "kind": "window", "group": "final-win", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "aa-full", "kind": "aa", "full": true, "throughput": true, "pairs": 6, "stat": "all_p50_ns"},
+    {"id": "cmp-full", "kind": "compare", "full": true, "throughput": true, "cand": "final", "pairs": 6, "stat": "all_p50_ns"},
+    {"id": "golden-final", "kind": "golden", "label": "final"},
+    {"id": "diff-final", "kind": "diff_slice", "label": "final"},
+    {"id": "bench-final", "kind": "bench", "label": "final", "runs": 3}
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "opt-w2-side-chunked",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "opt-w1-merged",
+    "w2-side-chunked": "opt-w2-side-chunked"
+  },
+  "steps": [
+    {"id": "aa-win", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 12, "stat": "all_p99_ns"},
+    {"id": "cmp-win", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "w2-side-chunked", "pairs": 12, "stat": "all_p99_ns"},
+    {"id": "aa-side", "kind": "aa", "part": "side", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-side", "kind": "compare", "part": "side", "cand": "w2-side-chunked", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-win", "kind": "confirm_best", "group": "w2b", "steps": ["cmp-win"]},
+    {"id": "guard-p50", "kind": "window", "group": "w2b", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "all_p50_ns"},
+    {"id": "guard-win", "kind": "window", "group": "w2b", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-w2b", "kind": "golden", "group": "w2b"},
+    {"id": "diff-w2b", "kind": "diff_slice", "group": "w2b"}
+  ]
+}

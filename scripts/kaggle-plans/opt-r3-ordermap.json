@@ -1,0 +1,23 @@
+{
+  "name": "opt-r3-ordermap",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "opt-base",
+    "flatmap": "opt-r3-flatmap",
+    "fasthash": "opt-r3-fasthash"
+  },
+  "steps": [
+    {"id": "aa-win", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "cmp-win-flat", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "flatmap", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "cmp-win-hash", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "fasthash", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "aa-orders", "kind": "aa", "part": "orders", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-orders-flat", "kind": "compare", "part": "orders", "cand": "flatmap", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-orders-hash", "kind": "compare", "part": "orders", "cand": "fasthash", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-win", "kind": "confirm_best", "group": "r3", "steps": ["cmp-win-flat", "cmp-win-hash"]},
+    {"id": "guard-win", "kind": "window", "group": "r3", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-r3", "kind": "golden", "group": "r3"},
+    {"id": "diff-r3", "kind": "diff_slice", "group": "r3"}
+  ]
+}

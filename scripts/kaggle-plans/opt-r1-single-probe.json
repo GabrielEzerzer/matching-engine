@@ -1,0 +1,20 @@
+{
+  "name": "opt-r1-single-probe",
+  "base": "base",
+  "cpu": 3,
+  "stop_after_min": 630,
+  "labels": {
+    "base": "opt-base",
+    "single-probe": "opt-r1-single-probe"
+  },
+  "steps": [
+    {"id": "aa-win", "kind": "aa", "window": "09:30:00-10:00:00", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "cmp-win", "kind": "compare", "window": "09:30:00-10:00:00", "cand": "single-probe", "pairs": 12, "stat": "all_p50_ns"},
+    {"id": "aa-book", "kind": "aa", "part": "book", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "cmp-book", "kind": "compare", "part": "book", "cand": "single-probe", "pairs": 10, "stat": "ns_per_op_min"},
+    {"id": "confirm-win", "kind": "confirm_best", "group": "r1", "steps": ["cmp-win"]},
+    {"id": "guard-win", "kind": "window", "group": "r1", "window": "09:30:00-10:00:00", "pairs": 10, "stat": "book_mean_ns"},
+    {"id": "golden-r1", "kind": "golden", "group": "r1"},
+    {"id": "diff-r1", "kind": "diff_slice", "group": "r1"}
+  ]
+}
